@@ -65,6 +65,7 @@ struct CliConfig {
     std::string uninstall_backend;  // Format: "recipe:backend"
     std::string output_file;
     bool downloaded = false;
+    bool dry_run = false;
     std::string agent;
     int scan_duration = 30;
 };
@@ -505,6 +506,7 @@ int main(int argc, char* argv[]) {
     CLI::App* export_cmd = app.add_subcommand("export", "Export model information to JSON");
     CLI::App* launch_cmd = app.add_subcommand("launch", "Launch an agent with a model");
     CLI::App* scan_cmd = app.add_subcommand("scan", "Scan for network beacons");
+    CLI::App* cleanup_cmd = app.add_subcommand("cleanup-cache", "Clean up orphaned files in HuggingFace cache");
 
     // List options
     list_cmd->add_flag("--downloaded", config.downloaded, "Save model options for future loads");
@@ -560,6 +562,9 @@ int main(int argc, char* argv[]) {
     // Scan options
     scan_cmd->add_option("--duration", config.scan_duration, "Scan duration in seconds")->default_val(config.scan_duration)->type_name("SECONDS");
 
+    // Cleanup cache options
+    cleanup_cmd->add_flag("--dry-run", config.dry_run, "Preview what would be cleaned up without deleting");
+
     // Parse arguments
     CLI11_PARSE(app, argc, argv);
 
@@ -591,6 +596,8 @@ int main(int argc, char* argv[]) {
         return handle_launch_command(config);
     } else if (scan_cmd->count() > 0) {
         return handle_scan_command(config);
+    } else if (cleanup_cmd->count() > 0) {
+        return client.cleanup_cache(config.dry_run);
     } else {
         std::cerr << "Error: No command specified" << std::endl;
         std::cerr << app.help() << std::endl;
