@@ -134,6 +134,17 @@ void SDServer::load(const std::string& model_name,
         args.push_back("-v");
     }
 
+    // Model-level context options (accepted by sd-server at startup)
+    int diffusion_fa = options.get_option("diffusion_fa");
+    if (diffusion_fa) {
+        args.push_back("--diffusion-fa");
+    }
+
+    int offload_to_cpu = options.get_option("offload_to_cpu");
+    if (offload_to_cpu) {
+        args.push_back("--offload-to-cpu");
+    }
+
     // Set up environment variables
     std::vector<std::pair<std::string, std::string>> env_vars;
     fs::path exe_dir = fs::path(exe_path).parent_path();
@@ -241,6 +252,22 @@ json SDServer::image_generations(const json& request) {
     if (request.contains("seed")) {
         extra_args["seed"] = request["seed"].get<int>();
     }
+    if (request.contains("sample_method")) {
+        extra_args["sample_method"] = request["sample_method"].get<std::string>();
+    } else {
+        std::string sm = recipe_options_.get_option("sampling_method");
+        if (!sm.empty()) {
+            extra_args["sample_method"] = sm;
+        }
+    }
+    {
+        float fs = recipe_options_.get_option("flow_shift");
+        if (request.contains("flow_shift")) {
+            extra_args["flow_shift"] = request["flow_shift"].get<float>();
+        } else if (fs > 0.0f) {
+            extra_args["flow_shift"] = fs;
+        }
+    }
 
     // Append extra args to prompt
     {
@@ -276,6 +303,22 @@ json SDServer::image_edits(const json& request) {
     }
     if (request.contains("seed")) {
         extra_args["seed"] = request["seed"].get<int>();
+    }
+    if (request.contains("sample_method")) {
+        extra_args["sample_method"] = request["sample_method"].get<std::string>();
+    } else {
+        std::string sm = recipe_options_.get_option("sampling_method");
+        if (!sm.empty()) {
+            extra_args["sample_method"] = sm;
+        }
+    }
+    {
+        float fs = recipe_options_.get_option("flow_shift");
+        if (request.contains("flow_shift")) {
+            extra_args["flow_shift"] = request["flow_shift"].get<float>();
+        } else if (fs > 0.0f) {
+            extra_args["flow_shift"] = fs;
+        }
     }
 
     // Append extra args to prompt (same pattern as image_generations)

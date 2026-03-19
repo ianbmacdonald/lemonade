@@ -19,6 +19,10 @@ static const json DEFAULTS = {
     {"cfg_scale", 7.0},
     {"width", 512},
     {"height", 512},
+    {"sampling_method", ""},
+    {"diffusion_fa", 0},
+    {"flow_shift", 0.0},
+    {"offload_to_cpu", 0},
     // FLM-specific options
     {"flm_args", ""}       // Custom arguments to pass to flm serve
 };
@@ -89,6 +93,30 @@ static const json CLI_OPTIONS = {
         {"envname", "LEMONADE_HEIGHT"},
         {"help", "Image height in pixels"}
     }},
+    {"--sampling-method", {
+        {"option_name", "sampling_method"},
+        {"type_name", "METHOD"},
+        {"envname", "LEMONADE_SAMPLING_METHOD"},
+        {"help", "Sampling method for image generation (e.g. euler, euler_a, dpm2)"}
+    }},
+    {"--diffusion-fa", {
+        {"option_name", "diffusion_fa"},
+        {"type_name", "FLAG"},
+        {"envname", "LEMONADE_DIFFUSION_FA"},
+        {"help", "Enable flash attention for diffusion models (0 or 1)"}
+    }},
+    {"--flow-shift", {
+        {"option_name", "flow_shift"},
+        {"type_name", "SHIFT"},
+        {"envname", "LEMONADE_FLOW_SHIFT"},
+        {"help", "Flow matching shift parameter"}
+    }},
+    {"--offload-to-cpu", {
+        {"option_name", "offload_to_cpu"},
+        {"type_name", "FLAG"},
+        {"envname", "LEMONADE_OFFLOAD_TO_CPU"},
+        {"help", "Offload model weights to CPU when not in use (0 or 1)"}
+    }},
     // FLM-specific options
     {"--flm-args", {
         {"option_name", "flm_args"},
@@ -108,7 +136,7 @@ static std::vector<std::string> get_keys_for_recipe(const std::string& recipe) {
     } else if (recipe == "ryzenai-llm") {
         return {"ctx_size"};
     } else if (recipe == "sd-cpp") {
-        return {"sd-cpp_backend", "steps", "cfg_scale", "width", "height"};
+        return {"sd-cpp_backend", "steps", "cfg_scale", "width", "height", "sampling_method", "diffusion_fa", "flow_shift", "offload_to_cpu"};
     } else {
         return {};
     }
@@ -181,7 +209,9 @@ std::vector<std::string> RecipeOptions::to_cli_options(const json& raw_options) 
             auto val = raw_options[opt_name];
             if (!val.is_null() && val != "") {
                 cli.push_back(key);
-                if (val.is_number_float()) {
+                if (val.is_boolean()) {
+                    cli.push_back(val.get<bool>() ? "1" : "0");
+                } else if (val.is_number_float()) {
                     cli.push_back(std::to_string((double) val));
                 } else if (val.is_number_integer()) {
                     cli.push_back(std::to_string((int) val));
@@ -208,6 +238,7 @@ RecipeOptions::RecipeOptions(const std::string& recipe, const json& options) {
 
 static std::string format_option_for_logging(const json& opt) {
     if (opt.is_null() || opt == "") return "(none)";
+    if (opt.is_boolean()) return opt.get<bool>() ? "1" : "0";
     if (opt.is_number_float()) return std::to_string((double) opt);
     if (opt.is_number_integer()) return std::to_string((int) opt);
     return opt;
