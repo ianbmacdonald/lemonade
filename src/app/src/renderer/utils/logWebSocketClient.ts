@@ -1,4 +1,4 @@
-import { getAPIKey, getWebSocketUrl, serverFetch } from './serverConfig';
+import { getAPIKey, getWebSocketUrl, isWebAppMode, serverFetch } from './serverConfig';
 
 export interface LogEntry {
   seq: number;
@@ -24,15 +24,18 @@ export async function connectLogStream(
   afterSeq: number | null,
   callbacks: LogStreamCallbacks,
 ): Promise<LogStreamHandle> {
-  // Get websocket port from health endpoint
-  const healthResponse = await serverFetch('/health');
-  if (!healthResponse.ok) {
-    throw new Error(`Failed to fetch health: ${healthResponse.status}`);
-  }
-  const health = await healthResponse.json();
-  const wsPort = health.websocket_port;
-  if (typeof wsPort !== 'number') {
-    throw new Error('Server did not advertise a websocket port');
+  let wsPort = 0;
+  if (!isWebAppMode()) {
+    // Get websocket port from health endpoint for direct-connect mode
+    const healthResponse = await serverFetch('/health');
+    if (!healthResponse.ok) {
+      throw new Error(`Failed to fetch health: ${healthResponse.status}`);
+    }
+    const health = await healthResponse.json();
+    wsPort = health.websocket_port;
+    if (typeof wsPort !== 'number') {
+      throw new Error('Server did not advertise a websocket port');
+    }
   }
 
   const query = new URLSearchParams();

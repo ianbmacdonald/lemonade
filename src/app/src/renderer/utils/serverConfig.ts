@@ -23,7 +23,7 @@ class ServerConfig {
   private discoveryPromise: Promise<number | null> | null = null;
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
-  private hasExternalUrl: boolean = false;
+  private isWebAppModeValue: boolean = false;
 
   constructor() {
     // Initialize from Electron API on startup
@@ -52,6 +52,8 @@ class ServerConfig {
 
   private async initialize(): Promise<void> {
     try {
+      this.isWebAppModeValue = !!(typeof window !== 'undefined' && window.api?.isWebApp);
+
       // Get API Key if available
       if (typeof window !== 'undefined'&& window.api?.getServerAPIKey) {
         this.apiKey = await window.api.getServerAPIKey();
@@ -63,9 +65,6 @@ class ServerConfig {
         if (baseUrl) {
           console.log('Using explicit server base URL:', baseUrl);
           this.explicitBaseUrl = baseUrl;
-          // Only treat as external URL in web-app mode (server-injected external_url).
-          // Electron's --base-url still needs the separate websocket_port.
-          this.hasExternalUrl = !!(window.api?.isWebApp);
           this.initialized = true;
           return;
         }
@@ -148,12 +147,12 @@ class ServerConfig {
   }
 
   /**
-   * Whether the server base URL came from the web-app's server-injected
-   * external_url config. When true, browser WebSocket clients should derive
-   * their public URLs from that base URL instead of using websocket_port.
+   * Whether this renderer is running in the browser-hosted web app rather than
+   * Electron. Browser-hosted web app requests should derive WebSocket URLs from
+   * the page/base URL instead of using websocket_port directly.
    */
-  isExternalUrl(): boolean {
-    return this.hasExternalUrl;
+  isWebAppMode(): boolean {
+    return this.isWebAppModeValue;
   }
 
   /**
@@ -348,12 +347,12 @@ export const getServerHost = () => serverConfig.getServerHost();
 export const getAPIKey = () => serverConfig.getAPIKey();
 export const getServerPort = () => serverConfig.getPort();
 export const discoverServerPort = () => serverConfig.discoverPort();
-export const isExternalUrl = () => serverConfig.isExternalUrl();
-export const getWebSocketUrl = (endpointPath: string, wsPort: number, query?: URLSearchParams) => {
+export const isWebAppMode = () => serverConfig.isWebAppMode();
+export const getWebSocketUrl = (endpointPath: string, wsPort: number | null, query?: URLSearchParams) => {
   const normalizedPath = ensureLeadingSlash(endpointPath);
   const queryString = query?.toString();
 
-  if (serverConfig.isExternalUrl()) {
+  if (serverConfig.isWebAppMode()) {
     const baseUrl = new URL(serverConfig.getServerBaseUrl());
     baseUrl.protocol = baseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
     const basePath = trimTrailingSlashes(baseUrl.pathname);
@@ -365,6 +364,9 @@ export const getWebSocketUrl = (endpointPath: string, wsPort: number, query?: UR
 
   const serverBaseUrl = new URL(serverConfig.getServerBaseUrl());
   const wsProtocol = serverBaseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (wsPort === null) {
+    throw new Error('Direct-connect WebSocket URL requires a websocket_port');
+  }
   const wsUrl = new URL(`${wsProtocol}//${serverConfig.getServerHost()}:${wsPort}`);
   wsUrl.pathname = normalizedPath;
   wsUrl.search = queryString ? `?${queryString}` : '';

@@ -2,7 +2,7 @@
  * WebSocket client for realtime transcription.
  * Uses a raw WebSocket with OpenAI Realtime API message format.
  */
-import { getAPIKey, getWebSocketUrl, serverFetch } from './serverConfig';
+import { getAPIKey, getWebSocketUrl, isWebAppMode, serverFetch } from './serverConfig';
 
 export interface TranscriptionCallbacks {
   /** Called with transcription text. isFinal=false for interim results that replace previous interim. */
@@ -15,13 +15,13 @@ export interface TranscriptionCallbacks {
 
 export class TranscriptionWebSocket {
   private socket: WebSocket;
-  private wsPort: number;
+  private wsPort: number | null;
 
   /**
    * Create a new TranscriptionWebSocket.
    * Use the static connect() method instead of calling this directly.
    */
-  private constructor(wsPort: number, model: string, callbacks: TranscriptionCallbacks) {
+  private constructor(wsPort: number | null, model: string, callbacks: TranscriptionCallbacks) {
     this.wsPort = wsPort;
     const query = new URLSearchParams({ model });
     const apiKey = getAPIKey();
@@ -92,9 +92,15 @@ export class TranscriptionWebSocket {
     this.socket.addEventListener('close', (ev) => {
       console.log('[WebSocket] Close event:', { code: ev.code, reason: ev.reason });
       if (ev.code !== 1000) {
-        callbacks.onError?.(
-          `WebSocket closed (code=${ev.code}). Is the server running on port ${this.wsPort}?`,
-        );
+        if (this.wsPort !== null) {
+          callbacks.onError?.(
+            `WebSocket closed (code=${ev.code}). Is the server running on port ${this.wsPort}?`,
+          );
+        } else {
+          callbacks.onError?.(
+            `WebSocket closed (code=${ev.code}). Check the page origin or reverse proxy WebSocket routing.`,
+          );
+        }
       }
       callbacks.onDisconnected?.();
     });
@@ -108,6 +114,11 @@ export class TranscriptionWebSocket {
     model: string,
     callbacks: TranscriptionCallbacks,
   ): Promise<TranscriptionWebSocket> {
+    if (isWebAppMode()) {
+      console.log('[WebSocket] Using browser-hosted web app URL for WebSocket connection');
+      return new TranscriptionWebSocket(null, model, callbacks);
+    }
+
     // Fetch WebSocket port from /health endpoint using serverFetch for auto port discovery
     console.log('[WebSocket] Fetching WebSocket port from server');
 
