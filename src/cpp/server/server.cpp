@@ -549,7 +549,7 @@ void Server::setup_static_files(httplib::Server &web_server) {
     // Check if web app directory exists
     if (fs::exists(web_app_dir) && fs::is_directory(web_app_dir)) {
         // Create a handler for serving web app index.html for SPA routing
-        auto serve_web_app_html = [web_app_dir](const httplib::Request&, httplib::Response& res) {
+        auto serve_web_app_html = [this, web_app_dir](const httplib::Request&, httplib::Response& res) {
             std::string index_path = web_app_dir + "/index.html";
             std::ifstream file(index_path);
 
@@ -606,6 +606,10 @@ window.api = {
     getServerAPIKey: async () => {
         const settings = await window.api.getSettings();
         return settings.apiKey?.value || '';
+    },
+    getServerBaseUrl: async () => {
+        const externalUrl = window.__LEMONADE_EXTERNAL_URL__ || '';
+        return externalUrl || null;
     },
     fetchWithApiKey: async (url) => {
         try {
@@ -713,10 +717,23 @@ window.api = {
 </script>
 )";
 
-            // Insert mock API before the closing </head> tag
+            // Build a small dynamic script that exposes the external_url config
+            // value (if set) so the frontend can derive its base URL from it.
+            std::string external_url = config_->external_url();
+            std::string config_script;
+            if (!external_url.empty()) {
+                // Strip trailing slash for consistency
+                if (external_url.back() == '/') {
+                    external_url.pop_back();
+                }
+                config_script = "<script>window.__LEMONADE_EXTERNAL_URL__ = '"
+                                + external_url + "';</script>\n";
+            }
+
+            // Insert config + mock API before the closing </head> tag
             size_t head_end_pos = html.find("</head>");
             if (head_end_pos != std::string::npos) {
-                html.insert(head_end_pos, mock_api);
+                html.insert(head_end_pos, config_script + mock_api);
             }
 
             // Set no-cache headers

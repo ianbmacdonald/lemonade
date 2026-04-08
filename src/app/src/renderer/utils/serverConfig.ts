@@ -20,6 +20,7 @@ class ServerConfig {
   private discoveryPromise: Promise<number | null> | null = null;
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
+  private hasExternalUrl: boolean = false;
 
   constructor() {
     // Initialize from Electron API on startup
@@ -53,7 +54,19 @@ class ServerConfig {
         this.apiKey = await window.api.getServerAPIKey();
       }
 
-      // In web app mode, use the current origin as the server base URL
+      // Check if an explicit base URL was configured (external_url, --base-url, or env var)
+      if (typeof window !== 'undefined' && window.api?.getServerBaseUrl) {
+        const baseUrl = await window.api.getServerBaseUrl();
+        if (baseUrl) {
+          console.log('Using explicit server base URL:', baseUrl);
+          this.explicitBaseUrl = baseUrl;
+          this.hasExternalUrl = true;
+          this.initialized = true;
+          return;
+        }
+      }
+
+      // In web app mode, fall back to the current origin as the server base URL
       if (typeof window !== 'undefined' && window.api?.isWebApp) {
         const origin = window.location?.origin;
         if (origin && origin !== 'null') {
@@ -63,18 +76,6 @@ class ServerConfig {
           this.initialized = true;
           return;
         }
-      }
-
-      // Check if an explicit base URL was configured (--base-url or env var)
-      if (typeof window !== 'undefined' && window.api?.getServerBaseUrl && window.api?.getServerAPIKey) {
-        const baseUrl = await window.api.getServerBaseUrl();
-        if (baseUrl) {
-          console.log('Using explicit server base URL:', baseUrl);
-          this.explicitBaseUrl = baseUrl;
-        }
-
-        this.initialized = true;
-        return;
       }
 
       // No explicit URL - use localhost with port discovery
@@ -139,6 +140,15 @@ class ServerConfig {
   getServerHost(): string {
     const url = new URL(this.getServerBaseUrl());
     return url.hostname;
+  }
+
+  /**
+   * Whether the server base URL was explicitly configured via external_url
+   * or --base-url. When true, WebSocket clients should derive their URLs
+   * from the base URL rather than using a separate websocket_port.
+   */
+  isExternalUrl(): boolean {
+    return this.hasExternalUrl;
   }
 
   /**
@@ -333,6 +343,8 @@ export const getServerHost = () => serverConfig.getServerHost();
 export const getAPIKey = () => serverConfig.getAPIKey();
 export const getServerPort = () => serverConfig.getPort();
 export const discoverServerPort = () => serverConfig.discoverPort();
+export const isExternalUrl = () => serverConfig.isExternalUrl();
+export const getWebSocketProtocol = () => new URL(serverConfig.getServerBaseUrl()).protocol === 'https:' ? 'wss' : 'ws';
 export const isRemoteServer = () => serverConfig.isRemoteServer();
 export const onServerPortChange = (listener: PortChangeListener) => serverConfig.onPortChange(listener);
 export const onServerUrlChange = (listener: UrlChangeListener) => serverConfig.onUrlChange(listener);
