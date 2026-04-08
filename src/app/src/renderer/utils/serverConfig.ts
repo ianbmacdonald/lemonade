@@ -349,7 +349,6 @@ export const getAPIKey = () => serverConfig.getAPIKey();
 export const getServerPort = () => serverConfig.getPort();
 export const discoverServerPort = () => serverConfig.discoverPort();
 export const isExternalUrl = () => serverConfig.isExternalUrl();
-export const getWebSocketProtocol = () => new URL(serverConfig.getServerBaseUrl()).protocol === 'https:' ? 'wss' : 'ws';
 export const getWebSocketUrl = (endpointPath: string, wsPort: number, query?: URLSearchParams) => {
   const normalizedPath = ensureLeadingSlash(endpointPath);
   const queryString = query?.toString();
@@ -364,7 +363,9 @@ export const getWebSocketUrl = (endpointPath: string, wsPort: number, query?: UR
     return baseUrl.toString();
   }
 
-  const wsUrl = new URL(`${getWebSocketProtocol()}://${serverConfig.getServerHost()}:${wsPort}`);
+  const serverBaseUrl = new URL(serverConfig.getServerBaseUrl());
+  const wsProtocol = serverBaseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = new URL(`${wsProtocol}//${serverConfig.getServerHost()}:${wsPort}`);
   wsUrl.pathname = normalizedPath;
   wsUrl.search = queryString ? `?${queryString}` : '';
   return wsUrl.toString();
