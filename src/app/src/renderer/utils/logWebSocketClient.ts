@@ -1,4 +1,4 @@
-import { getAPIKey, getServerBaseUrl, getServerHost, getWebSocketProtocol, isExternalUrl, serverFetch } from './serverConfig';
+import { getAPIKey, getWebSocketUrl, serverFetch } from './serverConfig';
 
 export interface LogEntry {
   seq: number;
@@ -41,21 +41,7 @@ export async function connectLogStream(
     query.set('api_key', apiKey);
   }
 
-  let wsUrl: string;
-  if (isExternalUrl()) {
-    // Behind a reverse proxy: derive WS URL from the public base URL.
-    // The proxy is expected to forward /logs/stream to the internal WS port.
-    const base = new URL(getServerBaseUrl());
-    const wsProto = base.protocol === 'https:' ? 'wss' : 'ws';
-    const path = `${wsProto}://${base.host}/logs/stream`;
-    wsUrl = query.size > 0 ? `${path}?${query.toString()}` : path;
-  } else {
-    // Direct connect: use the separate websocket_port
-    const protocol = getWebSocketProtocol();
-    wsUrl = query.size > 0
-      ? `${protocol}://${getServerHost()}:${wsPort}/logs/stream?${query.toString()}`
-      : `${protocol}://${getServerHost()}:${wsPort}/logs/stream`;
-  }
+  const wsUrl = getWebSocketUrl('/logs/stream', wsPort, query);
   const socket = new WebSocket(wsUrl);
 
   socket.addEventListener('open', () => {

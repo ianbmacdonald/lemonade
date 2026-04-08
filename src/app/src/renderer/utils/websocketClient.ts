@@ -2,7 +2,7 @@
  * WebSocket client for realtime transcription.
  * Uses a raw WebSocket with OpenAI Realtime API message format.
  */
-import { getAPIKey, getServerBaseUrl, getServerHost, getWebSocketProtocol, isExternalUrl, serverFetch } from './serverConfig';
+import { getAPIKey, getWebSocketUrl, serverFetch } from './serverConfig';
 
 export interface TranscriptionCallbacks {
   /** Called with transcription text. isFinal=false for interim results that replace previous interim. */
@@ -29,18 +29,7 @@ export class TranscriptionWebSocket {
       query.set('api_key', apiKey);
     }
 
-    let wsUrl: string;
-    if (isExternalUrl()) {
-      // Behind a reverse proxy: derive WS URL from the public base URL.
-      // The proxy is expected to forward /realtime to the internal WS port.
-      const base = new URL(getServerBaseUrl());
-      const wsProto = base.protocol === 'https:' ? 'wss' : 'ws';
-      wsUrl = `${wsProto}://${base.host}/realtime?${query.toString()}`;
-    } else {
-      // Direct connect: use the separate websocket_port
-      const protocol = getWebSocketProtocol();
-      wsUrl = `${protocol}://${getServerHost()}:${wsPort}/realtime?${query.toString()}`;
-    }
+    const wsUrl = getWebSocketUrl('/realtime', wsPort, query);
 
     console.log('[WebSocket] Connecting to:', wsUrl);
 
