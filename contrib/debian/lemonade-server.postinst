@@ -30,4 +30,28 @@ if [ "$1" = "configure" ]; then
 	fi
 fi
 
+# #2125: releases before this one globally enabled the per-user lemond.service
+# (dh_installsystemduser without --no-enable), so systemd started a redundant
+# per-user lemond in every --user session -- the gdm-greeter dynamic-user session
+# grabbed :13305 before login, and every desktop/SSH login spawned an instance
+# that collided with the system service. We no longer enable it on install; on an
+# upgrade FROM one of those releases, disable the global enable they left behind
+# AND stop any per-user instance still holding the port, so the conflict clears
+# without waiting for a reboot. A user who deliberately enables a per-user
+# instance after this release is unaffected (this runs once, only when upgrading
+# from a pre-fix version). Any instance that cannot be reached (e.g. an older
+# systemctl that cannot act on user managers) clears on the next session
+# restart / reboot.
+# NOTE (maintainer): set the version below to the first release that ships this
+# change. The trailing '~' sorts before the release, so `lt "10.8.1~"` matches
+# every pre-fix version (e.g. 10.8.0) but not 10.8.1 itself.
+if [ "$1" = "configure" ] && [ -n "$2" ] && dpkg --compare-versions "$2" lt "10.8.1~"; then
+	if command -v deb-systemd-helper > /dev/null 2>&1; then
+		deb-systemd-helper --user disable lemond.service > /dev/null 2>&1 || true
+	fi
+	if [ -d /run/systemd/system ] && command -v deb-systemd-invoke > /dev/null 2>&1; then
+		deb-systemd-invoke --user stop lemond.service > /dev/null 2>&1 || true
+	fi
+fi
+
 #DEBHELPER#

@@ -13,3 +13,20 @@ override_dh_auto_test:
 
 override_dh_install:
 	dh_install
+
+# Ship the per-user lemond.service present but DISABLED. dh_installsystemduser
+# enables user units globally by default, so systemd starts a per-user lemond in
+# every --user session in addition to the system service -- and both bind :13305.
+# The gdm-greeter dynamic-user session starts it at the login screen and grabs
+# the port before the system service / the user logs in (#2125); any other
+# session (a desktop login or an SSH login) likewise spawns a second instance
+# that just collides with the system service. With --no-enable the unit ships
+# present but inactive: nothing is removed, the system service keeps serving
+# :13305 by default. A user who instead wants a per-user instance (running as
+# their own user, with their own cache/GPU) can enable it with
+# `systemctl --user enable --now lemond` -- both units default to :13305, so the
+# system service has to be stopped/disabled or the user instance pointed at a
+# different port first.
+# https://github.com/lemonade-sdk/lemonade/issues/2125
+override_dh_installsystemduser:
+	dh_installsystemduser --no-enable
