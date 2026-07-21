@@ -408,6 +408,12 @@ The following options are available depending on the recipe being used:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--openmoss BACKEND` | OpenMOSS TTS backend to use | Auto-detected |
+
+#### LiteRT (`litert` recipe)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--litert-args ARGS` | Custom arguments to pass to litert-lm-server | `""` |
 <!-- END GENERATED: cli-recipe-options -->
 **Notes:**
 - Unspecified options will use the backend's default values

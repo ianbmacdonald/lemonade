@@ -12,6 +12,7 @@ the generator instead. Prose outside the markers is preserved. -->
 | `acestep` | ACE-Step | yes | no | cuda, rocm, vulkan |
 | `flm` | FastFlowLM NPU | no | yes | npu |
 | `kokoro` | Kokoro | no | no | cpu, metal |
+| `litert` | LiteRT | no | no | system |
 | `llamacpp` | Llama.cpp GPU | yes | yes | cpu, cuda, metal, rocm, system, vulkan |
 | `moonshine` | Moonshine | no | no | cpu |
 | `onnxruntime` | ONNX Runtime | no | no | cpu |
@@ -35,6 +36,7 @@ the generator instead. Prose outside the markers is preserved. -->
 | `flm` | npu | linux, windows | amd_npu (XDNA2) |
 | `kokoro` | cpu | linux, windows | cpu (x86_64) |
 | `kokoro` | metal | macos | metal |
+| `litert` | system | linux | cpu (arm64, x86_64) |
 | `llamacpp` | system | linux | cpu (arm64, x86_64) |
 | `llamacpp` | metal | macos | metal |
 | `llamacpp` | cuda | linux, windows | nvidia_gpu (sm_100, sm_120, sm_121, sm_75, sm_80, sm_86, sm_89, sm_90) |
@@ -85,6 +87,12 @@ the generator instead. Prose outside the markers is preserved. -->
 |--------|----------|------|---------|-------------|
 | `ctx_size` | `--ctx-size` | SIZE | -1 | Context size for the model |
 | `flm_args` | `--flm-args` | ARGS | "" | Safe flm serve tuning args: --pmode, --prefill-chunk-len, --img-pre-resize, --socket, --q-len, --preemption |
+
+#### `litert` — LiteRT
+
+| Option | CLI flag | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `litert_args` | `--litert-args` | ARGS | "" | Custom arguments to pass to litert-lm-server |
 
 #### `llamacpp` — Llama.cpp GPU
 
@@ -178,6 +186,12 @@ the generator instead. Prose outside the markers is preserved. -->
 | Model | Size (GB) | Labels |
 |-------|-----------|--------|
 | `kokoro-v1` | 0.354 | tts |
+
+#### `litert` — LiteRT (1 models)
+
+| Model | Size (GB) | Labels |
+|-------|-----------|--------|
+| `Qwen3-0.6B-LiteRT` | 0.5 | reasoning |
 
 #### `llamacpp` — Llama.cpp GPU (77 models)
 

@@ -58,6 +58,9 @@ Values set in the user's `config.json` always take precedence over these seeded 
   "kokoro": {
     "cpu_bin": "builtin"
   },
+  "litert": {
+    "args": ""
+  },
   "llamacpp": {
     "args": "",
     "backend": "auto",

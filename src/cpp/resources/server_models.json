@@ -1830,5 +1830,13 @@
             "classification"
         ],
         "size": 0.27
+    },
+    "Qwen3-0.6B-LiteRT": {
+        "checkpoint": "litert-community/Qwen3-0.6B:qwen3_0_6b_mixed_int4.litertlm",
+        "recipe": "litert",
+        "labels": [
+            "reasoning"
+        ],
+        "size": 0.5
     }
 }

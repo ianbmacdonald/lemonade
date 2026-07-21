@@ -23,6 +23,9 @@
   "kokoro": {
     "cpu_bin": "builtin"
   },
+  "litert": {
+    "args": ""
+  },
   "llamacpp": {
     "args": "",
     "backend": "auto",
