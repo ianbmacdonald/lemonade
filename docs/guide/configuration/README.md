@@ -75,6 +75,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
   "kokoro": {
     "cpu_bin": "builtin"
   },
+  "litert": {
+    "args": ""
+  },
   "llamacpp": {
     "args": "",
     "backend": "auto",
