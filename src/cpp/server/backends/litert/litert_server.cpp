@@ -86,7 +86,10 @@ void LiteRtServer::load(const std::string& model_name,
         "--port", std::to_string(port_),
     };
 
-    std::set<std::string> reserved_flags = {"--model", "--port"};
+    // --host is reserved: litert-lm-server binds loopback by design (it is
+    // reached only by this in-process forwarder), and a recipe must not be able
+    // to widen that to the gateway LAN.
+    std::set<std::string> reserved_flags = {"--model", "--port", "--host"};
     if (!extra_args.empty()) {
         std::string validation_error = validate_custom_args(extra_args, reserved_flags);
         if (!validation_error.empty()) {
