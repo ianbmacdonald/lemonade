@@ -272,6 +272,9 @@ static HashCheckResult verify_file_hash(const fs::path& path, const ExpectedHash
 // large models that re-hash dominates repeat pulls (hashing runs ~280 MB/s, so
 // a 340 GiB model costs ~20 min per pull with no bytes to download). Any
 // mismatch, including a touched or replaced file, falls back to the full hash.
+// Accepted tradeoff: corruption that preserves both size and mtime (bit rot) is
+// no longer caught on repeat pulls; deleting the .verified file forces a full
+// re-verification.
 
 static fs::path verified_sidecar_path(const fs::path& file) {
     fs::path p = file;
@@ -306,6 +309,8 @@ static void write_verified_sidecar(const fs::path& file, const ExpectedHash& exp
     }
     std::ofstream out(verified_sidecar_path(file), std::ios::trunc);
     if (!out.is_open()) {
+        LOG(WARNING, "Download") << "Could not record verification sidecar (repeat pulls will re-hash): "
+                                 << verified_sidecar_path(file).string() << std::endl;
         return;
     }
     out << expected.algorithm << "\n"
@@ -1408,6 +1413,10 @@ DownloadResult HttpClient::download_file(const std::string& url,
                 final_result.error_message = "Download succeeded but failed to rename file: " + ec.message();
             } else if (expected_hash.present()) {
                 write_verified_sidecar(output_path_fs, expected_hash);
+            } else {
+                // An unverified replacement invalidates any prior attestation:
+                // a sidecar must never attest an inode it did not see.
+                remove_verified_sidecar(output_path_fs);
             }
             return final_result;
         }
