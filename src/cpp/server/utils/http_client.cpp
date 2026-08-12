@@ -266,6 +266,102 @@ static HashCheckResult verify_file_hash(const fs::path& path, const ExpectedHash
     return result;
 }
 
+// A ".verified" sidecar records that the file at this path passed a full content
+// verification: algorithm, digest, size and mtime, one per line. A later check
+// whose expected digest, size and mtime all match skips the full re-hash — on
+// large models that re-hash dominates repeat pulls (hashing runs ~280 MB/s, so
+// a 340 GiB model costs ~20 min per pull with no bytes to download). Any
+// mismatch, including a touched or replaced file, falls back to the full hash.
+
+static fs::path verified_sidecar_path(const fs::path& file) {
+    fs::path p = file;
+    p += ".verified";
+    return p;
+}
+
+static void remove_verified_sidecar(const fs::path& file) {
+    std::error_code ec;
+    fs::remove(verified_sidecar_path(file), ec);
+}
+
+static bool read_file_facts(const fs::path& file, uintmax_t& size, long long& mtime) {
+    std::error_code ec;
+    size = fs::file_size(file, ec);
+    if (ec) {
+        return false;
+    }
+    const auto t = fs::last_write_time(file, ec);
+    if (ec) {
+        return false;
+    }
+    mtime = static_cast<long long>(t.time_since_epoch().count());
+    return true;
+}
+
+static void write_verified_sidecar(const fs::path& file, const ExpectedHash& expected) {
+    uintmax_t size = 0;
+    long long mtime = 0;
+    if (!read_file_facts(file, size, mtime)) {
+        return;
+    }
+    std::ofstream out(verified_sidecar_path(file), std::ios::trunc);
+    if (!out.is_open()) {
+        return;
+    }
+    out << expected.algorithm << "\n"
+        << expected.value << "\n"
+        << size << "\n"
+        << mtime << "\n";
+}
+
+static bool sidecar_attests(const fs::path& file, const ExpectedHash& expected) {
+    std::ifstream in(verified_sidecar_path(file));
+    if (!in.is_open()) {
+        return false;
+    }
+    std::string algorithm, digest, size_line, mtime_line;
+    if (!std::getline(in, algorithm) || !std::getline(in, digest) ||
+        !std::getline(in, size_line) || !std::getline(in, mtime_line)) {
+        return false;
+    }
+    if (algorithm != expected.algorithm || lower_copy(digest) != expected.value) {
+        return false;
+    }
+    uintmax_t size = 0;
+    long long mtime = 0;
+    if (!read_file_facts(file, size, mtime)) {
+        return false;
+    }
+    try {
+        if (std::stoull(size_line) != size || std::stoll(mtime_line) != mtime) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// verify_file_hash plus the sidecar fast path: attested files skip the re-hash;
+// full verifications record a fresh attestation, failed ones drop it.
+static HashCheckResult verify_file_hash_cached(const fs::path& path, const ExpectedHash& expected) {
+    if (sidecar_attests(path, expected)) {
+        LOG(INFO, "Download") << "Hash previously verified (sidecar match); skipping re-hash: "
+                              << path.string() << std::endl;
+        HashCheckResult result;
+        result.ok = true;
+        result.actual = expected.value;
+        return result;
+    }
+    auto result = verify_file_hash(path, expected);
+    if (result.ok && expected.present()) {
+        write_verified_sidecar(path, expected);
+    } else if (!result.ok) {
+        remove_verified_sidecar(path);
+    }
+    return result;
+}
+
 } // namespace
 
 // Callback for writing response data to string
@@ -1148,7 +1244,7 @@ DownloadResult HttpClient::download_file(const std::string& url,
     // If a verified final file exists next to a stale .partial file, trust the
     // verified final file and remove the stale partial.
     if (expected_hash.present() && fs::exists(output_path_fs) && fs::exists(partial_path_fs)) {
-        auto hash_result = verify_file_hash(output_path_fs, expected_hash);
+        auto hash_result = verify_file_hash_cached(output_path_fs, expected_hash);
         if (hash_result.ok) {
             std::error_code remove_partial_ec;
             fs::remove(partial_path_fs, remove_partial_ec);
@@ -1174,7 +1270,7 @@ DownloadResult HttpClient::download_file(const std::string& url,
     // matches; otherwise remove it and force a fresh download.
     if (fs::exists(output_path_fs) && !fs::exists(partial_path_fs)) {
         if (expected_hash.present()) {
-            auto hash_result = verify_file_hash(output_path_fs, expected_hash);
+            auto hash_result = verify_file_hash_cached(output_path_fs, expected_hash);
             if (hash_result.ok) {
                 final_result.success = true;
                 final_result.bytes_downloaded = 0;
@@ -1310,6 +1406,8 @@ DownloadResult HttpClient::download_file(const std::string& url,
             if (ec) {
                 final_result.success = false;
                 final_result.error_message = "Download succeeded but failed to rename file: " + ec.message();
+            } else if (expected_hash.present()) {
+                write_verified_sidecar(output_path_fs, expected_hash);
             }
             return final_result;
         }
