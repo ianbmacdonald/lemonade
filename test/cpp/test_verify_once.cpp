@@ -17,6 +17,9 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+
+#include <httplib.h>
 
 #include <lemon/utils/http_client.h>
 
@@ -157,6 +160,53 @@ int main() {
         auto result = HttpClient::download_file(kDeadUrl, f.string(), nullptr, {},
                                                 fast_fail_options(kContentSha256));
         r.check(!result.success, "garbled sidecar falls back to the full hash (which fails)");
+    }
+
+    {
+        // Real-download legs against a loopback server: the post-rename write
+        // site attests a fresh hashed download, and an UNVERIFIED (no-hash)
+        // replacement drops a prior attestation rather than leaving it to
+        // guard bytes it never saw.
+        httplib::Server server;
+        server.Get("/content.bin", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(kContent, "application/octet-stream");
+        });
+        int port = server.bind_to_any_port("127.0.0.1");
+        std::thread server_thread([&server]() { server.listen_after_bind(); });
+        server.wait_until_ready();
+        const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/content.bin";
+
+        {
+            // Fresh hashed download writes the attestation at the rename site.
+            const fs::path f = dir / "fresh.bin";
+            auto options = fast_fail_options(kContentSha256);
+            auto result = HttpClient::download_file(url, f.string(), nullptr, {}, options,
+                                                    lemon::utils::HttpSecurityPolicy::TrustedLoopback);
+            r.check(result.success, "fresh hashed download succeeds");
+            const fs::path sidecar = fs::path(f) += ".verified";
+            r.check(fs::exists(sidecar), "post-download rename site writes the sidecar");
+        }
+
+        {
+            // A no-hash download that REPLACES the file removes the stale
+            // attestation (a sidecar must never attest an inode it did not see).
+            const fs::path f = dir / "replaced.bin";
+            write_file(f, kContent);
+            write_sidecar(f, "sha256", kContentSha256, fs::file_size(f), mtime_count(f));
+            write_file(fs::path(f) += ".partial", "partial-bytes");
+            DownloadOptions options;
+            options.max_retries = 0;
+            options.resume_partial = false;
+            options.connect_timeout = 2;
+            auto result = HttpClient::download_file(url, f.string(), nullptr, {}, options,
+                                                    lemon::utils::HttpSecurityPolicy::TrustedLoopback);
+            r.check(result.success, "no-hash replacement download succeeds");
+            r.check(!fs::exists(fs::path(f) += ".verified"),
+                    "unverified replacement removes the stale sidecar");
+        }
+
+        server.stop();
+        server_thread.join();
     }
 
     fs::remove_all(dir);
