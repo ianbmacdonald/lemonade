@@ -479,6 +479,12 @@ The following options are available depending on the recipe being used:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--litert-args ARGS` | Custom arguments to pass to litert-lm-server | `""` |
+
+#### TFLite (`tflite` recipe)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--tflite-args ARGS` | Custom arguments to pass to tflite-server | `""` |
 <!-- END GENERATED: cli-recipe-options -->
 **Notes:**
 - Unspecified options will use the backend's default values
