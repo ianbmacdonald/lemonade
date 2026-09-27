@@ -29,9 +29,9 @@ inline const BackendDescriptor descriptor = {
     /*support*/ {
         {"system", {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
     },
-    /*default_labels*/  {},
+    /*supported_modes*/ {"chat"},
     /*required_checkpoints*/ {"main"},
-    /*modality*/        "Text generation",
+    /*default_capabilities*/ {},
     /*experimental*/    true,
     /*web_display_name*/ "",
     /*rocm_channels*/   {},
