@@ -162,6 +162,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
     },
     "trust_incoming_trace_context": false
   },
+  "tflite": {
+    "args": ""
+  },
   "thenoise": {
     "backend": "auto",
     "lora_dir": "",

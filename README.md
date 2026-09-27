@@ -354,7 +354,7 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
       <td>Windows, Linux</td>
     </tr>
     <tr>
-      <td rowspan="3"><strong>Text classification</strong></td>
+      <td rowspan="4"><strong>Text classification</strong></td>
       <td rowspan="3"><code>onnxruntime</code> (experimental)</td>
       <td><code>cpu</code></td>
       <td><code>x86_64</code> CPU</td>
@@ -369,6 +369,12 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
       <td><code>cpu</code></td>
       <td><code>arm64</code> CPU</td>
       <td>macOS</td>
+    </tr>
+    <tr>
+      <td rowspan="1"><code>tflite</code> (experimental)</td>
+      <td><code>system</code></td>
+      <td><code>x86_64</code>/ARM64 CPU</td>
+      <td>Linux</td>
     </tr>
   </tbody>
 </table>

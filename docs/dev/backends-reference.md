@@ -21,6 +21,7 @@ the generator instead. Prose outside the markers is preserved. -->
 | `openmoss` | OpenMOSS TTS | yes | no | cuda, vulkan |
 | `ryzenai-llm` | Ryzen AI LLM | no | yes | npu |
 | `sd-cpp` | StableDiffusion.cpp | yes | no | cpu, cuda, metal, rocm, vulkan |
+| `tflite` | TFLite | no | no | system |
 | `thenoise` | TheNoise ROCm | yes | no | rocm |
 | `thinksound` | ThinkSound | yes | no | cuda, rocm, vulkan |
 | `trellis` | TRELLIS.2 | yes | no | cuda, rocm, vulkan |
@@ -62,6 +63,7 @@ the generator instead. Prose outside the markers is preserved. -->
 | `sd-cpp` | vulkan | linux, windows | amd_gpu; cpu (x86_64); nvidia_gpu |
 | `sd-cpp` | rocm | linux | amd_gpu (gfx103X, gfx110X, gfx1150, gfx1151, gfx1152, gfx120X) |
 | `sd-cpp` | cpu | linux, windows | cpu (x86_64) |
+| `tflite` | system | linux | cpu (arm64, x86_64) |
 | `thenoise` | rocm | linux | amd_gpu (gfx103X, gfx110X, gfx1150, gfx1151, gfx1152, gfx120X) |
 | `thinksound` | cuda | linux, windows | nvidia_gpu |
 | `thinksound` | vulkan | linux, windows | amd_gpu; cpu (x86_64); nvidia_gpu |
@@ -159,6 +161,12 @@ the generator instead. Prose outside the markers is preserved. -->
 | `height` | — | SIZE | 512 | Output image height |
 | `sampling_method` | — | ARGS | "" | Sampling method |
 | `flow_shift` | — | SIZE | 0.0 | Flow shift |
+
+#### `tflite` — TFLite
+
+| Option | CLI flag | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `tflite_args` | `--tflite-args` | ARGS | "" | Custom arguments to pass to tflite-server |
 
 #### `thenoise` — TheNoise ROCm
 

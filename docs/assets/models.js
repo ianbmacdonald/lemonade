@@ -16,6 +16,7 @@ const RECIPE_PRIORITY = [
   'openmoss',
   'ryzenai-llm',
   'sd-cpp',
+  'tflite',
   'thenoise',
   'thinksound',
   'trellis',
@@ -38,7 +39,8 @@ const RECIPE_DISPLAY_NAMES = {
   onnxruntime: 'ONNX Runtime',
   trellis: 'TRELLIS.2',
   openmoss: 'OpenMOSS TTS',
-  litert: 'LiteRT'
+  litert: 'LiteRT',
+  tflite: 'TFLite'
 };
 /* END GENERATED: models-js-recipes */
 
