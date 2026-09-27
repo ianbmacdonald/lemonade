@@ -2598,6 +2598,15 @@
         "size": 81.0,
         "min_resident_gb": 16.0
     },
+    "Gemma3-1B-IT-LiteRT": {
+        "checkpoint": "litert-community/Gemma3-1B-IT:gemma3-1b-it-int4.litertlm",
+        "recipe": "litert",
+        "suggested": true,
+        "labels": [
+            "chat"
+        ],
+        "size": 0.58
+    },
     "Qwen3-0.6B-LiteRT": {
         "checkpoint": "litert-community/Qwen3-0.6B:qwen3_0_6b_mixed_int4.litertlm",
         "recipe": "litert",
