@@ -28,9 +28,16 @@ namespace {
 // config.json. The config is mandatory even when a manifest is present — the
 // manifest describes the output contract only, so the backend still needs the
 // config to check the architecture against its supported input convention.
+// The graph is model.onnx, or model.ort (the ONNX Runtime format that a
+// --minimal_build ort-server requires; ort-server prefers it when both exist).
+bool has_model_graph(const fs::path& dir) {
+    std::error_code ec;
+    return fs::exists(dir / "model.onnx", ec) || fs::exists(dir / "model.ort", ec);
+}
+
 bool is_complete_model_dir(const fs::path& dir) {
     std::error_code ec;
-    return fs::exists(dir / "model.onnx", ec) && fs::exists(dir / "tokenizer.json", ec) &&
+    return has_model_graph(dir) && fs::exists(dir / "tokenizer.json", ec) &&
            fs::exists(dir / "config.json", ec);
 }
 
@@ -96,12 +103,15 @@ std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
     if (ec) return dirs;
     for (auto end = fs::recursive_directory_iterator(); it != end; it.increment(ec)) {
         if (ec) break;
-        if (it->is_regular_file(ec) && !ec && it->path().filename() == "model.onnx" &&
+        const fs::path name = it->path().filename();
+        if (it->is_regular_file(ec) && !ec && (name == "model.onnx" || name == "model.ort") &&
             is_complete_model_dir(it->path().parent_path())) {
             dirs.push_back(it->path().parent_path());
         }
     }
     std::sort(dirs.begin(), dirs.end());
+    // A directory holding both model.onnx and model.ort is one model, not two.
+    dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
     return dirs;
 }
 }  // namespace
@@ -166,7 +176,7 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     if (candidates.empty()) {
         throw std::runtime_error(
             "No servable model directory under '" + model_path +
-            "': need model.onnx + tokenizer.json + config.json "
+            "': need model.onnx (or model.ort) + tokenizer.json + config.json "
             "(manifest.json is optional and overrides the output contract)");
     }
     if (candidates.size() > 1) {
