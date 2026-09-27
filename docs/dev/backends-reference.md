@@ -13,6 +13,7 @@ the generator instead. Prose outside the markers is preserved. -->
 | `ds4` | DwarfStar4 (experimental) | no | yes | rocm |
 | `flm` | FastFlowLM NPU | no | yes | npu |
 | `kokoro` | Kokoro | no | no | cpu, metal |
+| `litert` | LiteRT | no | no | system |
 | `llamacpp` | Llama.cpp GPU | yes | yes | cpu, cuda, metal, rocm, system, vulkan |
 | `llamacpp-hrx` | HRX GPU (experimental) | no | yes | hrx |
 | `moonshine` | Moonshine | no | no | cpu |
@@ -39,6 +40,7 @@ the generator instead. Prose outside the markers is preserved. -->
 | `flm` | npu | linux, windows | amd_npu (XDNA2) |
 | `kokoro` | metal | macos | metal |
 | `kokoro` | cpu | linux, windows | cpu (x86_64) |
+| `litert` | system | linux | cpu (arm64, x86_64) |
 | `llamacpp` | system | linux | cpu (arm64, x86_64) |
 | `llamacpp` | metal | macos | metal |
 | `llamacpp` | cuda | linux, windows | nvidia_gpu (sm_100, sm_120, sm_121, sm_75, sm_80, sm_86, sm_89, sm_90) |
@@ -104,6 +106,12 @@ the generator instead. Prose outside the markers is preserved. -->
 |--------|----------|------|---------|-------------|
 | `ctx_size` | `--ctx-size` | SIZE | -1 | Context size for the model |
 | `flm_args` | `--flm-args` | ARGS | "" | Safe flm serve tuning args: --pmode, --prefill-chunk-len, --img-pre-resize, --socket, --q-len, --preemption |
+
+#### `litert` — LiteRT
+
+| Option | CLI flag | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `litert_args` | `--litert-args` | ARGS | "" | Custom arguments to pass to litert-lm-server |
 
 #### `llamacpp` — Llama.cpp GPU
 
