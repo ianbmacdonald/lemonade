@@ -2602,6 +2602,7 @@
         "checkpoint": "litert-community/Qwen3-0.6B:qwen3_0_6b_mixed_int4.litertlm",
         "recipe": "litert",
         "labels": [
+            "chat",
             "reasoning"
         ],
         "size": 0.5
