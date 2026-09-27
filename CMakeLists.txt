@@ -240,6 +240,7 @@ set(LEMON_BACKENDS
     "trellis|trellis"
     "openmoss|openmoss"
     "litert|litert"
+    "tflite|tflite"
 )
 
 # ============================================================
