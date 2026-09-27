@@ -133,6 +133,9 @@ public:
     // default pin. Beware: vLLM release tags use the raw ISA (gfx942), unlike
     // therock.url_mapping, which maps it to gfx94X-dcgpu.
     static std::string vllm_rocm_version_override(const std::string& asset_family);
+    // GitHub repo that publishes the vLLM ROCm release for an asset family, when it is
+    // not lemonade-sdk/vllm-rocm (backend_versions.json vllm.rocm_arch_repos); "" = default.
+    static std::string vllm_rocm_repo_override(const std::string& asset_family);
 
     // When set non-empty on the calling thread, get_rocm_arch() returns this
     // value instead of probing hardware, so backend asset URLs can be resolved

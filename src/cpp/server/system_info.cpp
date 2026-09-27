@@ -2128,6 +2128,27 @@ std::string SystemInfo::vllm_rocm_version_override(const std::string& asset_fami
     return "";
 }
 
+std::string SystemInfo::vllm_rocm_repo_override(const std::string& asset_family) {
+    static const json repos = []() -> json {
+        try {
+            std::string config_path = utils::get_resource_path("resources/backend_versions.json");
+            std::ifstream file(config_path);
+            if (!file.is_open()) {
+                return json::object();
+            }
+            json vllm = json::parse(file).value("vllm", json::object());
+            return vllm.value("rocm_arch_repos", json::object());
+        } catch (...) {
+            return json::object();
+        }
+    }();
+
+    if (auto it = repos.find(asset_family); it != repos.end() && it->is_string()) {
+        return it->get<std::string>();
+    }
+    return "";
+}
+
 std::string SystemInfo::select_rocm_arch(const json& amd_gpu_devices) {
     if (!amd_gpu_devices.is_array()) {
         return "";

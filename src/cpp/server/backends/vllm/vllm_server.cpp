@@ -307,6 +307,9 @@ InstallParams VLLMServer::get_install_params(const std::string& backend, const s
             );
         }
 #ifdef __linux__
+        if (std::string repo = SystemInfo::vllm_rocm_repo_override(target_arch); !repo.empty()) {
+            params.repo = repo;
+        }
         // The per-arch override replaces ONLY the builtin default base, so an explicit
         // vllm.rocm_bin pin is not silently clobbered on an MI300X host.
         std::string arch_override = SystemInfo::vllm_rocm_version_override(target_arch);
