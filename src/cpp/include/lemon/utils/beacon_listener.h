@@ -42,7 +42,8 @@ enum class IngestResult {
     UrlMismatch,
     RateLimited,
     TableFull,
-    WrongInterface
+    WrongInterface,
+    UnknownInterface
 };
 
 const char* ingest_result_name(IngestResult result);
@@ -155,7 +156,7 @@ private:
     void refresh_sockets();
     void close_all_sockets();
     void publish_socket_status();
-    bool arrived_on_listened_interface(const SocketState& sock, unsigned ifindex) const;
+    bool arrived_on_listened_interface(unsigned ifindex) const;
     void wait_slice();
     void log_rejection(IngestResult result, uint32_t src_ip);
 
@@ -172,6 +173,8 @@ private:
     bool start_failed_ = false;
     nlohmann::json sockets_status_ = nlohmann::json::array();
     nlohmann::json interfaces_status_ = nlohmann::json::array();
+    nlohmann::json unmatched_status_ = nlohmann::json::array();
+    std::string allowlist_error_;
 
     mutable std::mutex allowlist_mtx_;
     std::vector<std::string> allowlist_;
@@ -179,6 +182,7 @@ private:
 
     std::vector<SocketState> sockets_;
     std::vector<ListenedInterface> interfaces_;
+    std::vector<std::string> unmatched_;
     bool allowlist_active_ = false;
     std::map<IngestResult, std::chrono::steady_clock::time_point> last_warning_;
     BeaconPeerTable table_;
