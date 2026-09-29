@@ -15,6 +15,12 @@ namespace lemon {
 
 using json = nlohmann::json;
 
+ModelNameMapper public_model_name_mapper(ModelManager& model_manager) {
+    return [&model_manager](const std::string& name) {
+        return model_manager.get_public_model_name(name);
+    };
+}
+
 std::optional<Decision> evaluate_router_policy(ServerContext& ctx, const ModelInfo& info,
                                                const json& body, bool want_trace) {
     // The policy is parsed once when the models cache is built. A missing one means
@@ -64,6 +70,7 @@ std::optional<RouterDispatchResult> router_dispatch(ServerContext& ctx, std::str
         result.requested_model = requested_model;
         result.selected_model = decision->route_to;
         result.decision = std::move(*decision);
+        result.public_model_name = public_model_name_mapper(*ctx.model_manager);
         ctx.router->note_route_decision(utils::conversation_fingerprint(body),
                                         result.selected_model);
 

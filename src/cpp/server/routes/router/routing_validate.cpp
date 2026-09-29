@@ -270,7 +270,8 @@ public:
             normalized_policy["routing"] = std::move(normalized_routing);
 
             json response = {
-                {"decision", route_decision_to_json(decision)},
+                {"decision", route_decision_to_json(
+                                 decision, public_model_name_mapper(*ctx_.model_manager))},
                 {"normalized_policy", std::move(normalized_policy)},
             };
             res.set_content(response.dump(), "application/json");
@@ -348,9 +349,10 @@ private:
                 return;
             }
 
+            const ModelNameMapper public_name = public_model_name_mapper(*ctx_.model_manager);
             json response = {
-                {"model", ctx_.model_manager->get_public_model_name(info.model_name)},
-                {"decision", route_decision_to_json(*decision)},
+                {"model", public_name(info.model_name)},
+                {"decision", route_decision_to_json(*decision, public_name)},
             };
             res.set_content(response.dump(), "application/json");
         } catch (const RouterResidencyConflictException& e) {

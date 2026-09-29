@@ -615,7 +615,8 @@ void ApiRoute::stream_response(RouteRequest& req, httplib::Response& res, Stream
     }
 
     json route_decision_json = req.route_decision
-        ? route_decision_to_json(req.route_decision->decision)
+        ? route_decision_to_json(req.route_decision->decision,
+                                 req.route_decision->public_model_name)
         : json(nullptr);
     std::string body = req.body.is_null() ? req.http.body : req.body.dump();
     std::function<bool()> is_closed = req.http.is_connection_closed;
@@ -767,7 +768,8 @@ void attach_route_decision(json& response, httplib::Response& res,
     if (!decision) {
         return;
     }
-    response["x_lemonade_route"] = route_decision_to_json(decision->decision);
+    response["x_lemonade_route"] =
+        route_decision_to_json(decision->decision, decision->public_model_name);
     attach_route_header(res, decision->decision);
 }
 

@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "lemon/route_decision_response.h"
 #include "lemon/routing_policy.h"
 
 namespace lemon {
@@ -18,7 +19,12 @@ struct RouterDispatchResult {
     std::string requested_model;
     std::string selected_model;
     Decision decision;
+    // Dispatch uses the engine's internal ids; responses report public names, the ones
+    // /v1/models lists, so a client can join route_to against it.
+    ModelNameMapper public_model_name;
 };
+
+ModelNameMapper public_model_name_mapper(ModelManager& model_manager);
 
 // The decision the registered policy of collection.router `info` makes for body. Dispatch
 // and the classify-only /routing/validate share it so the two cannot disagree. It has no
