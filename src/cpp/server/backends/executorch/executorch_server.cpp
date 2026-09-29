@@ -1,13 +1,15 @@
 #include "lemon/backends/executorch/executorch_server.h"
-#include "lemon/backends/executorch/executorch.h"
-#include "lemon/backends/backend_registry.h"
-#include "lemon/backends/backend_ops.h"
-#include "lemon/backends/backend_utils.h"
-#include "lemon/backends/hf_cache_util.h"
+
 #include "lemon/backend_manager.h"
-#include "lemon/utils/path_utils.h"
+#include "lemon/backends/backend_ops.h"
+#include "lemon/backends/backend_registry.h"
+#include "lemon/backends/backend_utils.h"
+#include "lemon/backends/executorch/executorch.h"
+#include "lemon/backends/hf_cache_util.h"
+#include "lemon/error_types.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
+#include "lemon/utils/path_utils.h"
 #include "lemon/utils/process_manager.h"
 #include <algorithm>
 #include <filesystem>
@@ -24,6 +26,10 @@ namespace lemon {
 namespace backends {
 
 namespace {
+// et-server rejects larger bodies itself; refusing here keeps an oversized
+// request from being copied into a second body just to be refused.
+constexpr size_t kMaxClassifyTextBytes = 1024 * 1024;
+
 // The config is mandatory even when a manifest is present: the manifest
 // describes the output contract only, and et-server still needs the config to
 // check the architecture against its supported input convention.
@@ -103,8 +109,11 @@ std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
 // Subprocess contract (ort-server's):
 //   GET  /health             -> 200 once every method in the .pte is loaded
 //   POST /classify {text}    -> 200 {"labels": {"<label>": <score in [0,1]>, ...}}
+//   refusing a model         -> one "et-server: ..." stderr line, then exit(1)
+// Exit statuses above 128 are read as signal deaths, so a launcher wrapper must
+// exec et-server rather than propagate its status from a shell.
 InstallParams ExecutorchServer::get_install_params(const std::string& backend,
-                                               const std::string& version) {
+                                                   const std::string& version) {
     (void)backend;
     (void)version;
     throw std::runtime_error(
@@ -113,7 +122,7 @@ InstallParams ExecutorchServer::get_install_params(const std::string& backend,
 }
 
 ExecutorchServer::ExecutorchServer(const std::string& log_level, ModelManager* model_manager,
-                                     BackendManager* backend_manager)
+                                   BackendManager* backend_manager)
     : WrappedServer("et-server", log_level, model_manager, backend_manager) {
 }
 
@@ -122,9 +131,9 @@ ExecutorchServer::~ExecutorchServer() {
 }
 
 void ExecutorchServer::load(const std::string& model_name,
-                             const ModelInfo& model_info,
-                             const RecipeOptions& options,
-                             bool do_not_upgrade) {
+                            const ModelInfo& model_info,
+                            const RecipeOptions& options,
+                            bool do_not_upgrade) {
     (void)do_not_upgrade;
     LOG(INFO, "ExecutorchServer") << "Loading model: " << model_name << std::endl;
     LOG(INFO, "ExecutorchServer") << "Per-model settings: " << options.to_log_string() << std::endl;
@@ -146,7 +155,7 @@ void ExecutorchServer::load(const std::string& model_name,
     // the resolved path is the only candidate.
     auto candidates = find_complete_model_dirs(path_from_utf8(model_path));
     if (candidates.empty()) {
-        throw std::runtime_error(
+        throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
             "': need model.pte + tokenizer.json + config.json "
             "(manifest.json is optional and overrides the output contract)");
@@ -154,7 +163,7 @@ void ExecutorchServer::load(const std::string& model_name,
     if (candidates.size() > 1) {
         std::string listing;
         for (const auto& c : candidates) listing += "\n  " + path_to_utf8(c);
-        throw std::runtime_error(
+        throw NonRetryableLoadException(
             "Ambiguous model layout under '" + model_path + "': " +
             std::to_string(candidates.size()) +
             " complete model directories found — keep exactly one:" + listing);
@@ -165,14 +174,11 @@ void ExecutorchServer::load(const std::string& model_name,
     std::string executable = BackendUtils::get_backend_binary_path(*executorch::spec(), "system");
     LOG(INFO, "ExecutorchServer") << "Using executable: " << executable << std::endl;
 
-    port_ = utils::ProcessManager::find_free_port(8001);
-    if (port_ == 0) {
-        throw std::runtime_error("Failed to find an available port for et-server");
-    }
+    const int port = choose_port();
 
     std::vector<std::string> args = {
         "--model-path", model_path,
-        "--port", std::to_string(port_),
+        "--port", std::to_string(port),
     };
 
     std::set<std::string> reserved_flags = {"--model-path", "--port"};
@@ -195,21 +201,36 @@ void ExecutorchServer::load(const std::string& model_name,
     }
     LOG(INFO, "ExecutorchServer") << "Process started with PID: " << started_handle.pid << std::endl;
 
-    if (!wait_for_ready("/health")) {
+    constexpr long kReadyTimeoutSeconds = 600;
+    if (!wait_for_ready("/health", kReadyTimeoutSeconds)) {
         unload();
-        // A signal death during load is almost always the OOM killer. Relaunching
-        // to capture stderr would repeat the full load under the same memory
-        // pressure and could take a resident LLM down with it, so report it as is.
+        // Every failure below is non-retryable: et-server is CPU-only, so the
+        // Router's evict-everything-and-retry would only cost the resident LLM
+        // and repeat a load that failed for reasons eviction does not change.
         const int exit_code = startup_exit_code();
-        if (exit_code > 128 && exit_code <= 128 + 64) {
-            const int sig = exit_code - 128;
-            throw std::runtime_error(
-                "et-server was killed by signal " + std::to_string(sig) +
-                (sig == 9 ? " (likely out of memory)" : ""));
+        if (load_cancel_ && load_cancel_->load()) {
+            throw NonRetryableLoadException("et-server load cancelled");
         }
+        if (exit_code < 0) {
+            // Still running at the deadline: on a small box that is memory
+            // thrash, and a capture relaunch would load the model a second time.
+            throw NonRetryableLoadException("et-server did not become ready within " +
+                                            std::to_string(kReadyTimeoutSeconds) + " s");
+        }
+        if (exit_code == 128 + 9) {
+            // SIGKILL during load is the OOM killer's signature; relaunching to
+            // capture stderr would repeat the full load under the same pressure.
+            throw NonRetryableLoadException(
+                "et-server was killed by signal 9 (likely out of memory)");
+        }
+        // A fast refusal or crash (abort, segfault) is cheap to repeat, and the
+        // relaunch is the only way to show the diagnostic line it printed.
         std::string details = capture_startup_error(executable, args);
-        throw std::runtime_error("et-server failed to start or become ready" +
-                                 (details.empty() ? "" : ": " + details));
+        std::string status = exit_code > 128
+            ? "killed by signal " + std::to_string(exit_code - 128)
+            : "exited with code " + std::to_string(exit_code);
+        throw NonRetryableLoadException("et-server " + status + " during startup" +
+                                        (details.empty() ? "" : ": " + details));
     }
     start_backend_watchdog("/health");
     LOG(INFO, "ExecutorchServer") << "Server is ready!" << std::endl;
@@ -243,6 +264,16 @@ json ExecutorchServer::classify(const json& request) {
                 {"message", "Missing 'input' (or 'text') string in classify request"},
                 {"type", "invalid_request_error"},
                 {"status_code", 400},
+            }}
+        };
+    }
+    if (text.size() > kMaxClassifyTextBytes) {
+        return json{
+            {"error", {
+                {"message", "Classify text exceeds " + std::to_string(kMaxClassifyTextBytes) +
+                            " bytes"},
+                {"type", "invalid_request_error"},
+                {"status_code", 413},
             }}
         };
     }

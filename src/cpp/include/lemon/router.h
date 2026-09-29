@@ -135,6 +135,10 @@ public:
 
     ~Router();
 
+    // True when a failed backend load must be rethrown as is, without evicting
+    // the other loaded models and retrying.
+    static bool load_error_skips_nuclear_retry(const std::exception& error);
+
     // Wires the cloud provider registry so the Router can construct
     // CloudServer instances with a credential source. Pointer (not
     // ownership) — Server owns the registry.

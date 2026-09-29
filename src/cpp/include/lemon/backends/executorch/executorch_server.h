@@ -1,10 +1,9 @@
 #pragma once
 
 #include "lemon/backends/backend_registry.h"
-
-#include "lemon/wrapped_server.h"
-#include "lemon/server_capabilities.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/server_capabilities.h"
+#include "lemon/wrapped_server.h"
 #include <string>
 
 namespace lemon {

@@ -80,6 +80,18 @@ Router::Router(RuntimeConfig* config, ModelManager* model_manager, BackendManage
     eviction_engine_->start();
 }
 
+bool Router::load_error_skips_nuclear_retry(const std::exception& error) {
+    if (dynamic_cast<const NonRetryableLoadException*>(&error) != nullptr) {
+        return true;
+    }
+    // A missing file stays missing after an eviction, so it is the one
+    // message-classified exception to the nuclear policy.
+    const std::string message = error.what();
+    return message.find("not found") != std::string::npos ||
+           message.find("does not exist") != std::string::npos ||
+           message.find("No such file") != std::string::npos;
+}
+
 Router::~Router() {
     LOG(DEBUG, "Router") << "Destructor: stopping monitors and unloading all models" << std::endl;
     if (eviction_engine_) eviction_engine_->stop();
@@ -1045,6 +1057,7 @@ void Router::load_model(const std::string& model_name,
         // Load the backend (this can take 30-60 seconds)
         LOG(DEBUG, "Router") << "Starting backend (this may take a moment)..." << std::endl;
         bool load_success = false;
+        bool skip_nuclear_retry = false;
         std::string error_message;
         auto load_start = std::chrono::steady_clock::now();
 
@@ -1059,6 +1072,7 @@ void Router::load_model(const std::string& model_name,
         } catch (const std::exception& e) {
             error_message = e.what();
             load_success = false;
+            skip_nuclear_retry = load_error_skips_nuclear_retry(e);
             LOG(ERROR, "Router") << "Backend load failed: " << error_message << std::endl;
         }
 
@@ -1100,12 +1114,6 @@ void Router::load_model(const std::string& model_name,
             LOG(INFO, "Router") << "Model loaded successfully. Total loaded: "
                       << loaded_servers_.size() << std::endl;
         } else {
-            // ERROR HANDLING (from spec: Error Handling section)
-            // Check if error is "file not found" (exception to nuclear policy)
-            bool is_file_not_found = (error_message.find("not found") != std::string::npos ||
-                                     error_message.find("does not exist") != std::string::npos ||
-                                     error_message.find("No such file") != std::string::npos);
-
             is_loading_ = false;
             load_cv_.notify_all();
 
@@ -1114,8 +1122,8 @@ void Router::load_model(const std::string& model_name,
                 throw std::runtime_error("load cancelled");
             }
 
-            if (is_file_not_found) {
-                LOG(ERROR, "Router") << "File not found error, NOT evicting other models" << std::endl;
+            if (skip_nuclear_retry) {
+                LOG(ERROR, "Router") << "Non-retryable load error, NOT evicting other models" << std::endl;
                 throw std::runtime_error(error_message);
             }
 
@@ -1132,7 +1140,7 @@ void Router::load_model(const std::string& model_name,
             }
 
             // Nuclear option: evict all models and retry
-            LOG(WARNING, "Router") << "Load failed with non-file-not-found error, "
+            LOG(WARNING, "Router") << "Load failed with a retryable error, "
                       << "evicting all models and retrying..." << std::endl;
 
             evict_all_servers();
