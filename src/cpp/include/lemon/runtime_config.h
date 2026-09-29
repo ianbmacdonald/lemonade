@@ -44,6 +44,7 @@ public:
     long global_timeout() const;
     int max_loaded_models() const;
     int64_t download_rate_limit_bytes_per_second() const;
+    int download_connections() const;
     std::string allowed_origins() const;
 
     std::string models_dir() const;

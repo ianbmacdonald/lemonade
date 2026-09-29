@@ -424,6 +424,7 @@ Server::Server(std::shared_ptr<RuntimeConfig> config,
 
     // Global download rate limit
     utils::HttpClient::set_download_rate_limit(config->download_rate_limit_bytes_per_second());
+    utils::HttpClient::set_download_connections(config->download_connections());
 
     cloud_registry_ = std::make_unique<CloudProviderRegistry>();
     // Seed installed providers from config.json. Runtime keys stay empty
@@ -7636,6 +7637,10 @@ void Server::apply_config_side_effects(const json& applied_changes) {
                 LOG(INFO, "Server") << "Download rate limit disabled" << std::endl;
             }
             utils::HttpClient::set_download_rate_limit(bps);
+        } else if (key == "download_connections") {
+            const int connections = config_->download_connections();
+            LOG(INFO, "Server") << "Download connections per file set to " << connections << std::endl;
+            utils::HttpClient::set_download_connections(connections);
         } else if (key == "allowed_origins") {
             LOG(INFO, "Server") << "Allowed origins updated: " << config_->allowed_origins() << std::endl;
         } else if (key == "broadcast" || key == "no_broadcast") {

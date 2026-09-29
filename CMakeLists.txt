@@ -3411,6 +3411,13 @@ if(BUILD_TESTING AND EXISTS "${_VERIFY_ONCE_TEST_SRC}")
     add_cpp_ci_test(VerifyOnceTest CI ON COMMAND test_verify_once)
 endif()
 
+set(_PARALLEL_DOWNLOAD_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_parallel_download.cpp")
+if(BUILD_TESTING AND EXISTS "${_PARALLEL_DOWNLOAD_TEST_SRC}")
+    add_executable(test_parallel_download test/cpp/test_parallel_download.cpp)
+    target_link_libraries(test_parallel_download PRIVATE lemonade-server-core)
+    add_cpp_ci_test(ParallelDownloadTest CI ON COMMAND test_parallel_download)
+endif()
+
 set(_CLOUD_DISCOVERY_POLICY_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_cloud_discovery_policy.cpp")
 if(BUILD_TESTING AND EXISTS "${_CLOUD_DISCOVERY_POLICY_TEST_SRC}")
     add_executable(test_cloud_discovery_policy test/cpp/test_cloud_discovery_policy.cpp)

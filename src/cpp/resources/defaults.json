@@ -18,6 +18,7 @@
   "ctx_size": -1,
   "default_model_source": "huggingface",
   "disable_model_filtering": false,
+  "download_connections": 8,
   "download_rate_limit": "",
   "ds4": {
     "args": ""

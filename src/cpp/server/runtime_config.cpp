@@ -2,6 +2,7 @@
 #include "lemon/backends/backend_descriptor_registry.h"
 #include "lemon/system_info.h"
 #include "lemon/utils/aixlog.hpp"
+#include "lemon/utils/http_client.h"
 #include "lemon/utils/path_utils.h"
 #include "lemon/utils/rate_limit_utils.h"
 #include <algorithm>
@@ -429,6 +430,21 @@ int64_t RuntimeConfig::download_rate_limit_bytes_per_second() const {
         return 0;
     }
     return parsed;
+}
+
+int RuntimeConfig::download_connections() const {
+    std::shared_lock lock(mutex_);
+    if (!config_.contains("download_connections") ||
+        !config_["download_connections"].is_number_integer()) {
+        return utils::HttpClient::kDefaultDownloadConnections;
+    }
+    const int64_t n = config_["download_connections"].get<int64_t>();
+    if (n < 1 || n > utils::HttpClient::kMaxDownloadConnections) {
+        LOG(WARNING, "RuntimeConfig") << "Invalid download_connections value in config, using "
+                                      << utils::HttpClient::kDefaultDownloadConnections << std::endl;
+        return utils::HttpClient::kDefaultDownloadConnections;
+    }
+    return static_cast<int>(n);
 }
 
 std::string RuntimeConfig::allowed_origins_unlocked() const {
@@ -869,6 +885,16 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
             throw std::invalid_argument(
                 "'download_rate_limit' must be a byte rate like \"512\", \"100K\", \"10M\", etc. "
                 "Use \"\" for unlimited download speed");
+        }
+    } else if (key == "download_connections") {
+        if (!value.is_number_integer()) {
+            throw std::invalid_argument("'download_connections' must be an integer");
+        }
+        const int64_t n = value.get<int64_t>();
+        if (n < 1 || n > utils::HttpClient::kMaxDownloadConnections) {
+            throw std::invalid_argument(
+                "'download_connections' must be between 1 and " +
+                std::to_string(utils::HttpClient::kMaxDownloadConnections));
         }
     } else if (key == "allowed_origins") {
         if (!value.is_string()) {
