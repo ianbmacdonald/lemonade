@@ -2110,18 +2110,26 @@ json Router::classify(const json& request) {
     }
 }
 
+std::optional<json> Router::image_classify_cooldown_error(const std::string& model_name) {
+    const long long wait = image_crash_breaker_.blocked_seconds(
+        resolve_model_name(model_name), CrashBreaker::Clock::now());
+    if (wait == 0) {
+        return std::nullopt;
+    }
+    return json{{"error", {
+        {"message", "The backend for model '" + model_name +
+                        "' crashed repeatedly on recent inputs; image classification is paused"},
+        {"type", ErrorType::BACKEND_ERROR},
+        {"code", "backend_crash_cooldown"},
+        {"status_code", 503},
+        {"retry_after", wait},
+        {"retryable", true}}}};
+}
+
 json Router::classify_image(const json& params, std::string image_bytes) {
     std::string requested_model = params.value("model", "");
-    if (const long long wait = image_crash_breaker_.blocked_seconds(
-            requested_model, CrashBreaker::Clock::now())) {
-        return json{{"error", {
-            {"message", "The backend for model '" + requested_model +
-                            "' crashed repeatedly on recent inputs; image classification is paused"},
-            {"type", ErrorType::BACKEND_ERROR},
-            {"code", "backend_crash_cooldown"},
-            {"status_code", 503},
-            {"retry_after", wait},
-            {"retryable", true}}}};
+    if (auto paused = image_classify_cooldown_error(requested_model)) {
+        return *paused;
     }
     std::shared_ptr<telemetry::InferenceSpan> span = telemetry::TelemetryTracker::start_span(
         "CLASSIFIER", "image_classify", requested_model, params);
@@ -2146,7 +2154,8 @@ json Router::classify_image(const json& params, std::string image_bytes) {
 
         if (response.contains("error") && response["error"].is_object() &&
             response["error"].value("code", "") == "backend_crashed_on_input" &&
-            image_crash_breaker_.record_crash(requested_model, CrashBreaker::Clock::now())) {
+            image_crash_breaker_.record_crash(resolve_model_name(requested_model),
+                                              CrashBreaker::Clock::now())) {
             LOG(WARNING, "Router") << "Image classification for '" << requested_model
                                    << "' paused after repeated backend crashes" << std::endl;
         }

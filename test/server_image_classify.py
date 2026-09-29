@@ -599,6 +599,10 @@ class ImageClassifyTests(ServerTestBase):
             data={"model": MODEL, "top_k": "1"},
         )
         self._assert_status(response, 503, "good image while paused")
+        implicit = self._post_form(
+            {"image": ("g.jpg", self._fixture(), "image/jpeg")}, data={"top_k": "1"}
+        )
+        self._assert_status(implicit, 503, "implicit model while paused")
         self.assertEqual(lines(crashes), crashes_before, "paused model crashed again")
         self.assertEqual(lines(starts), starts_before, "paused model was reloaded")
 

@@ -4569,6 +4569,16 @@ void Server::handle_image_classify(const httplib::Request& req, httplib::Respons
         res.set_content(error.dump(), "application/json");
     };
 
+    auto send_if_paused = [this, &res](const std::string& model) {
+        auto paused = router_->image_classify_cooldown_error(model);
+        if (!paused) return false;
+        res.status = 503;
+        res.set_header("Retry-After",
+                       std::to_string((*paused)["error"]["retry_after"].get<long long>()));
+        res.set_content(paused->dump(), "application/json");
+        return true;
+    };
+
     try {
         std::uint64_t received = req.body.size();
         for (const auto& [name, field] : req.form.fields) received += name.size() + field.content.size();
@@ -4624,6 +4634,7 @@ void Server::handle_image_classify(const httplib::Request& req, httplib::Respons
                            "model_not_applicable");
                 return;
             }
+            if (send_if_paused(requested_model)) return;
             try {
                 auto_load_model_if_needed(requested_model, extract_auto_load_options(params));
             } catch (const std::exception& e) {
@@ -4643,6 +4654,7 @@ void Server::handle_image_classify(const httplib::Request& req, httplib::Respons
                                 "is loaded (load one, or name it in the request)");
                 return;
             }
+            if (send_if_paused(requested_model)) return;
             params["model"] = requested_model;
         }
 

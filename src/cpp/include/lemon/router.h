@@ -229,6 +229,10 @@ public:
     json reranking(const json& request);
     json classify(const json& request);
     json classify_image(const json& params, std::string image_bytes);
+    // The 503 error to return while image classification for this model is
+    // paused after repeated backend crashes; checked before any auto-load so a
+    // paused model is not reloaded either.
+    std::optional<json> image_classify_cooldown_error(const std::string& model_name);
     json get_slots();
     json slots_action(int slot_id, const std::string& action, const json& request_body);
     json tokenize(const json& request);
