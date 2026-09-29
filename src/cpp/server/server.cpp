@@ -3804,9 +3804,10 @@ void Server::handle_collection_chat_completions(const nlohmann::json& request_js
     res.set_content(response.dump(), "application/json");
 }
 
-std::optional<RouterDispatchResult> Server::route_collection_request(
+std::optional<Decision> Server::evaluate_collection_route(
     const nlohmann::json& request_json,
-    const ModelInfo& collection_info) {
+    const ModelInfo& collection_info,
+    bool want_trace) {
     // The policy is parsed once when the models cache is built (ModelManager),
     // so dispatch just reads it here. A missing policy means the collection
     // failed to parse at cache-build time; return nullopt so the caller leaves
@@ -3831,12 +3832,21 @@ std::optional<RouterDispatchResult> Server::route_collection_request(
                                std::move(cost_services));
 
     RouteContext ctx = build_route_context(request_json, collection_info.model_name);
-    const bool want_trace = request_json.value("route_trace", false);
-    Decision decision = engine.route(ctx, want_trace);
+    return engine.route(ctx, want_trace);
+}
+
+std::optional<RouterDispatchResult> Server::route_collection_request(
+    const nlohmann::json& request_json,
+    const ModelInfo& collection_info) {
+    std::optional<Decision> decision = evaluate_collection_route(
+        request_json, collection_info, request_json.value("route_trace", false));
+    if (!decision) {
+        return std::nullopt;
+    }
     RouterDispatchResult result;
     result.requested_model = collection_info.model_name;
-    result.selected_model = decision.route_to;
-    result.decision = std::move(decision);
+    result.selected_model = decision->route_to;
+    result.decision = std::move(*decision);
     router_->note_route_decision(utils::conversation_fingerprint(request_json),
                                  result.selected_model);
     return result;
@@ -3845,6 +3855,19 @@ std::optional<RouterDispatchResult> Server::route_collection_request(
 void Server::handle_routing_validate(const httplib::Request& req, httplib::Response& res) {
     nlohmann::json request_json;
     if (!parse_required_json_body(req, res, request_json)) return;
+
+    if (request_json.is_object() && request_json.contains("model")) {
+        if (request_json.contains("policy")) {
+            res.status = 400;
+            nlohmann::json error = {{"error",
+                "'policy' and 'model' are mutually exclusive: send 'policy' to test an "
+                "ad-hoc policy, or 'model' to classify against a registered router"}};
+            res.set_content(error.dump(), "application/json");
+            return;
+        }
+        handle_registered_routing_validate(request_json, res);
+        return;
+    }
 
     if (!request_json.contains("policy") || !request_json["policy"].is_object()) {
         res.status = 400;
@@ -3952,6 +3975,81 @@ void Server::handle_routing_validate(const httplib::Request& req, httplib::Respo
         res.status = 400;
         nlohmann::json error = {{"error", std::string("Invalid routing policy: ") + e.what()}};
         res.set_content(error.dump(), "application/json");
+    }
+}
+
+void Server::handle_registered_routing_validate(nlohmann::json request_json,
+                                                httplib::Response& res) {
+    auto bad_request = [&res](const std::string& message) {
+        res.status = 400;
+        res.set_content(nlohmann::json{{"error", message}}.dump(), "application/json");
+    };
+
+    if (!request_json["model"].is_string()) {
+        bad_request("'model' must be a string");
+        return;
+    }
+    // These only simulate request features for an ad-hoc policy; here the
+    // context is derived from the body exactly as dispatch derives it, so an
+    // explicit flag would silently disagree with what dispatch would see.
+    for (const char* flag : {"has_images", "has_tools"}) {
+        if (request_json.contains(flag)) {
+            bad_request(std::string("'") + flag +
+                        "' is not accepted with 'model'; it is derived from the "
+                        "request's messages/tools as it is on dispatch");
+            return;
+        }
+    }
+    if (request_json.contains("prompt") && !request_json["prompt"].is_string() &&
+        !request_json["prompt"].is_array()) {
+        bad_request("'prompt' must be a string or an array of strings");
+        return;
+    }
+    if (request_json.contains("messages") && !request_json["messages"].is_array()) {
+        bad_request("'messages' must be an array");
+        return;
+    }
+
+    normalize_client_model_name(request_json);
+    normalize_and_resolve_request_model(request_json);
+    const std::string requested_model = request_json["model"].get<std::string>();
+
+    try {
+        if (!model_manager_->model_exists(requested_model)) {
+            res.status = 404;
+            res.set_content(nlohmann::json{{"error",
+                "Model '" + requested_model + "' not found"}}.dump(), "application/json");
+            return;
+        }
+        ModelInfo info = model_manager_->get_model_info(requested_model);
+        if (!is_router_collection_recipe(info.recipe)) {
+            bad_request("Model '" + requested_model + "' is not a collection.router model "
+                        "(recipe '" + info.recipe + "')");
+            return;
+        }
+
+        std::optional<Decision> decision =
+            evaluate_collection_route(request_json, info, /*want_trace=*/true);
+        if (!decision) {
+            res.status = 500;
+            res.set_content(nlohmann::json{{"error",
+                "Router '" + requested_model + "' has no parsed routing policy"}}.dump(),
+                "application/json");
+            return;
+        }
+
+        nlohmann::json response = {
+            {"model", model_manager_->get_public_model_name(info.model_name)},
+            {"decision", route_decision_to_json(*decision)},
+        };
+        res.set_content(response.dump(), "application/json");
+    } catch (const RouterResidencyConflictException& e) {
+        set_router_residency_conflict_response(e, res);
+    } catch (const std::exception& e) {
+        res.status = 500;
+        res.set_content(nlohmann::json{{"error",
+            std::string("Routing evaluation failed: ") + e.what()}}.dump(),
+            "application/json");
     }
 }
 

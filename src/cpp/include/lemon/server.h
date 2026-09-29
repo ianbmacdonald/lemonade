@@ -163,6 +163,12 @@ private:
     std::optional<RouterDispatchResult> route_collection_request(
         const nlohmann::json& request_json,
         const ModelInfo& collection_info);
+    // The side-effect-free core of route_collection_request, shared with the
+    // classify-only /routing/validate mode so the two can never disagree.
+    std::optional<Decision> evaluate_collection_route(
+        const nlohmann::json& request_json,
+        const ModelInfo& collection_info,
+        bool want_trace);
     // If request_json addresses a collection.router model, rewrite its "model"
     // field in place to the engine-selected candidate and return the Decision.
     // No-op otherwise.
@@ -191,6 +197,10 @@ private:
     // route_collection_request, the policy isn't attached to a registered
     // model, so it's parsed fresh from the request body each call.
     void handle_routing_validate(const httplib::Request& req, httplib::Response& res);
+    // Classify-only mode of /routing/validate: evaluates the policy of the
+    // registered collection.router named by request_json["model"].
+    void handle_registered_routing_validate(nlohmann::json request_json,
+                                            httplib::Response& res);
     void handle_load(const httplib::Request& req, httplib::Response& res);
     void handle_unload(const httplib::Request& req, httplib::Response& res);
     void handle_pin(const httplib::Request& req, httplib::Response& res);
