@@ -181,11 +181,12 @@ void set_router_residency_conflict_response(
 }
 
 void attach_route_decision(json& response, httplib::Response& res,
-                           const std::optional<RouterDispatchResult>& dispatch) {
+                           const std::optional<RouterDispatchResult>& dispatch,
+                           const ModelNameMapper& public_model_name) {
     if (!dispatch.has_value()) {
         return;
     }
-    response["x_lemonade_route"] = route_decision_to_json(dispatch->decision);
+    response["x_lemonade_route"] = route_decision_to_json(dispatch->decision, public_model_name);
     attach_route_header(res, dispatch->decision);
 }
 
@@ -193,6 +194,7 @@ template <typename StreamFn>
 void set_route_decision_sse_content_provider(
     httplib::Response& res,
     const std::optional<RouterDispatchResult>& dispatch,
+    const ModelNameMapper& public_model_name,
     std::string request_body,
     StreamFn stream_fn) {
     res.set_header("Cache-Control", "no-cache");
@@ -203,7 +205,7 @@ void set_route_decision_sse_content_provider(
     }
 
     json route_decision_json = dispatch
-        ? route_decision_to_json(dispatch->decision)
+        ? route_decision_to_json(dispatch->decision, public_model_name)
         : json(nullptr);
     res.set_chunked_content_provider(
         "text/event-stream",
@@ -3804,6 +3806,12 @@ void Server::handle_collection_chat_completions(const nlohmann::json& request_js
     res.set_content(response.dump(), "application/json");
 }
 
+std::function<std::string(const std::string&)> Server::public_model_name_mapper() {
+    return [this](const std::string& name) {
+        return model_manager_->get_public_model_name(name);
+    };
+}
+
 std::optional<Decision> Server::evaluate_collection_route(
     const nlohmann::json& request_json,
     const ModelInfo& collection_info,
@@ -3967,7 +3975,7 @@ void Server::handle_routing_validate(const httplib::Request& req, httplib::Respo
         normalized_policy["routing"] = std::move(normalized_routing);
 
         nlohmann::json response = {
-            {"decision", route_decision_to_json(decision)},
+            {"decision", route_decision_to_json(decision, public_model_name_mapper())},
             {"normalized_policy", std::move(normalized_policy)},
         };
         res.set_content(response.dump(), "application/json");
@@ -4038,9 +4046,10 @@ void Server::handle_registered_routing_validate(nlohmann::json request_json,
             return;
         }
 
+        const auto public_model_name = public_model_name_mapper();
         nlohmann::json response = {
-            {"model", model_manager_->get_public_model_name(info.model_name)},
-            {"decision", route_decision_to_json(*decision)},
+            {"model", public_model_name(info.model_name)},
+            {"decision", route_decision_to_json(*decision, public_model_name)},
         };
         res.set_content(response.dump(), "application/json");
     } catch (const RouterResidencyConflictException& e) {
@@ -4249,6 +4258,7 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                 set_route_decision_sse_content_provider(
                     res,
                     route_dispatch,
+                    public_model_name_mapper(),
                     request_body,
                     [this](const std::string& body, httplib::DataSink& sink) {
                         router_->chat_completion_stream(body, sink);
@@ -4270,7 +4280,7 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                 return;
             }
 
-            attach_route_decision(response, res, route_dispatch);
+            attach_route_decision(response, res, route_dispatch, public_model_name_mapper());
             // Debug: Check if response contains tool_calls
             if (response.contains("choices") && response["choices"].is_array() && !response["choices"].empty()) {
                 auto& first_choice = response["choices"][0];
@@ -4381,6 +4391,7 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
                 set_route_decision_sse_content_provider(
                     res,
                     route_dispatch,
+                    public_model_name_mapper(),
                     request_body,
                     [this](const std::string& body, httplib::DataSink& sink) {
                         router_->completion_stream(body, sink);
@@ -4415,7 +4426,7 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
                 return;
             }
 
-            attach_route_decision(response, res, route_dispatch);
+            attach_route_decision(response, res, route_dispatch, public_model_name_mapper());
             res.set_content(response.dump(), "application/json");
 
             record_response_telemetry(response, request_json);
@@ -6066,6 +6077,7 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
                 set_route_decision_sse_content_provider(
                     res,
                     route_dispatch,
+                    public_model_name_mapper(),
                     request_body,
                     [this](const std::string& body, httplib::DataSink& sink) {
                         router_->responses_stream(body, sink);
@@ -6086,7 +6098,7 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
                 return;
             }
 
-            attach_route_decision(response, res, route_dispatch);
+            attach_route_decision(response, res, route_dispatch, public_model_name_mapper());
             LOG(INFO, "Server") << "200 OK" << std::endl;
             res.set_content(response.dump(), "application/json");
 

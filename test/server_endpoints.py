@@ -5437,7 +5437,12 @@ class EndpointTests(ServerTestBase):
             self.assertEqual(code_response.status_code, 200, code_response.text)
             body = code_response.json()
             self.assertEqual(set(body.keys()), {"model", "decision"})
-            self.assertEqual(body["model"], canonical_name)
+            models_response = requests.get(
+                f"{self.base_url}/models?show_all=true", timeout=TIMEOUT_DEFAULT
+            )
+            self.assertEqual(models_response.status_code, 200, models_response.text)
+            listed_ids = {m["id"] for m in models_response.json()["data"]}
+            self.assertIn(body["model"], listed_ids)
             decision = body["decision"]
             self.assertEqual(decision["route_to"], ENDPOINT_TEST_MODEL)
             self.assertEqual(decision["matched_rule"], "code-to-test-model")
@@ -5451,6 +5456,11 @@ class EndpointTests(ServerTestBase):
                 timeout=TIMEOUT_DEFAULT,
             )
             self.assertEqual(default_response.status_code, 200, default_response.text)
+            self.assertEqual(
+                default_response.json()["model"],
+                body["model"],
+                "bare and user.-prefixed requests must echo the same public name",
+            )
             default_decision = default_response.json()["decision"]
             self.assertEqual(default_decision["route_to"], MULTI_MODEL_TERTIARY)
             self.assertEqual(default_decision["matched_rule"], "")
