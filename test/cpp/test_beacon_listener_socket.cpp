@@ -1,11 +1,15 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <thread>
@@ -47,9 +51,129 @@ bool wait_for(const std::function<bool()>& pred, std::chrono::milliseconds timeo
     return pred();
 }
 
+bool write_file(const char* path, const std::string& content) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return false;
+    bool ok = write(fd, content.data(), content.size()) == static_cast<ssize_t>(content.size());
+    close(fd);
+    return ok;
+}
+
+// A private user+network namespace lets the test create interfaces whose
+// addresses carry no configured broadcast (as OpenWrt/prplOS LAN bridges do)
+// without root, and keeps UDP 13305 clear of any production lemond.
+bool enter_private_netns() {
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) {
+        std::printf("[SKIP] unshare(CLONE_NEWUSER|CLONE_NEWNET) failed: %s\n", std::strerror(errno));
+        return false;
+    }
+    write_file("/proc/self/setgroups", "deny");
+    if (!write_file("/proc/self/uid_map", "0 " + std::to_string(uid) + " 1") ||
+        !write_file("/proc/self/gid_map", "0 " + std::to_string(gid) + " 1")) {
+        std::printf("[SKIP] could not map uid/gid in the new user namespace\n");
+        return false;
+    }
+    const char* setup =
+        "ip link set lo up && "
+        "ip link add lbt0 type dummy && ip link set lbt0 up && ip addr add 10.213.0.1/24 dev lbt0 && "
+        "ip link add lbt1 type dummy && ip link set lbt1 up && ip addr add 10.214.0.1/24 dev lbt1";
+    if (std::system(setup) != 0) {
+        std::printf("[SKIP] could not create dummy interfaces with ip(8)\n");
+        return false;
+    }
+    return true;
+}
+
+bool send_beacon(const std::string& src_ip, const std::string& dst_ip, const std::string& url,
+                 const std::string& instance_id) {
+    int tx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (tx < 0) return false;
+    int one = 1;
+    setsockopt(tx, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+    sockaddr_in from{};
+    from.sin_family = AF_INET;
+    inet_pton(AF_INET, src_ip.c_str(), &from.sin_addr);
+    if (bind(tx, reinterpret_cast<sockaddr*>(&from), sizeof(from)) != 0) {
+        close(tx);
+        return false;
+    }
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(lemon::kBeaconPort);
+    inet_pton(AF_INET, dst_ip.c_str(), &to.sin_addr);
+    std::string payload = json({{"service", "lemonade"},
+                                {"hostname", "netns-peer"},
+                                {"url", url},
+                                {"instance_id", instance_id}})
+                              .dump();
+    bool ok = sendto(tx, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&to), sizeof(to)) ==
+              static_cast<ssize_t>(payload.size());
+    close(tx);
+    return ok;
+}
+
+bool host_listed(const BeaconListener& listener, const std::string& url) {
+    json st = listener.status_json();
+    for (const auto& h : st["hosts"]) {
+        if (h["url"] == url) return true;
+    }
+    return false;
+}
+
+bool socket_bound(const json& st, const std::string& address) {
+    for (const auto& s : st["sockets"]) {
+        if (s["address"] == address && s["bound"] == true) return true;
+    }
+    return false;
+}
+
+int run_netns_tests() {
+    std::puts("=== RUNNING BEACON LISTENER NETNS BROADCAST TESTS ===");
+    if (!enter_private_netns()) return 0;
+
+    NetworkBeacon nb;
+    std::string lbt0_bcast;
+    for (const auto& iface : nb.getLocalRFC1918Interfaces()) {
+        if (iface.ipAddress == "10.213.0.1") lbt0_bcast = iface.broadcastAddress;
+    }
+    check(lbt0_bcast == "10.213.0.255",
+          ("subnet broadcast of 10.213.0.1/24 without brd is 10.213.0.255 (got '" + lbt0_bcast + "')").c_str());
+
+    {
+        BeaconListener listener;
+        listener.start("4444444444444444", 18999);
+        check(wait_for([&] { return listener.status_json().value("listening", false); },
+                       std::chrono::milliseconds(2000)),
+              "listener is listening in the private netns");
+        json st = listener.status_json();
+        check(socket_bound(st, "10.213.0.255:13305"), "lbt0 subnet broadcast 10.213.0.255 is bound");
+        check(socket_bound(st, "10.214.0.255:13305"), "lbt1 subnet broadcast 10.214.0.255 is bound");
+        check(!socket_bound(st, "10.213.0.1:13305"), "lbt0 unicast address is not bound");
+
+        const std::string url_a = "http://10.213.0.1:65001/api/v1/";
+        check(send_beacon("10.213.0.1", "10.213.0.255", url_a, "abcdef0123456789"),
+              "sent beacon to subnet broadcast 10.213.0.255");
+        check(wait_for([&] { return host_listed(listener, url_a); }, std::chrono::milliseconds(3000)),
+              "beacon sent to the subnet broadcast is heard");
+
+        const std::string url_b = "http://10.214.0.1:65002/api/v1/";
+        check(send_beacon("10.214.0.1", "255.255.255.255", url_b, "bcdef0123456789a"),
+              "sent beacon to limited broadcast 255.255.255.255");
+        check(wait_for([&] { return host_listed(listener, url_b); }, std::chrono::milliseconds(3000)),
+              "beacon sent to the limited broadcast is heard");
+        listener.stop();
+    }
+
+    return test_helpers::report_results("beacon listener netns broadcast");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--netns") return run_netns_tests();
+
     std::puts("=== RUNNING BEACON LISTENER SOCKET TESTS ===");
 
     int probe = bind_wildcard_no_reuse();
