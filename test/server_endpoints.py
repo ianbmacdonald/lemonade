@@ -5380,6 +5380,218 @@ class EndpointTests(ServerTestBase):
             "[OK] /routing/validate rejected malformed prompt/has_images/has_tools types with 400"
         )
 
+    def _register_two_candidate_router(self, canonical_name):
+        """Register (without downloading anything) a collection.router whose
+        keyword rule picks ENDPOINT_TEST_MODEL and whose default is
+        MULTI_MODEL_TERTIARY, so rule and default land on distinct candidates."""
+        return requests.post(
+            f"{self.base_url}/models/register",
+            json={
+                "model_name": canonical_name,
+                "version": "1",
+                "recipe": "collection.router",
+                "components": [ENDPOINT_TEST_MODEL, MULTI_MODEL_TERTIARY],
+                "routing": {
+                    "candidates": [ENDPOINT_TEST_MODEL, MULTI_MODEL_TERTIARY],
+                    "default_model": MULTI_MODEL_TERTIARY,
+                    "rules": [
+                        {
+                            "id": "code-to-test-model",
+                            "match": {"keywords_any": ["code", "def "]},
+                            "route_to": ENDPOINT_TEST_MODEL,
+                            "outputs": {"pool": "small"},
+                        }
+                    ],
+                },
+            },
+            timeout=TIMEOUT_DEFAULT,
+        )
+
+    def _loaded_model_names(self):
+        health = requests.get(f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT)
+        self.assertEqual(health.status_code, 200, health.text)
+        return {m["model_name"] for m in health.json().get("all_models_loaded", [])}
+
+    def test_021zw_routing_validate_registered_router_matches_dispatch(self):
+        """/routing/validate with a registered router's "model" returns the
+        decision that dispatching the same request picks, without loading any
+        candidate."""
+        canonical_name = f"user.ValidateRouter-{uuid.uuid4().hex[:8]}"
+        public_name = canonical_name[5:]
+        try:
+            register = self._register_two_candidate_router(canonical_name)
+            self.assertEqual(register.status_code, 200, register.text)
+            requests.post(
+                f"{self.base_url}/unload",
+                json={"model_name": ENDPOINT_TEST_MODEL},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            loaded_before = self._loaded_model_names()
+
+            code_messages = [{"role": "user", "content": "Please write code for me"}]
+            code_response = requests.post(
+                f"{self.base_url}/routing/validate",
+                json={"model": canonical_name, "messages": code_messages},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(code_response.status_code, 200, code_response.text)
+            body = code_response.json()
+            self.assertEqual(set(body.keys()), {"model", "decision"})
+            self.assertEqual(body["model"], canonical_name)
+            decision = body["decision"]
+            self.assertEqual(decision["route_to"], ENDPOINT_TEST_MODEL)
+            self.assertEqual(decision["matched_rule"], "code-to-test-model")
+            self.assertFalse(decision["default_used"])
+            self.assertEqual(decision["outputs"], {"pool": "small"})
+            self.assertIsInstance(decision.get("trace"), list)
+
+            default_response = requests.post(
+                f"{self.base_url}/routing/validate",
+                json={"model": public_name, "prompt": "Hello there"},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(default_response.status_code, 200, default_response.text)
+            default_decision = default_response.json()["decision"]
+            self.assertEqual(default_decision["route_to"], MULTI_MODEL_TERTIARY)
+            self.assertEqual(default_decision["matched_rule"], "")
+            self.assertTrue(default_decision["default_used"])
+
+            self.assertEqual(
+                self._loaded_model_names(),
+                loaded_before,
+                "classify-only validate must not load any candidate",
+            )
+
+            chat_response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json={
+                    "model": public_name,
+                    "messages": code_messages,
+                    "route_trace": True,
+                    "max_tokens": 8,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(chat_response.status_code, 200, chat_response.text)
+            self.assertEqual(chat_response.json().get("x_lemonade_route"), decision)
+            print("[OK] /routing/validate registered router agreed with dispatch")
+        finally:
+            self._cleanup_router_collection(canonical_name)
+
+    def test_021zx_routing_validate_unknown_model_returns_404(self):
+        response = requests.post(
+            f"{self.base_url}/routing/validate",
+            json={
+                "model": f"user.NoSuchRouter-{uuid.uuid4().hex[:8]}",
+                "prompt": "hello",
+            },
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertIn("not found", response.json()["error"])
+        print("[OK] /routing/validate rejected an unknown model with 404")
+
+    def test_021zy_routing_validate_non_router_model_returns_400(self):
+        response = requests.post(
+            f"{self.base_url}/routing/validate",
+            json={"model": ENDPOINT_TEST_MODEL, "prompt": "hello"},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("collection.router", response.json()["error"])
+        self.assertIsNone(self._get_loaded_model_info(ENDPOINT_TEST_MODEL))
+        print("[OK] /routing/validate rejected a non-router model with 400")
+
+    def test_021zz_routing_validate_model_request_conflicts_return_400(self):
+        """A request naming both a policy and a registered model is ambiguous,
+        and the ad-hoc-only simulation flags have no meaning when the context
+        comes from the request body itself."""
+        canonical_name = f"user.ValidateConflict-{uuid.uuid4().hex[:8]}"
+        policy = {
+            "version": "1",
+            "recipe": "collection.router",
+            "components": ["Qwen3-8B-GGUF"],
+            "routing": {
+                "candidates": ["Qwen3-8B-GGUF"],
+                "default_model": "Qwen3-8B-GGUF",
+                "rules": [
+                    {
+                        "id": "greeting",
+                        "match": {"keywords_any": ["hello"]},
+                        "route_to": "Qwen3-8B-GGUF",
+                    }
+                ],
+            },
+        }
+        try:
+            register = self._register_two_candidate_router(canonical_name)
+            self.assertEqual(register.status_code, 200, register.text)
+
+            both = requests.post(
+                f"{self.base_url}/routing/validate",
+                json={"policy": policy, "model": canonical_name, "prompt": "hi"},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(both.status_code, 400, both.text)
+            self.assertIn("policy", both.json()["error"])
+            self.assertIn("model", both.json()["error"])
+
+            for flag in ("has_images", "has_tools"):
+                flagged = requests.post(
+                    f"{self.base_url}/routing/validate",
+                    json={"model": canonical_name, "prompt": "hi", flag: True},
+                    timeout=TIMEOUT_DEFAULT,
+                )
+                self.assertEqual(flagged.status_code, 400, flagged.text)
+                self.assertIn(flag, flagged.json()["error"])
+
+            bad_model = requests.post(
+                f"{self.base_url}/routing/validate",
+                json={"model": 42, "prompt": "hi"},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(bad_model.status_code, 400, bad_model.text)
+            self.assertIn("model", bad_model.json()["error"])
+            print("[OK] /routing/validate rejected conflicting model-mode fields")
+        finally:
+            self._cleanup_router_collection(canonical_name)
+
+    def test_021zza_routing_validate_adhoc_shape_unchanged(self):
+        """The ad-hoc policy mode keeps its exact response keys, and a body
+        with neither 'policy' nor 'model' keeps its original error."""
+        policy = {
+            "version": "1",
+            "recipe": "collection.router",
+            "components": ["Qwen3-8B-GGUF"],
+            "routing": {
+                "candidates": ["Qwen3-8B-GGUF"],
+                "default_model": "Qwen3-8B-GGUF",
+                "rules": [
+                    {
+                        "id": "greeting",
+                        "match": {"keywords_any": ["hello"]},
+                        "route_to": "Qwen3-8B-GGUF",
+                    }
+                ],
+            },
+        }
+        response = requests.post(
+            f"{self.base_url}/routing/validate",
+            json={"policy": policy, "prompt": "hello"},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(set(response.json().keys()), {"decision", "normalized_policy"})
+
+        missing = requests.post(
+            f"{self.base_url}/routing/validate",
+            json={"prompt": "hello"},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(missing.status_code, 400, missing.text)
+        self.assertEqual(missing.json(), {"error": "'policy' must be a JSON object"})
+        print("[OK] /routing/validate ad-hoc mode unchanged")
+
     def test_021zj_router_llm_l0a_live(self):
         """L0a live path (#2405), deterministic: the router component is a mock
         cloud model (via _start_mock_cloud_provider) that returns a fixed valid
