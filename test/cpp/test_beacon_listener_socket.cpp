@@ -166,6 +166,40 @@ int run_netns_tests() {
         listener.stop();
     }
 
+    {
+        BeaconListener listener;
+        listener.set_interface_allowlist({"lbt0"});
+        listener.start("5555555555555555", 18999);
+        check(wait_for([&] { return listener.status_json().value("listening", false); },
+                       std::chrono::milliseconds(2000)),
+              "allow-listed listener is listening");
+        json st = listener.status_json();
+        check(st["interface_allowlist"] == json::array({"lbt0"}), "status echoes the interface allow-list");
+        check(st["interfaces"].size() == 1 && st["interfaces"][0]["name"] == "lbt0" &&
+                  st["interfaces"][0]["broadcast"] == "10.213.0.255",
+              "only lbt0 is listed as a listened interface");
+        check(socket_bound(st, "10.213.0.255:13305"), "allow-listed lbt0 broadcast is bound");
+        check(!socket_bound(st, "10.214.0.255:13305"), "lbt1 broadcast is not bound");
+
+        const std::string url_c = "http://10.214.0.1:65003/api/v1/";
+        send_beacon("10.214.0.1", "255.255.255.255", url_c, "cdef0123456789ab");
+        send_beacon("10.214.0.1", "10.214.0.255", url_c, "cdef0123456789ab");
+        const std::string url_d = "http://10.213.0.1:65004/api/v1/";
+        send_beacon("10.213.0.1", "255.255.255.255", url_d, "def0123456789abc");
+        check(wait_for([&] { return host_listed(listener, url_d); }, std::chrono::milliseconds(3000)),
+              "limited broadcast arriving on allow-listed lbt0 is heard");
+        check(!host_listed(listener, url_c), "beacons arriving on lbt1 are not listed");
+        check(listener.status_json()["stats"]["wrong_interface"].get<int>() >= 1,
+              "limited broadcast arriving on lbt1 is counted as wrong_interface");
+
+        listener.set_interface_allowlist({"lbt1"});
+        check(wait_for([&] { return socket_bound(listener.status_json(), "10.214.0.255:13305"); },
+                       std::chrono::milliseconds(2000)),
+              "changing the allow-list rebinds without a restart");
+        check(!socket_bound(listener.status_json(), "10.213.0.255:13305"), "old interface is released");
+        listener.stop();
+    }
+
     return test_helpers::report_results("beacon listener netns broadcast");
 }
 
