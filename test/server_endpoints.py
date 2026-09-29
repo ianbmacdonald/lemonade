@@ -38,6 +38,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from utils.server_base import (
     ServerTestBase,
     run_server_tests,
+    set_server_config,
     OpenAI,
     pull_model_with_retry,
     _auth_headers,
@@ -424,6 +425,135 @@ class EndpointTests(ServerTestBase):
         print(
             f"[OK] /health endpoint response: status={data['status']}, models_loaded={len(data['all_models_loaded'])}"
         )
+
+    def _beacon_listener_state(self, prefix="/api/v1"):
+        response = requests.get(
+            f"http://localhost:{PORT}{prefix}/health",
+            headers=_auth_headers(),
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("beacon_listener", data)
+        return data["beacon_listener"]
+
+    def _wait_beacon_listener(self, predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        state = self._beacon_listener_state()
+        while time.time() < deadline:
+            if predicate(state):
+                return state
+            time.sleep(0.2)
+            state = self._beacon_listener_state()
+        return state
+
+    @staticmethod
+    def _local_rfc1918_ip():
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 9))
+            ip = probe.getsockname()[0]
+        except OSError:
+            return None
+        finally:
+            probe.close()
+        octets = [int(o) for o in ip.split(".")]
+        if (
+            octets[0] == 10
+            or (octets[0] == 172 and 16 <= octets[1] <= 31)
+            or (octets[0] == 192 and octets[1] == 168)
+        ):
+            return ip
+        return None
+
+    @staticmethod
+    def _send_limited_broadcast(payload):
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sender.sendto(json.dumps(payload).encode(), ("255.255.255.255", 13305))
+        finally:
+            sender.close()
+
+    def test_002c_beacon_listener_health(self):
+        """beacon_listen toggles a list-only listener reported under /health."""
+        for prefix in ("/api/v0", "/api/v1", "/v0", "/v1"):
+            self.assertEqual(
+                self._beacon_listener_state(prefix),
+                {"enabled": False},
+                f"beacon_listener should default to disabled on {prefix}/health",
+            )
+
+        try:
+            set_server_config({"beacon_listen": True})
+            state = self._wait_beacon_listener(
+                lambda s: s.get("enabled")
+                and (s.get("listening") or not s.get("supported"))
+            )
+            self.assertTrue(state["enabled"])
+            if not state["supported"]:
+                self.assertEqual(platform.system(), "Windows")
+                self.assertFalse(state["listening"])
+                self.skipTest("beacon listener is not supported on this platform")
+
+            self.assertTrue(state["listening"], state)
+            self.assertTrue(state["sockets"])
+            self.assertNotIn("0.0.0.0:13305", [s["address"] for s in state["sockets"]])
+            self.assertRegex(state["self_instance_id"], r"^[0-9a-f]{16}$")
+            self.assertEqual(state["self_port"], PORT)
+            for host in state["hosts"]:
+                self.assertNotEqual(host["instance_id"], state["self_instance_id"])
+
+            local_ip = self._local_rfc1918_ip()
+            if local_ip is None:
+                self.skipTest("no RFC1918 default-route address to inject beacons from")
+
+            url = f"http://{local_ip}:65001/api/v1/"
+            self._send_limited_broadcast(
+                {
+                    "service": "lemonade",
+                    "hostname": "peer-test",
+                    "url": url,
+                    "instance_id": "abcdef0123456789",
+                }
+            )
+            state = self._wait_beacon_listener(
+                lambda s: any(h["url"] == url for h in s.get("hosts", []))
+            )
+            self.assertTrue(
+                any(h["url"] == url for h in state["hosts"]),
+                f"injected beacon {url} not listed: {state}",
+            )
+
+            mismatches = state["stats"]["url_mismatch"]
+            self._send_limited_broadcast(
+                {
+                    "service": "lemonade",
+                    "hostname": "peer-mismatch",
+                    "url": "http://10.9.9.9:1/api/v1/",
+                }
+            )
+            state = self._wait_beacon_listener(
+                lambda s: s["stats"]["url_mismatch"] > mismatches
+            )
+            self.assertGreater(state["stats"]["url_mismatch"], mismatches)
+            self.assertFalse(
+                any(h["url"] == "http://10.9.9.9:1/api/v1/" for h in state["hosts"])
+            )
+        finally:
+            set_server_config({"beacon_listen": False})
+
+        self.assertEqual(self._beacon_listener_state(), {"enabled": False})
+        if platform.system() == "Linux":
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.bind(("0.0.0.0", 13305))
+            except OSError:
+                pass  # the CLI or desktop app may legitimately hold the port
+            else:
+                print("[OK] UDP 13305 released after beacon_listen=false")
+            finally:
+                probe.close()
 
     def test_002_health_streaming_flags(self):
         """Test is_busy and is_streaming fields in /health response.
