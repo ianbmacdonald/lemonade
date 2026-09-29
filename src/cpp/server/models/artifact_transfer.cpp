@@ -321,7 +321,8 @@ void ArtifactTransfer::execute(const DownloadPlan& plan,
         if (fs::exists(output_path) && !fs::exists(partial_path)) {
             bytes_on_disk = file.size;  // File already complete
         } else if (fs::exists(partial_path)) {
-            bytes_on_disk = static_cast<std::uint64_t>(fs::file_size(partial_path));
+            bytes_on_disk =
+                static_cast<std::uint64_t>(HttpClient::resumable_partial_bytes(output_path));
         }
 
         ByteProgress byte_progress;
@@ -474,6 +475,8 @@ std::uint64_t HttpFileTransfer::transfer(const DownloadFile& file,
     options.connect_timeout = 60;
     options.expected_hash_algorithm = file.expected_hash_algorithm;
     options.expected_hash = file.expected_hash;
+    options.allow_parallel = true;
+    options.expected_size = static_cast<std::size_t>(file.size);
 
     // The tick always exists — it is where the transport learns to abort on
     // the token, inside the HTTP client — even when nobody is watching bytes.
