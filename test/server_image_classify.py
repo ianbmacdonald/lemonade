@@ -283,15 +283,22 @@ class ImageClassifyTests(ServerTestBase):
             "length_required",
         )
 
-    def test_006d_chunked_with_small_content_length_is_411(self):
-        self._assert_refused_unread(
+    def test_006d_chunked_with_small_content_length_refused(self):
+        # httplib itself refuses a positive Content-Length with
+        # Transfer-Encoding as request smuggling (400) before lemond's guard
+        # runs; either refusal leaves the body unread.
+        rss_before = _vm_rss_kb(_opts.lemond_pid) if _opts.lemond_pid else None
+        status, reply = _raw_request(
             f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
             "Content-Type: application/json\r\nContent-Length: 1024\r\n"
             "Transfer-Encoding: chunked\r\n\r\n",
             b"5\r\nhello\r\n0\r\n\r\n",
-            411,
-            "length_required",
         )
+        self.assertIn(status, (400, 411), reply[:300])
+        if rss_before is not None:
+            growth_kb = _vm_rss_kb(_opts.lemond_pid) - rss_before
+            self.assertLess(growth_kb, 10 * 1024, f"lemond RSS grew {growth_kb} KiB")
+        print(f"[OK] Content-Length + Transfer-Encoding refused: {status}")
 
     def test_006e_aborted_uploads_release_their_slot(self):
         # Each upload is admitted, then the client disappears mid-body. If the
