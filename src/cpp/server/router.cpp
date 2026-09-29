@@ -1275,14 +1275,15 @@ std::string Router::get_loaded_recipe() const {
     return server->get_recipe_options().get_recipe();
 }
 
-std::string Router::get_sole_loaded_model_of_type(ModelType type) const {
+std::string Router::get_sole_loaded_model_of_type(ModelType type, bool include_dead_backends) const {
     std::lock_guard<std::mutex> lock(load_mutex_);
 
     WrappedServer* standard_match = nullptr;
     WrappedServer* helper_match = nullptr;
     bool helper_ambiguous = false;
     for (const auto& server : loaded_servers_) {
-        if (!server->is_backend_alive() || server->get_model_type() != type) {
+        if ((!include_dead_backends && !server->is_backend_alive()) ||
+            server->get_model_type() != type) {
             continue;
         }
         if (server->get_residency_class() == ResidencyClass::Standard) {
@@ -1592,17 +1593,6 @@ auto Router::execute_inference(const json& request, Func&& inference_func,
 
             server->release_inference();
 
-            if (attempt == 0 && watchdog_reset) {
-                if (restart_model_name.empty()) {
-                    restart_model_name = requested_model;
-                }
-                const bool reloaded = reload_model_after_watchdog_reset(
-                    restart_model_name, restart_options, failed_instance_id);
-                if (reloaded && retry_after_watchdog_reset) {
-                    continue;
-                }
-            }
-
             if (watchdog_reset && !retry_after_watchdog_reset) {
                 return json{{"error", {
                     {"message", "The backend for model '" + requested_model +
@@ -1611,6 +1601,15 @@ auto Router::execute_inference(const json& request, Func&& inference_func,
                     {"code", "backend_crashed_on_input"},
                     {"status_code", 502},
                     {"retryable", false}}}};
+            }
+
+            if (attempt == 0 && watchdog_reset) {
+                if (restart_model_name.empty()) {
+                    restart_model_name = requested_model;
+                }
+                if (reload_model_after_watchdog_reset(restart_model_name, restart_options, failed_instance_id)) {
+                    continue;
+                }
             }
 
             return response;
@@ -2113,6 +2112,17 @@ json Router::classify(const json& request) {
 
 json Router::classify_image(const json& params, std::string image_bytes) {
     std::string requested_model = params.value("model", "");
+    if (const long long wait = image_crash_breaker_.blocked_seconds(
+            requested_model, CrashBreaker::Clock::now())) {
+        return json{{"error", {
+            {"message", "The backend for model '" + requested_model +
+                            "' crashed repeatedly on recent inputs; image classification is paused"},
+            {"type", ErrorType::BACKEND_ERROR},
+            {"code", "backend_crash_cooldown"},
+            {"status_code", 503},
+            {"retry_after", wait},
+            {"retryable", true}}}};
+    }
     std::shared_ptr<telemetry::InferenceSpan> span = telemetry::TelemetryTracker::start_span(
         "CLASSIFIER", "image_classify", requested_model, params);
 
@@ -2133,6 +2143,13 @@ json Router::classify_image(const json& params, std::string image_bytes) {
             // Runs at most once: retry is disabled below, so the bytes can move.
             return image_server->classify_image(params, std::move(image_bytes));
         }, /*retry_after_watchdog_reset=*/false);
+
+        if (response.contains("error") && response["error"].is_object() &&
+            response["error"].value("code", "") == "backend_crashed_on_input" &&
+            image_crash_breaker_.record_crash(requested_model, CrashBreaker::Clock::now())) {
+            LOG(WARNING, "Router") << "Image classification for '" << requested_model
+                                   << "' paused after repeated backend crashes" << std::endl;
+        }
 
         if (span) {
             if (response.contains("error")) {

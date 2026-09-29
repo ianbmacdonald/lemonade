@@ -117,7 +117,7 @@ The request is either `multipart/form-data` (the same shape as `/v1/images/edits
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `model` | string | yes* | Image-classification model id. *Optional when exactly one image-classification model is loaded. |
-| `image` | file or string | yes | Multipart: exactly one file part named `image` (or `file`). JSON: a base64 string, or a `data:image/jpeg;base64,...` / `data:image/png;base64,...` URL. Remote `http(s)` URLs are not fetched. |
+| `image` | file or string | yes | Multipart: exactly one file part named `image` (or `file`). JSON: a base64 string, or a `data:image/jpeg;base64,...` / `data:image/png;base64,...` URL (`image/jpg` is accepted as an alias; the format is decided by the image's own bytes). Remote `http(s)` URLs are not fetched. |
 | `top_k` | integer | no | Number of labels to return, from 1 to 1,000,000. Default 5; the backend caps it at the model's label count. |
 
 Only JPEG and PNG are accepted. EXIF orientation is not applied.
@@ -158,9 +158,11 @@ curl -X POST http://localhost:13305/v1/images/classify \
 | Status | When |
 |--------|------|
 | `400` | Malformed request: not multipart or JSON, zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG image, a bad `top_k`, a model that is not an image-classification model (`code: model_not_applicable`), or an image the backend cannot decode (corrupt or truncated, 12-bit or arithmetic-coded JPEG, too many pixels, decode memory budget exceeded). |
-| `411` | No `Content-Length` (for example a chunked upload). The request is refused before its body is read. |
+| `411` | No `Content-Length`, or any `Transfer-Encoding` header, even alongside a `Content-Length` (`code: length_required`). The request is refused before its body is read. |
 | `413` | `Content-Length` over 23 MiB (refused before the body is read), or a decoded image over 16 MiB (`code: payload_too_large`). |
-| `502` | The backend crashed while processing this image (`code: backend_crashed_on_input`). The request is not retried, because replaying the same input would crash the restarted backend too; the backend is restarted for the next request. |
+| `415` | Any `Content-Encoding` header, such as a gzip-compressed body (`code: unsupported_content_encoding`). Refused before the body is read. |
+| `502` | The backend crashed while processing this image (`code: backend_crashed_on_input`). The request is not retried, because replaying the same input would crash the restarted backend too; the next request restarts the backend. |
+| `503` | Two image-classification requests are already in progress (`code: server_busy`, `Retry-After: 1`), or the model's backend crashed on 3 inputs within 60 seconds, which pauses image classification for that model for 60 seconds (`code: backend_crash_cooldown`, with `Retry-After`). |
 
 ### Model directory
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <nlohmann/json.hpp>
@@ -16,6 +17,13 @@ using json = nlohmann::json;
 constexpr std::size_t kMaxImageBytes = 16u * 1024u * 1024u;
 // Base64 of kMaxImageBytes plus room for the JSON or multipart framing.
 constexpr std::uint64_t kMaxImageClassifyRequestBytes = 23ull * 1024ull * 1024ull;
+// Longest JSON "image" string worth decoding: base64 of kMaxImageBytes plus a
+// data: URL prefix and line breaks.
+constexpr std::size_t kMaxImageBase64Chars = 4u * ((kMaxImageBytes + 2u) / 3u) + 64u * 1024u;
+
+// Each admitted request can hold several copies of a maximum-size body while it
+// is parsed and forwarded, and httplib runs up to 256 workers.
+constexpr int kMaxConcurrentImageClassify = 2;
 
 constexpr int kDefaultTopK = 5;
 constexpr long long kMaxTopK = 1000000;
@@ -51,9 +59,28 @@ std::string sniff_image_mime(std::string_view bytes);
 // True for POST targets of this route under any of its four prefixes.
 bool is_image_classify_path(const std::string& path);
 
-// Checked before the body is read: 0 to proceed, 411 when there is no
-// Content-Length (chunked), 413 when it exceeds kMaxImageClassifyRequestBytes.
-int precheck_content_length(bool has_length, std::uint64_t length);
+// Checked before the body is read, so the body can only be what Content-Length
+// declares. Returns 0 to proceed; 415 for any Content-Encoding (httplib would
+// inflate it past the declared length); 411 for any Transfer-Encoding (even
+// with a Content-Length, httplib reads chunked framing first) or no
+// Content-Length; 413 when it exceeds kMaxImageClassifyRequestBytes.
+int precheck_request_headers(bool has_length, std::uint64_t length,
+                             bool has_transfer_encoding, bool has_content_encoding);
+
+class InflightLimiter {
+public:
+    explicit InflightLimiter(int max_in_flight) : max_(max_in_flight) {}
+    InflightLimiter(const InflightLimiter&) = delete;
+    InflightLimiter& operator=(const InflightLimiter&) = delete;
+
+    bool try_acquire();
+    void release();
+    int in_flight() const { return count_.load(std::memory_order_acquire); }
+
+private:
+    const int max_;
+    std::atomic<int> count_{0};
+};
 
 }  // namespace image_classify
 }  // namespace lemon

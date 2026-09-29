@@ -71,36 +71,37 @@ bool strict_base64_decode(std::string_view in, std::string& out) {
         return t;
     }();
 
-    std::string compact;
-    compact.reserve(in.size());
-    for (char c : in) {
-        if (!is_ascii_space(c)) compact.push_back(c);
-    }
-    if (compact.empty() || compact.size() % 4 != 0) return false;
-
+    // Two passes over the input instead of a whitespace-free copy, which would
+    // double the peak for a maximum-size image.
+    std::size_t symbols = 0;
     std::size_t padding = 0;
-    if (compact.back() == '=') {
-        ++padding;
-        if (compact[compact.size() - 2] == '=') ++padding;
+    for (char c : in) {
+        if (is_ascii_space(c)) continue;
+        ++symbols;
+        if (c == '=') {
+            ++padding;
+        } else if (padding > 0 || kTable[static_cast<unsigned char>(c)] < 0) {
+            return false;
+        }
     }
-    const std::size_t data_len = compact.size() - padding;
-    for (std::size_t i = 0; i < data_len; ++i) {
-        if (kTable[static_cast<unsigned char>(compact[i])] < 0) return false;
-    }
+    if (symbols == 0 || symbols % 4 != 0 || padding > 2) return false;
 
     out.clear();
-    out.reserve(compact.size() / 4 * 3);
-    for (std::size_t i = 0; i < compact.size(); i += 4) {
-        const bool last = i + 4 == compact.size();
-        const int a = kTable[static_cast<unsigned char>(compact[i])];
-        const int b = kTable[static_cast<unsigned char>(compact[i + 1])];
-        const int c = (last && padding == 2) ? 0 : kTable[static_cast<unsigned char>(compact[i + 2])];
-        const int d = (last && padding >= 1) ? 0 : kTable[static_cast<unsigned char>(compact[i + 3])];
-        const unsigned triple = (static_cast<unsigned>(a) << 18) | (static_cast<unsigned>(b) << 12) |
-                                (static_cast<unsigned>(c) << 6) | static_cast<unsigned>(d);
+    out.reserve(symbols / 4 * 3);
+    unsigned quad[4];
+    std::size_t filled = 0;
+    std::size_t seen = 0;
+    for (char c : in) {
+        if (is_ascii_space(c)) continue;
+        ++seen;
+        quad[filled++] = c == '=' ? 0u : static_cast<unsigned>(kTable[static_cast<unsigned char>(c)]);
+        if (filled < 4) continue;
+        filled = 0;
+        const unsigned triple = (quad[0] << 18) | (quad[1] << 12) | (quad[2] << 6) | quad[3];
+        const std::size_t keep = seen == symbols ? 3 - padding : 3;
         out.push_back(static_cast<char>((triple >> 16) & 0xFF));
-        if (!(last && padding == 2)) out.push_back(static_cast<char>((triple >> 8) & 0xFF));
-        if (!(last && padding >= 1)) out.push_back(static_cast<char>(triple & 0xFF));
+        if (keep > 1) out.push_back(static_cast<char>((triple >> 8) & 0xFF));
+        if (keep > 2) out.push_back(static_cast<char>(triple & 0xFF));
     }
     return true;
 }
@@ -124,10 +125,26 @@ bool is_image_classify_path(const std::string& path) {
            path == "/v0/images/classify" || path == "/v1/images/classify";
 }
 
-int precheck_content_length(bool has_length, std::uint64_t length) {
-    if (!has_length) return 411;
+int precheck_request_headers(bool has_length, std::uint64_t length,
+                             bool has_transfer_encoding, bool has_content_encoding) {
+    if (has_content_encoding) return 415;
+    if (has_transfer_encoding || !has_length) return 411;
     if (length > kMaxImageClassifyRequestBytes) return 413;
     return 0;
+}
+
+bool InflightLimiter::try_acquire() {
+    int current = count_.load(std::memory_order_acquire);
+    while (current < max_) {
+        if (count_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void InflightLimiter::release() {
+    count_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 ParsedRequest parse_json(const std::string& body) {
@@ -148,11 +165,17 @@ ParsedRequest parse_json(const std::string& body) {
         return fail(400, "Missing 'image' (base64 or data: URL string)");
     }
 
+    std::string image = std::move(doc["image"].get_ref<std::string&>());
+    doc.erase("image");
+
     ParsedRequest r;
     {
-        const std::string& image = doc["image"].get_ref<const std::string&>();
         std::string_view view(image);
         while (!view.empty() && is_ascii_space(view.front())) view.remove_prefix(1);
+        if (view.size() > kMaxImageBase64Chars) {
+            return fail(413, "image exceeds the " + std::to_string(kMaxImageBytes / (1024 * 1024)) +
+                                 " MiB limit");
+        }
 
         if (starts_with_ci(view, "http://") || starts_with_ci(view, "https://")) {
             return fail(400, "remote image URLs are not supported; send base64 or a data: URL");
@@ -173,8 +196,8 @@ ParsedRequest parse_json(const std::string& body) {
             return fail(400, "'image' is not valid base64");
         }
     }
+    std::string().swap(image);
 
-    doc.erase("image");
     r.params = std::move(doc);
     return finish(std::move(r));
 }
