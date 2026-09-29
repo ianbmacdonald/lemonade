@@ -1,6 +1,7 @@
 // A tflite model's default mode is text classification, so an image classifier
 // registered with `lemonade pull` needs `--label image-classification`; if the
 // CLI rejects that label the model can only be registered as a text classifier.
+// The same holds for every mode a backend serves beyond its default.
 
 #include "lemon/backends/backend_descriptor_registry.h"
 #include "lemon/model_types.h"
@@ -39,6 +40,15 @@ int main() {
           lemon::backends::default_mode_for("tflite") != "image-classification");
     check("lemonade pull --label accepts image-classification",
           cli_accepts("image-classification"));
+
+    for (const auto* descriptor : lemon::backends::all_descriptors()) {
+        const auto& modes = descriptor->supported_modes;
+        for (std::size_t i = 1; i < modes.size(); ++i) {
+            check("lemonade pull --label accepts " + descriptor->recipe +
+                      "'s non-default mode " + modes[i],
+                  cli_accepts(modes[i]));
+        }
+    }
 
     const auto& labels = lemon_cli::pull_labels();
     check("pull labels are sorted and unique",
