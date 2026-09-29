@@ -3176,6 +3176,7 @@ if(BUILD_TESTING AND UNIX AND NOT APPLE AND EXISTS "${_BEACON_LISTENER_SOCKET_TE
     add_executable(test_beacon_listener_socket test/cpp/test_beacon_listener_socket.cpp)
     target_link_libraries(test_beacon_listener_socket PRIVATE lemonade-server-core)
     add_cpp_ci_test(BeaconListenerSocketTest CI OFF COMMAND test_beacon_listener_socket)
+    add_cpp_ci_test(BeaconListenerNetnsTest CI OFF COMMAND test_beacon_listener_socket --netns)
 endif()
 
 set(_CONFIG_TELEMETRY_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_config_telemetry.cpp")

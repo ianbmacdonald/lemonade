@@ -273,5 +273,43 @@ int main() {
               "ConfigFile defaults include beacon_listen: false");
     }
 
+    // 12. beacon_listen_interfaces: default, round-trip, and rejection of bad shapes
+    {
+        RuntimeConfig iface_cfg(base_cfg);
+        check(iface_cfg.beacon_listen_interfaces().empty(), "beacon_listen_interfaces defaults to empty");
+        iface_cfg.set({{"beacon_listen_interfaces", json::array({"br-lan", "br-guest"})}});
+        check(iface_cfg.beacon_listen_interfaces() == std::vector<std::string>({"br-lan", "br-guest"}),
+              "beacon_listen_interfaces round-trips");
+        check(iface_cfg.snapshot()["beacon_listen_interfaces"] == json::array({"br-lan", "br-guest"}),
+              "snapshot reflects beacon_listen_interfaces");
+        iface_cfg.set({{"beacon_listen_interfaces", json::array()}});
+        check(iface_cfg.beacon_listen_interfaces().empty(), "beacon_listen_interfaces cleared");
+
+        for (const json& bad : {json("br-lan"), json::array({1}), json::array({""}),
+                                json::array({std::string(65, 'x')})}) {
+            bool threw = false;
+            try {
+                iface_cfg.set({{"beacon_listen_interfaces", bad}});
+            } catch (const std::invalid_argument&) {
+                threw = true;
+            }
+            check(threw, ("set() rejects beacon_listen_interfaces = " + bad.dump().substr(0, 20)).c_str());
+        }
+
+        bool threw_ctor = false;
+        try {
+            json bad = base_cfg;
+            bad["beacon_listen_interfaces"] = "br-lan";
+            RuntimeConfig bad_cfg(bad);
+        } catch (const std::invalid_argument&) {
+            threw_ctor = true;
+        }
+        check(threw_ctor, "constructor rejects a non-array beacon_listen_interfaces");
+
+        json defaults = ConfigFile::get_defaults();
+        check(defaults.contains("beacon_listen_interfaces") && defaults["beacon_listen_interfaces"] == json::array(),
+              "ConfigFile defaults include beacon_listen_interfaces: []");
+    }
+
     return test_helpers::report_results("C++ config/discovery");
 }

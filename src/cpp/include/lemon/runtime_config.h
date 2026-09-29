@@ -53,6 +53,7 @@ public:
     double auto_evict_threshold_pct() const;
     bool inhibit_suspend() const;
     bool beacon_listen() const;
+    std::vector<std::string> beacon_listen_interfaces() const;
 
     // Telemetry settings
     bool telemetry_enabled() const;

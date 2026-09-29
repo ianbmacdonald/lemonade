@@ -1789,13 +1789,16 @@ curl http://localhost:13305/v1/health
   - `supported` - `false` on Windows, where the listener is not available in this release
   - `listening` - Whether at least one UDP socket is bound
   - `error` - Platform-level error string, or `null`. If the listener thread could not be started, `listening` is `false`, `sockets` is empty and `error` says why; toggling `beacon_listen` retries.
-  - `sockets` - One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each local RFC1918 interface's directed-broadcast address plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on. It is not scoped to an interface: on a gateway whose WAN side is also RFC1918, block inbound UDP 13305 on the WAN zone or WAN-side hosts are listed too.
+  - `sockets` - One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each listened interface's subnet broadcast address (worked out from its address and netmask) plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on.
+  - `interfaces` - The interfaces being listened on: `name`, `address`, `netmask` and `broadcast`. By default this is every interface with an RFC1918 address. The `beacon_listen_interfaces` config key narrows it; on a gateway whose WAN side is also RFC1918, set it to the LAN bridges or WAN-side hosts are listed too.
+  - `interface_allowlist` - The `beacon_listen_interfaces` setting, or `[]` when every RFC1918 interface is heard
+  - `unmatched_interfaces` - Entries of `beacon_listen_interfaces` that name no interface with an RFC1918 address. When none match, `listening` is `false` and `error` names them.
   - `self_instance_id`, `self_port` - This server's beacon `instance_id` and HTTP port, used to drop its own beacons
   - `ttl_seconds` - Seconds a host stays listed after its last beacon (15)
   - `max_hosts` - Maximum listed hosts (32)
   - `distinct_instances` - Number of distinct servers heard (a multi-homed server has one row per interface)
   - `hosts` - Heard servers, sorted by hostname: `hostname` (sanitised to `[A-Za-z0-9._-]`), `url`, `source_ip`, `instance_id` (or `null` for older servers), `first_seen` and `last_seen` (Unix seconds), `age_seconds`
-  - `stats` - Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch` (advertised URL host differs from the sender's IP), `rate_limited`, `table_full`, `evicted`
+  - `stats` - Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch` (advertised URL host differs from the sender's IP), `rate_limited`, `table_full`, `wrong_interface` (arrived on an interface that is not being listened on), `unknown_interface` (the arrival interface could not be determined while `beacon_listen_interfaces` is set), `evicted`
 
 ## `GET /v1/stats`
 <sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>

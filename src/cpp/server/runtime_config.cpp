@@ -259,6 +259,18 @@ void RuntimeConfig::validate_bin_path(const std::string& config_section,
     // error if the tag does not exist on GitHub.
 }
 
+static void validate_beacon_listen_interfaces(const json& value) {
+    if (!value.is_array()) {
+        throw std::invalid_argument("'beacon_listen_interfaces' must be an array of interface names");
+    }
+    for (const auto& name : value) {
+        if (!name.is_string() || name.get<std::string>().empty() || name.get<std::string>().size() > 64) {
+            throw std::invalid_argument(
+                "'beacon_listen_interfaces' entries must be non-empty interface names of at most 64 characters");
+        }
+    }
+}
+
 RuntimeConfig::RuntimeConfig(const json& config)
     : config_(config) {
     if (config_.contains("broadcast") && !config_["broadcast"].is_boolean()) {
@@ -266,6 +278,9 @@ RuntimeConfig::RuntimeConfig(const json& config)
     }
     if (config_.contains("beacon_listen") && !config_["beacon_listen"].is_boolean()) {
         throw std::invalid_argument("'beacon_listen' must be a boolean");
+    }
+    if (config_.contains("beacon_listen_interfaces")) {
+        validate_beacon_listen_interfaces(config_["beacon_listen_interfaces"]);
     }
     // Migrate legacy no_broadcast if present
     if (config_.contains("no_broadcast")) {
@@ -487,6 +502,17 @@ bool RuntimeConfig::beacon_listen() const {
     std::shared_lock lock(mutex_);
     auto it = config_.find("beacon_listen");
     return it != config_.end() && it->is_boolean() && it->get<bool>();
+}
+
+std::vector<std::string> RuntimeConfig::beacon_listen_interfaces() const {
+    std::shared_lock lock(mutex_);
+    std::vector<std::string> names;
+    auto it = config_.find("beacon_listen_interfaces");
+    if (it == config_.end() || !it->is_array()) return names;
+    for (const auto& v : *it) {
+        if (v.is_string()) names.push_back(v.get<std::string>());
+    }
+    return names;
 }
 
 bool RuntimeConfig::inhibit_suspend() const {
@@ -943,6 +969,8 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
         if (!value.is_boolean()) {
             throw std::invalid_argument("'beacon_listen' must be a boolean");
         }
+    } else if (key == "beacon_listen_interfaces") {
+        validate_beacon_listen_interfaces(value);
     } else if (key == "auto_evict_threshold_pct") {
         if (!value.is_number()) {
             throw std::invalid_argument("'auto_evict_threshold_pct' must be a number");

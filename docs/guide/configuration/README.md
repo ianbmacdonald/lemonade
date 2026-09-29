@@ -50,6 +50,7 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
   "auto_evict_threshold_pct": 0.9,
   "auto_update_models": false,
   "beacon_listen": false,
+  "beacon_listen_interfaces": [],
   "broadcast": true,
   "cloud_providers": [],
   "config_version": 2,
@@ -220,7 +221,8 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
 | `max_loaded_models` | int | 1 | Max models per type slot. Use -1 for unlimited |
 | `auto_evict` | bool | false | Enable dynamic VRAM management based on idle time and global GPU memory pressure. Can be overridden per model. |
 | `auto_evict_threshold_pct` | number | 0.90 | Global VRAM fraction at which pressure eviction is evaluated. Must be greater than 0 and at most 1.0; `0.90` means 90%. |
-| `beacon_listen` | bool | false | Linux/macOS only. Listen on UDP 13305 for other Lemonade servers' LAN broadcast beacons from on-link RFC1918 senders and list them under `beacon_listener` in `/v1/health`. Heard hosts are never contacted and never used as providers. The list is as readable as `/health`, so set `LEMONADE_API_KEY` when `host` is not localhost. `stats.url_mismatch` counts multi-homed peers whose source IP differs from their advertised URL. UDP 13305 must be allowed inbound on the LAN side. It hears every RFC1918 interface, so on a gateway whose WAN side is also RFC1918 (double NAT), block inbound UDP 13305 on the WAN zone or WAN-side hosts are listed too. |
+| `beacon_listen` | bool | false | Linux/macOS only. Listen on UDP 13305 for other Lemonade servers' LAN broadcast beacons from on-link RFC1918 senders and list them under `beacon_listener` in `/v1/health`. Heard hosts are never contacted and never used as providers. The list is as readable as `/health`, so set `LEMONADE_API_KEY` when `host` is not localhost. `stats.url_mismatch` counts multi-homed peers whose source IP differs from their advertised URL. UDP 13305 must be allowed inbound on the LAN side. By default it hears every RFC1918 interface, so on a gateway whose WAN side is also RFC1918 (double NAT), set `beacon_listen_interfaces` to the LAN bridges, or WAN-side hosts are listed too. |
+| `beacon_listen_interfaces` | list of strings | [] | Interface names the beacon listener hears on, for example `["br-lan"]`. Empty means every interface with an RFC1918 address. Beacons that arrive on any other interface, including ones sent to `255.255.255.255`, are dropped and counted in `stats.wrong_interface`. Names that match no interface with an RFC1918 address are logged and listed in `beacon_listener.unmatched_interfaces`. The interfaces in use are listed under `beacon_listener.interfaces` in `/v1/health`. Only applies when `beacon_listen` is true. |
 | `broadcast` | bool | true | Enable or disable UDP broadcasting for server discovery |
 | `extra_models_dir` | string | "" | Secondary directory recursively scanned for GGUF model files. Empty disables extra discovery; existing paths must be readable by `lemond`. Top-level `chat`, `embeddings`, and `reranking` directories select how models run, see [Model Management](../../embeddable/models.md) |
 | `models_dir` | string | "auto" | Directory for cached model files. `"auto"` follows `HF_HUB_CACHE` / `HF_HOME` / platform default |

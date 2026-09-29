@@ -12,9 +12,11 @@
 
 #ifndef _WIN32
     #include <arpa/inet.h>
+    #include <net/if.h>
     #include <netinet/in.h>
     #include <poll.h>
     #include <sys/socket.h>
+    #include <sys/uio.h>
     #include <unistd.h>
 #endif
 
@@ -131,8 +133,16 @@ const char* ingest_result_name(IngestResult result) {
         case IngestResult::UrlMismatch: return "url_mismatch";
         case IngestResult::RateLimited: return "rate_limited";
         case IngestResult::TableFull: return "table_full";
+        case IngestResult::WrongInterface: return "wrong_interface";
+        case IngestResult::UnknownInterface: return "unknown_interface";
     }
     return "unknown";
+}
+
+bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
+                             const std::vector<unsigned>& listened_ifindexes) {
+    if (ifindex == 0) return !allowlist_active;
+    return std::find(listened_ifindexes.begin(), listened_ifindexes.end(), ifindex) != listened_ifindexes.end();
 }
 
 BeaconPeerTable::BeaconPeerTable() = default;
@@ -338,6 +348,11 @@ void BeaconPeerTable::expire(steady_clock::time_point now) {
     expire_locked(now);
 }
 
+IngestResult BeaconPeerTable::reject(IngestResult result) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return record_locked(result);
+}
+
 nlohmann::json BeaconPeerTable::to_json(steady_clock::time_point now) const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<const HeardHost*> live;
@@ -371,7 +386,8 @@ nlohmann::json BeaconPeerTable::to_json(steady_clock::time_point now) const {
     nlohmann::json stats = nlohmann::json::object();
     for (auto r : {IngestResult::Accepted, IngestResult::Refreshed, IngestResult::Self,
                    IngestResult::BadSource, IngestResult::BadPayload, IngestResult::UrlMismatch,
-                   IngestResult::RateLimited, IngestResult::TableFull}) {
+                   IngestResult::RateLimited, IngestResult::TableFull, IngestResult::WrongInterface,
+                   IngestResult::UnknownInterface}) {
         auto it = stats_.find(r);
         stats[ingest_result_name(r)] = it == stats_.end() ? 0 : it->second;
     }
@@ -437,6 +453,15 @@ bool BeaconListener::is_running() const {
 
 void BeaconListener::set_self_port(int port) {
     table_.set_self_port(port);
+}
+
+void BeaconListener::set_interface_allowlist(std::vector<std::string> names) {
+    {
+        std::lock_guard<std::mutex> lock(allowlist_mtx_);
+        if (names == allowlist_) return;
+        allowlist_ = std::move(names);
+    }
+    refresh_requested_ = true;
 }
 
 void BeaconListener::start(const std::string& instance_id, int self_port) {
@@ -507,8 +532,12 @@ void BeaconListener::stop() {
     {
         std::lock_guard<std::mutex> status_lock(status_mtx_);
         sockets_status_ = nlohmann::json::array();
+        interfaces_status_ = nlohmann::json::array();
+        unmatched_status_ = nlohmann::json::array();
+        allowlist_error_.clear();
         error_.clear();
     }
+    unmatched_.clear();
     LOG(INFO, "BeaconListener") << "Stopped listening for LAN beacons" << std::endl;
 }
 
@@ -523,6 +552,10 @@ nlohmann::json BeaconListener::status_json() const {
     }
     auto now = std::chrono::steady_clock::now();
     nlohmann::json out = table_.to_json(now);
+    {
+        std::lock_guard<std::mutex> lock(allowlist_mtx_);
+        out["interface_allowlist"] = allowlist_;
+    }
     std::lock_guard<std::mutex> status_lock(status_mtx_);
     bool listening = false;
     for (const auto& s : sockets_status_) {
@@ -531,8 +564,16 @@ nlohmann::json BeaconListener::status_json() const {
     out["enabled"] = true;
     out["supported"] = supported_;
     out["listening"] = listening;
-    out["error"] = error_.empty() ? nlohmann::json(nullptr) : nlohmann::json(error_);
+    if (!error_.empty()) {
+        out["error"] = error_;
+    } else if (!allowlist_error_.empty()) {
+        out["error"] = allowlist_error_;
+    } else {
+        out["error"] = nullptr;
+    }
     out["sockets"] = sockets_status_;
+    out["interfaces"] = interfaces_status_;
+    out["unmatched_interfaces"] = unmatched_status_;
     return out;
 }
 
@@ -568,8 +609,21 @@ void BeaconListener::publish_socket_status() {
             {"error", s.error.empty() ? nlohmann::json(nullptr) : nlohmann::json(s.error)},
         });
     }
+    nlohmann::json ifaces = nlohmann::json::array();
+    for (const auto& i : interfaces_) {
+        ifaces.push_back({{"name", i.name}, {"address", i.address}, {"netmask", i.netmask},
+                          {"broadcast", i.broadcast}});
+    }
+    std::string allowlist_error;
+    if (allowlist_active_ && interfaces_.empty()) {
+        allowlist_error = "no interface named in beacon_listen_interfaces has an RFC1918 address:";
+        for (const auto& name : unmatched_) allowlist_error += " " + name;
+    }
     std::lock_guard<std::mutex> status_lock(status_mtx_);
     sockets_status_ = std::move(arr);
+    interfaces_status_ = std::move(ifaces);
+    unmatched_status_ = unmatched_;
+    allowlist_error_ = std::move(allowlist_error);
 }
 
 #ifdef _WIN32
@@ -592,21 +646,52 @@ void BeaconListener::close_all_sockets() {
 void BeaconListener::refresh_sockets() {
     NetworkBeacon probe;
     auto ifaces = probe.getLocalRFC1918Interfaces();
+    std::vector<std::string> allowlist;
+    {
+        std::lock_guard<std::mutex> lock(allowlist_mtx_);
+        allowlist = allowlist_;
+    }
+    allowlist_active_ = !allowlist.empty();
 
     std::vector<uint32_t> local_addrs;
     std::set<uint32_t> desired;
+    std::set<std::string> present;
+    interfaces_.clear();
     for (const auto& iface : ifaces) {
         in_addr ip{};
         if (inet_pton(AF_INET, iface.ipAddress.c_str(), &ip) != 1) continue;
         uint32_t ip_host = ntohl(ip.s_addr);
         local_addrs.push_back(ip_host);
         if ((ip_host & 0xFF000000u) == 0x7F000000u) continue;
+        present.insert(iface.name);
+        if (allowlist_active_ &&
+            std::find(allowlist.begin(), allowlist.end(), iface.name) == allowlist.end()) {
+            continue;
+        }
         in_addr bcast{};
         if (inet_pton(AF_INET, iface.broadcastAddress.c_str(), &bcast) != 1) continue;
-        desired.insert(ntohl(bcast.s_addr));
+        uint32_t bcast_host = ntohl(bcast.s_addr);
+        if (bcast_host != ip_host) desired.insert(bcast_host);
+        interfaces_.push_back({iface.name, if_nametoindex(iface.name.c_str()), iface.ipAddress, iface.netmask,
+                               iface.broadcastAddress});
     }
-    desired.insert(0xFFFFFFFFu);
+    if (!interfaces_.empty()) desired.insert(0xFFFFFFFFu);
     table_.set_local_addresses(std::move(local_addrs));
+
+    std::vector<std::string> unmatched;
+    for (const auto& name : allowlist) {
+        if (present.count(name) == 0) unmatched.push_back(name);
+    }
+    if (unmatched != unmatched_) {
+        if (!unmatched.empty()) {
+            std::string names;
+            for (const auto& name : unmatched) names += (names.empty() ? "" : ", ") + name;
+            LOG(WARNING, "BeaconListener") << "beacon_listen_interfaces names no interface with an RFC1918 address: "
+                                           << names << (interfaces_.empty() ? " (listening on nothing)" : "")
+                                           << std::endl;
+        }
+        unmatched_ = std::move(unmatched);
+    }
 
     for (auto it = sockets_.begin(); it != sockets_.end();) {
         if (desired.count(it->bind_ip) == 0) {
@@ -636,6 +721,14 @@ void BeaconListener::refresh_sockets() {
         }
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef IP_PKTINFO
+        if (setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one)) != 0) {
+            LOG(WARNING, "BeaconListener") << "IP_PKTINFO unavailable on " << existing->address << ": "
+                                           << std::strerror(errno)
+                                           << "; beacons on it are dropped while beacon_listen_interfaces is set"
+                                           << std::endl;
+        }
+#endif
         sockaddr_in sa{};
         sa.sin_family = AF_INET;
         sa.sin_port = htons(kBeaconPort);
@@ -652,13 +745,19 @@ void BeaconListener::refresh_sockets() {
     publish_socket_status();
 }
 
+bool BeaconListener::arrived_on_listened_interface(unsigned ifindex) const {
+    std::vector<unsigned> listened;
+    for (const auto& i : interfaces_) listened.push_back(i.index);
+    return beacon_arrival_accepted(allowlist_active_, ifindex, listened);
+}
+
 void BeaconListener::thread_loop() {
     auto next_refresh = std::chrono::steady_clock::now();
     char buf[kMaxDatagram];
 
     while (!stop_.load()) {
         auto now = std::chrono::steady_clock::now();
-        if (now >= next_refresh) {
+        if (now >= next_refresh || refresh_requested_.exchange(false)) {
             refresh_sockets();
             next_refresh = now + kIfaceRefresh;
         }
@@ -696,13 +795,20 @@ void BeaconListener::thread_loop() {
             }
             for (int drained = 0; drained < 64; ++drained) {
                 sockaddr_in from{};
-                socklen_t from_len = sizeof(from);
+                iovec iov{buf, sizeof(buf)};
+                alignas(cmsghdr) char control[256];
+                msghdr msg{};
+                msg.msg_name = &from;
+                msg.msg_namelen = sizeof(from);
+                msg.msg_iov = &iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control;
+                msg.msg_controllen = sizeof(control);
                 int flags = MSG_DONTWAIT;
 #ifdef __linux__
                 flags |= MSG_TRUNC;
 #endif
-                ssize_t n = recvfrom(sock.fd, buf, sizeof(buf), flags,
-                                     reinterpret_cast<sockaddr*>(&from), &from_len);
+                ssize_t n = recvmsg(sock.fd, &msg, flags);
                 if (n < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
                     sock.error = std::string("recvfrom: ") + std::strerror(errno);
@@ -716,8 +822,20 @@ void BeaconListener::thread_loop() {
                 bool truncated = received >= sizeof(buf);
                 size_t len = std::min(received, sizeof(buf));
                 uint32_t src = ntohl(from.sin_addr.s_addr);
-                IngestResult result =
-                    table_.ingest(buf, len, truncated, src, std::chrono::steady_clock::now());
+                unsigned ifindex = 0;
+#ifdef IP_PKTINFO
+                for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+                    if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
+                        in_pktinfo info{};
+                        std::memcpy(&info, CMSG_DATA(c), sizeof(info));
+                        ifindex = static_cast<unsigned>(info.ipi_ifindex);
+                    }
+                }
+#endif
+                IngestResult result = arrived_on_listened_interface(ifindex)
+                                          ? table_.ingest(buf, len, truncated, src, std::chrono::steady_clock::now())
+                                          : table_.reject(ifindex == 0 ? IngestResult::UnknownInterface
+                                                                       : IngestResult::WrongInterface);
                 log_rejection(result, src);
             }
         }

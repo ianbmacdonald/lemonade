@@ -41,10 +41,16 @@ enum class IngestResult {
     BadPayload,
     UrlMismatch,
     RateLimited,
-    TableFull
+    TableFull,
+    WrongInterface,
+    UnknownInterface
 };
 
 const char* ingest_result_name(IngestResult result);
+
+// Whether a beacon that arrived on ifindex (0 = unknown) may be ingested.
+bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
+                             const std::vector<unsigned>& listened_ifindexes);
 
 struct HeardHost {
     std::string hostname;
@@ -70,6 +76,7 @@ public:
     IngestResult ingest(const char* buf, std::size_t len, bool truncated, uint32_t src_ip,
                         std::chrono::steady_clock::time_point now);
     void expire(std::chrono::steady_clock::time_point now);
+    IngestResult reject(IngestResult result);
 
     nlohmann::json to_json(std::chrono::steady_clock::time_point now) const;
     std::vector<HeardHost> hosts() const;
@@ -110,8 +117,9 @@ private:
 };
 
 // Owns the UDP sockets and one worker thread. Binds only broadcast addresses
-// (never INADDR_ANY) so 127.0.0.1 unicast beacons keep reaching the CLI and
-// desktop app wildcard listeners.
+// (never INADDR_ANY): with SO_REUSEADDR the kernel hands each 127.0.0.1
+// unicast beacon to the most recently bound wildcard socket only, so a
+// wildcard bind here would take them from the CLI and desktop app listeners.
 class BeaconListener {
 public:
     BeaconListener();
@@ -123,6 +131,8 @@ public:
     void start(const std::string& instance_id, int self_port);
     void stop();
     void set_self_port(int port);
+    // Interface names to listen on; empty means every RFC1918 interface.
+    void set_interface_allowlist(std::vector<std::string> names);
     bool is_running() const;
     nlohmann::json status_json() const;
 
@@ -134,11 +144,19 @@ private:
         bool bound = false;
         std::string error;
     };
+    struct ListenedInterface {
+        std::string name;
+        unsigned index = 0;
+        std::string address;
+        std::string netmask;
+        std::string broadcast;
+    };
 
     void thread_loop();
     void refresh_sockets();
     void close_all_sockets();
     void publish_socket_status();
+    bool arrived_on_listened_interface(unsigned ifindex) const;
     void wait_slice();
     void log_rejection(IngestResult result, uint32_t src_ip);
 
@@ -154,8 +172,18 @@ private:
     std::string error_;
     bool start_failed_ = false;
     nlohmann::json sockets_status_ = nlohmann::json::array();
+    nlohmann::json interfaces_status_ = nlohmann::json::array();
+    nlohmann::json unmatched_status_ = nlohmann::json::array();
+    std::string allowlist_error_;
+
+    mutable std::mutex allowlist_mtx_;
+    std::vector<std::string> allowlist_;
+    std::atomic<bool> refresh_requested_{false};
 
     std::vector<SocketState> sockets_;
+    std::vector<ListenedInterface> interfaces_;
+    std::vector<std::string> unmatched_;
+    bool allowlist_active_ = false;
     std::map<IngestResult, std::chrono::steady_clock::time_point> last_warning_;
     BeaconPeerTable table_;
 };
