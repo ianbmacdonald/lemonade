@@ -5555,6 +5555,31 @@ class EndpointTests(ServerTestBase):
                 self.assertEqual(flagged.status_code, 400, flagged.text)
                 self.assertIn(flag, flagged.json()["error"])
 
+            for bad_field in (
+                {"prompt": [{"text": "hi"}]},
+                {"prompt": [None]},
+                {"input": 42},
+            ):
+                malformed = requests.post(
+                    f"{self.base_url}/routing/validate",
+                    json={"model": canonical_name, **bad_field},
+                    timeout=TIMEOUT_DEFAULT,
+                )
+                self.assertEqual(malformed.status_code, 400, malformed.text)
+                self.assertIn(next(iter(bad_field)), malformed.json()["error"])
+
+            for accepted in (
+                {"prompt": [1, 2, 3]},
+                {"prompt": ["def f", "code"]},
+                {"input": [{"role": "user", "content": "code"}]},
+            ):
+                ok = requests.post(
+                    f"{self.base_url}/routing/validate",
+                    json={"model": canonical_name, **accepted},
+                    timeout=TIMEOUT_DEFAULT,
+                )
+                self.assertEqual(ok.status_code, 200, ok.text)
+
             bad_model = requests.post(
                 f"{self.base_url}/routing/validate",
                 json={"model": 42, "prompt": "hi"},
