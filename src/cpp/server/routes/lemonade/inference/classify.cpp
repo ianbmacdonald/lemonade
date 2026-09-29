@@ -20,6 +20,8 @@ const RouteError kNoSoleClassifier{
     400, "", "`model` is omitted and not exactly one classification model is loaded"};
 const RouteError kNotClassifier{
     400, "", "`model` lacks the `classification` label, checked before it loads"};
+const RouteError kImageModel{
+    400, "model_not_applicable", "`model` is an image-classification model, served by `POST /v1/images/classify`"};
 const RouteError kBackendRejected{
     400, "",
     "The backend rejects the request, for example `labels` sent to a fixed-label model or left "
@@ -108,7 +110,7 @@ public:
         })");
         s.examples = {example};
         s.errors = join_errors({{kBodyNotJson, kArgMissing, kArgInvalid,
-                                 kNoSoleClassifier, kNotClassifier,
+                                 kNoSoleClassifier, kNotClassifier, kImageModel,
                                  kBackendRejected, kModelUnloaded, kBackendError,
                                  kMalformedBackendResponse, kUnexpectedException},
                                 ModelLoader::errors()});
@@ -157,6 +159,14 @@ protected:
             }
             req.body[kModel.name] = req.model;
             req.model_already_loaded = true;
+        }
+
+        if (const auto info = ctx_.router->try_get_model_info(req.model);
+            info && info->type == ModelType::IMAGE_CLASSIFICATION) {
+            write_openai_error(res, kImageModel,
+                "model '" + req.model + "' is an image-classification model; "
+                "POST /v1/images/classify");
+            return false;
         }
 
         // Refused before the load: loading a chat model would take an LLM slot (and
