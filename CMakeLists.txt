@@ -2345,6 +2345,18 @@ if(BUILD_TESTING AND EXISTS "${_CUSTOM_ARGS_TEST_SRC}")
     add_cpp_ci_test(CustomArgsTest CI ON COMMAND test_custom_args)
 endif()
 
+# /proc/<pid>/status memory parsing for the health endpoint.
+set(_PROCESS_MEMORY_TEST_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_process_memory.cpp"
+)
+if(BUILD_TESTING AND EXISTS "${_PROCESS_MEMORY_TEST_SRC}")
+    add_executable(test_process_memory ${_PROCESS_MEMORY_TEST_SRC})
+    target_include_directories(test_process_memory PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
+    )
+    add_cpp_ci_test(ProcessMemoryTest CI ON COMMAND test_process_memory)
+endif()
+
 # Recipe custom-argument scope resolution.
 set(_RECIPE_ARG_RESOLVER_TEST_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_recipe_arg_resolution.cpp"
