@@ -10,6 +10,7 @@
 #include <httplib.h>
 
 #include "lemon/upgradable_http_server.h"
+#include "lemon/utils/beacon_listener.h"
 #include "lemon/utils/network_beacon.h"
 
 namespace lemon {
@@ -44,6 +45,10 @@ public:
     // Applies the host, port, websocket_port and broadcast settings from RuntimeConfig to
     // the running listeners. Only what changed is restarted.
     void rebind();
+
+    // Starts or stops the LAN beacon listener to match config; safe to call repeatedly.
+    void sync_beacon_listener();
+    nlohmann::json beacon_listener_status() const { return beacon_listener_.status_json(); }
 
     // 0 when the WebSocket server is not running.
     int websocket_port() const;
@@ -91,6 +96,10 @@ private:
     std::unique_ptr<WebSocketServer> websocket_server_;
 
     NetworkBeacon udp_beacon_;
+    std::string instance_id_;
+    BeaconListener beacon_listener_;
+    std::mutex beacon_listener_mtx_;
+    bool beacon_listener_shutdown_ = false;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> shutdown_requested_{false};

@@ -109,6 +109,25 @@ ordered_json health_schema() {
                 }
             },
             "pinned_helper_models": {"type": "object", "additionalProperties": {"type": "integer", "description": "How many pinned routing-helper models of this type are loaded."}, "description": "Loaded pinned routing-helper models, counted per model type."},
+            "beacon_listener": {
+                "type": "object",
+                "description": "State of the LAN beacon listener, controlled by the `beacon_listen` setting in [Server Configuration](../guide/configuration/README.md). The list is display-only: Lemonade never contacts a heard host, sends it credentials, or routes requests to it. When the listener is off, this is `{\"enabled\": false}`.",
+                "required": ["enabled"],
+                "properties": {
+                    "enabled": {"type": "boolean", "description": "Whether the listener is running."},
+                    "supported": {"type": "boolean", "description": "`false` on Windows, where the listener is not available in this release."},
+                    "listening": {"type": "boolean", "description": "Whether at least one UDP socket is bound."},
+                    "error": {"type": ["string", "null"], "description": "Platform-level error, or `null`."},
+                    "sockets": {"type": "array", "items": {"type": "object"}, "description": "One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each local RFC1918 interface's directed-broadcast address plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on."},
+                    "self_instance_id": {"type": "string", "description": "This server's beacon `instance_id`, used to drop its own beacons."},
+                    "self_port": {"type": "integer", "description": "This server's HTTP port, used to drop its own beacons."},
+                    "ttl_seconds": {"type": "integer", "description": "Seconds a host stays listed after its last beacon."},
+                    "max_hosts": {"type": "integer", "description": "Maximum listed hosts."},
+                    "distinct_instances": {"type": "integer", "description": "Number of distinct servers heard; a multi-homed server has one row per interface."},
+                    "hosts": {"type": "array", "items": {"type": "object"}, "description": "Heard servers, sorted by hostname: `hostname` (sanitised to `[A-Za-z0-9._-]`), `url`, `source_ip`, `instance_id` (or `null` for older servers), `first_seen` and `last_seen` (Unix seconds), `age_seconds`."},
+                    "stats": {"type": "object", "description": "Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch`, `rate_limited`, `table_full`, `evicted`."}
+                }
+            },
             "server_process": {
                 "type": "object",
                 "description": "The Lemonade Server process itself.",
@@ -203,6 +222,7 @@ public:
         }
 
         response["update_check_done"] = ctx_.server->update_check_done();
+        response["beacon_listener"] = ctx_.listener->beacon_listener_status();
 
         if (ctx_.model_manager) {
             const json sync = ctx_.model_manager->sync_status();

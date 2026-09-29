@@ -33,6 +33,7 @@ public:
     std::vector<NetworkInterfaceInfo> getLocalRFC1918Interfaces();
     void startBroadcasting(int beaconPort, int serverPort, uint16_t intervalSeconds);
     void stopBroadcasting();
+    void setInstanceId(const std::string& id);
 
 private:
     std::mutex _netMtx;
@@ -44,6 +45,7 @@ private:
     SOCKET _socket;
     bool _isInitialized;
     uint16_t _broadcastIntervalSeconds;
+    std::string _instanceId;
     void cleanup();
     void createSocket();
     void broadcastThreadLoop();

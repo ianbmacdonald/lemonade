@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <iostream>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 
 #include <lemon/utils/aixlog.hpp>
@@ -51,6 +54,14 @@ HttpListener::HttpListener(RuntimeConfig* config, Router* router, SetupFn setup,
       bound_host_(config->host()),
       websocket_requested_port_(config->websocket_port()),
       broadcast_(config->broadcast()) {
+    {
+        std::random_device rd;
+        std::mt19937_64 gen((static_cast<uint64_t>(rd()) << 32) ^ rd());
+        std::ostringstream id;
+        id << std::hex << std::setw(16) << std::setfill('0') << gen();
+        instance_id_ = id.str();
+    }
+    udp_beacon_.setInstanceId(instance_id_);
     create_servers();
     websocket_server_ = std::make_unique<WebSocketServer>(
         router_, config_->host(), config_->websocket_port());
@@ -283,6 +294,8 @@ void HttpListener::start() {
         }
     }
 
+    sync_beacon_listener();
+
     while (true) {
         if (shutdown_requested_.load()) {
             LOG(INFO, "Server") << "Shutdown requested, stopping server..." << std::endl;
@@ -391,7 +404,21 @@ void HttpListener::start() {
 }
 
 
+void HttpListener::sync_beacon_listener() {
+    std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
+    if (!beacon_listener_shutdown_ && config_->beacon_listen()) {
+        beacon_listener_.start(instance_id_, port_.load());
+    } else {
+        beacon_listener_.stop();
+    }
+}
+
 bool HttpListener::stop() {
+    {
+        std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
+        beacon_listener_shutdown_ = true;
+        beacon_listener_.stop();
+    }
     if (!running_.exchange(false)) {
         return false;
     }
@@ -432,6 +459,7 @@ void HttpListener::rebind() {
     if (new_port != current_port) {
         LOG(INFO, "Server") << "Port change requested: " << current_port << " -> " << new_port << std::endl;
         port_.store(new_port);
+        beacon_listener_.set_self_port(new_port);
         rebind_http = true;
     }
     if (new_host != bound_host_) {
