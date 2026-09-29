@@ -311,7 +311,9 @@ class ImageClassifyTests(ServerTestBase):
         self._assert_status(response, 200, "classification")
         body = response.json()
         self.assertEqual(body["object"], "image_classification")
-        self.assertEqual(body["model"], MODEL)
+        # The public id of a user model drops the "user." prefix when echoed
+        # for an implicitly selected model.
+        self.assertIn(body["model"], (MODEL, MODEL[len("user.") :]))
         data = body["data"]
         self.assertEqual(len(data), top_k)
         scores = [d["score"] for d in data]
