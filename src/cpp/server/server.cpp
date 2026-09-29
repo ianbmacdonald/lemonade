@@ -4008,9 +4008,23 @@ void Server::handle_registered_routing_validate(nlohmann::json request_json,
             return;
         }
     }
-    if (request_json.contains("prompt") && !request_json["prompt"].is_string() &&
-        !request_json["prompt"].is_array()) {
-        bad_request("'prompt' must be a string or an array of strings");
+    if (request_json.contains("prompt")) {
+        const auto& prompt = request_json["prompt"];
+        // Token ids and token-id arrays are valid completions prompts that
+        // dispatch routes as empty text, so only other element types are rejected.
+        const bool valid = prompt.is_string() ||
+            (prompt.is_array() &&
+             std::all_of(prompt.begin(), prompt.end(), [](const nlohmann::json& part) {
+                 return part.is_string() || part.is_number_integer() || part.is_array();
+             }));
+        if (!valid) {
+            bad_request("'prompt' must be a string or an array of strings or token ids");
+            return;
+        }
+    }
+    if (request_json.contains("input") && !request_json["input"].is_string() &&
+        !request_json["input"].is_array()) {
+        bad_request("'input' must be a string or an array");
         return;
     }
     if (request_json.contains("messages") && !request_json["messages"].is_array()) {
@@ -4018,11 +4032,11 @@ void Server::handle_registered_routing_validate(nlohmann::json request_json,
         return;
     }
 
-    normalize_client_model_name(request_json);
-    normalize_and_resolve_request_model(request_json);
-    const std::string requested_model = request_json["model"].get<std::string>();
-
     try {
+        normalize_client_model_name(request_json);
+        normalize_and_resolve_request_model(request_json);
+        const std::string requested_model = request_json["model"].get<std::string>();
+
         if (!model_manager_->model_exists(requested_model)) {
             res.status = 404;
             res.set_content(nlohmann::json{{"error",

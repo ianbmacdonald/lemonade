@@ -383,7 +383,11 @@ the returned `decision` is the one a real request with the same body would get.
 No candidate is loaded and nothing is forwarded to a backend. Deterministic
 rules are evaluated locally; model-backed conditions (`semantic_similarity`,
 `classifier`, `llm`, `routing.router`) load and run their helper models, as they
-do on dispatch. Classify-only requests are not counted in the routing metrics.
+do on dispatch, and like any load that can evict other loaded models under
+memory pressure. Classify-only requests are not counted in the routing metrics.
+If evaluation fails, validate returns an error, whereas dispatch fails open and
+sends the request on to the router model itself, so an error here does not mean
+the same request would fail on dispatch.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -435,7 +439,7 @@ always included, and the `decision` object is identical to the
 | `400` | Body is not valid JSON, `policy` is missing or not an object, `prompt` is not a string, `has_images`/`has_tools` are not booleans, or `metadata` is not an object of string values. |
 | `400` | The policy document is invalid or internally inconsistent; the `error` field is prefixed with `Invalid routing policy:`. |
 | `400` | Both `policy` and `model` were sent. |
-| `400` | With `model`: `model` is not a string, the model is not a `collection.router`, `has_images`/`has_tools` were sent, `prompt` is not a string or array, or `messages` is not an array. |
+| `400` | With `model`: `model` is not a string, the model is not a `collection.router`, `has_images`/`has_tools` were sent, `prompt` is not a string or an array of strings/token ids, `input` is not a string or array, or `messages` is not an array. |
 | `404` | With `model`: no model by that name is registered. |
 | `409` | With `model`: a model-backed condition's helper model could not be made resident (`router_residency_conflict`), as on dispatch. |
 | `500` | With `model`: the router's registered policy failed to parse, or a helper model failed in a way its `on_error` policy does not absorb. |

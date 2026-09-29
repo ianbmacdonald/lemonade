@@ -163,8 +163,10 @@ private:
     std::optional<RouterDispatchResult> route_collection_request(
         const nlohmann::json& request_json,
         const ModelInfo& collection_info);
-    // The side-effect-free core of route_collection_request, shared with the
-    // classify-only /routing/validate mode so the two can never disagree.
+    // The decision core of route_collection_request, shared with the
+    // classify-only /routing/validate mode so the two can never disagree. It
+    // has no dispatch side effects (no candidate load, no route history, no
+    // metrics), but model-backed conditions may load routing helper models.
     std::optional<Decision> evaluate_collection_route(
         const nlohmann::json& request_json,
         const ModelInfo& collection_info,
