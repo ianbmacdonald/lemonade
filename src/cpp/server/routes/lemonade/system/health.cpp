@@ -7,6 +7,7 @@
 #include "lemon/server.h"
 #include "lemon/server/api_route.h"
 #include "lemon/server/http_listener.h"
+#include "lemon/utils/process_memory.h"
 #include "lemon/version.h"
 
 namespace lemon {
@@ -14,6 +15,15 @@ namespace {
 
 using json = nlohmann::json;
 using ordered_json = nlohmann::ordered_json;
+
+void add_memory_fields(json& obj, const utils::ProcessMemory& mem) {
+    if (mem.has_rss) {
+        obj["rss_mib"] = utils::to_mib(mem.rss_kib);
+    }
+    if (mem.has_anon) {
+        obj["anon_mib"] = utils::to_mib(mem.anon_kib);
+    }
+}
 
 ordered_json health_schema() {
     return ordered_json::parse(R"json({
@@ -54,6 +64,8 @@ ordered_json health_schema() {
                         "is_streaming": {"type": "boolean", "description": "Whether the model is generating output tokens: `true` from the first chunk until every streaming request completes."},
                         "backend_url": {"type": "string", "description": "URL of the backend process serving the model."},
                         "pid": {"type": "integer", "description": "Process ID of the backend process serving the model."},
+                        "rss_mib": {"type": "number", "description": "Resident memory of the backend process in MiB (`VmRSS`, rounded to one decimal). Includes memory-mapped model weights and shared libraries, so pages shared between backends can be counted more than once. Linux only; a best-effort sample, omitted when it can't be read. Only the direct backend process is measured, not its children."},
+                        "anon_mib": {"type": "number", "description": "Private anonymous memory of the backend process in MiB (`RssAnon`, rounded to one decimal): the part of `rss_mib` not backed by files. Same availability as `rss_mib`."},
                         "launch_command": {"type": "array", "items": {"type": "string"}, "description": "The command that started the model's backend, program first, with the values actually used: an automatic `ctx_size` appears as a number, and flags Lemonade added are included. Absent for cloud models."},
                         "recipe": {"type": "string", "description": "Recipe used to load the model, e.g. `llamacpp` or `flm`."},
                         "recipe_options": {"type": "object", "description": "Options the model was loaded with, such as `ctx_size` or `llamacpp_args`."},
@@ -96,7 +108,17 @@ ordered_json health_schema() {
                     "captures": {"type": "array", "items": {"enum": ["inputs", "outputs", "thinking"]}, "description": "The parts of each request telemetry captures, present when `enabled` is `true`."}
                 }
             },
-            "pinned_helper_models": {"type": "object", "additionalProperties": {"type": "integer", "description": "How many pinned routing-helper models of this type are loaded."}, "description": "Loaded pinned routing-helper models, counted per model type."}
+            "pinned_helper_models": {"type": "object", "additionalProperties": {"type": "integer", "description": "How many pinned routing-helper models of this type are loaded."}, "description": "Loaded pinned routing-helper models, counted per model type."},
+            "server_process": {
+                "type": "object",
+                "description": "The Lemonade Server process itself.",
+                "required": ["pid"],
+                "properties": {
+                    "pid": {"type": "integer", "description": "Process ID of the server."},
+                    "rss_mib": {"type": "number", "description": "Resident memory of the server in MiB, with the same meaning and availability as the per-model field."},
+                    "anon_mib": {"type": "number", "description": "Private anonymous memory of the server in MiB, with the same meaning and availability as the per-model field."}
+                }
+            }
         }
     })json");
 }
@@ -160,6 +182,17 @@ public:
         std::string loaded_model = ctx_.router->get_loaded_model();
         response["model_loaded"] = loaded_model.empty() ? json(nullptr) : json(loaded_model);
         response["all_models_loaded"] = ctx_.router->get_all_loaded_models();
+        // Sampled after the router lock is released: a backend evicted in the gap
+        // just loses its memory fields for this one response.
+        for (auto& model : response["all_models_loaded"]) {
+            const int pid = model.value("pid", 0);
+            if (pid > 0) {
+                add_memory_fields(model, utils::read_process_memory(pid));
+            }
+        }
+        json server_process = {{"pid", utils::current_process_id()}};
+        add_memory_fields(server_process, utils::read_self_memory());
+        response["server_process"] = server_process;
         response["max_models"] = ctx_.router->get_max_model_limits();
         response["pinned_models"] = ctx_.router->get_pinned_model_counts();
         response["pinned_helper_models"] = ctx_.router->get_pinned_helper_counts();
