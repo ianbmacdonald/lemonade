@@ -134,14 +134,14 @@ const char* ingest_result_name(IngestResult result) {
         case IngestResult::RateLimited: return "rate_limited";
         case IngestResult::TableFull: return "table_full";
         case IngestResult::WrongInterface: return "wrong_interface";
+        case IngestResult::UnknownInterface: return "unknown_interface";
     }
     return "unknown";
 }
 
 bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
                              const std::vector<unsigned>& listened_ifindexes) {
-    (void)allowlist_active;
-    if (ifindex == 0) return true;
+    if (ifindex == 0) return !allowlist_active;
     return std::find(listened_ifindexes.begin(), listened_ifindexes.end(), ifindex) != listened_ifindexes.end();
 }
 
@@ -386,7 +386,8 @@ nlohmann::json BeaconPeerTable::to_json(steady_clock::time_point now) const {
     nlohmann::json stats = nlohmann::json::object();
     for (auto r : {IngestResult::Accepted, IngestResult::Refreshed, IngestResult::Self,
                    IngestResult::BadSource, IngestResult::BadPayload, IngestResult::UrlMismatch,
-                   IngestResult::RateLimited, IngestResult::TableFull, IngestResult::WrongInterface}) {
+                   IngestResult::RateLimited, IngestResult::TableFull, IngestResult::WrongInterface,
+                   IngestResult::UnknownInterface}) {
         auto it = stats_.find(r);
         stats[ingest_result_name(r)] = it == stats_.end() ? 0 : it->second;
     }
@@ -532,8 +533,11 @@ void BeaconListener::stop() {
         std::lock_guard<std::mutex> status_lock(status_mtx_);
         sockets_status_ = nlohmann::json::array();
         interfaces_status_ = nlohmann::json::array();
+        unmatched_status_ = nlohmann::json::array();
+        allowlist_error_.clear();
         error_.clear();
     }
+    unmatched_.clear();
     LOG(INFO, "BeaconListener") << "Stopped listening for LAN beacons" << std::endl;
 }
 
@@ -560,9 +564,16 @@ nlohmann::json BeaconListener::status_json() const {
     out["enabled"] = true;
     out["supported"] = supported_;
     out["listening"] = listening;
-    out["error"] = error_.empty() ? nlohmann::json(nullptr) : nlohmann::json(error_);
+    if (!error_.empty()) {
+        out["error"] = error_;
+    } else if (!allowlist_error_.empty()) {
+        out["error"] = allowlist_error_;
+    } else {
+        out["error"] = nullptr;
+    }
     out["sockets"] = sockets_status_;
     out["interfaces"] = interfaces_status_;
+    out["unmatched_interfaces"] = unmatched_status_;
     return out;
 }
 
@@ -603,9 +614,16 @@ void BeaconListener::publish_socket_status() {
         ifaces.push_back({{"name", i.name}, {"address", i.address}, {"netmask", i.netmask},
                           {"broadcast", i.broadcast}});
     }
+    std::string allowlist_error;
+    if (allowlist_active_ && interfaces_.empty()) {
+        allowlist_error = "no interface named in beacon_listen_interfaces has an RFC1918 address:";
+        for (const auto& name : unmatched_) allowlist_error += " " + name;
+    }
     std::lock_guard<std::mutex> status_lock(status_mtx_);
     sockets_status_ = std::move(arr);
     interfaces_status_ = std::move(ifaces);
+    unmatched_status_ = unmatched_;
+    allowlist_error_ = std::move(allowlist_error);
 }
 
 #ifdef _WIN32
@@ -637,6 +655,7 @@ void BeaconListener::refresh_sockets() {
 
     std::vector<uint32_t> local_addrs;
     std::set<uint32_t> desired;
+    std::set<std::string> present;
     interfaces_.clear();
     for (const auto& iface : ifaces) {
         in_addr ip{};
@@ -644,6 +663,7 @@ void BeaconListener::refresh_sockets() {
         uint32_t ip_host = ntohl(ip.s_addr);
         local_addrs.push_back(ip_host);
         if ((ip_host & 0xFF000000u) == 0x7F000000u) continue;
+        present.insert(iface.name);
         if (allowlist_active_ &&
             std::find(allowlist.begin(), allowlist.end(), iface.name) == allowlist.end()) {
             continue;
@@ -657,6 +677,21 @@ void BeaconListener::refresh_sockets() {
     }
     if (!interfaces_.empty()) desired.insert(0xFFFFFFFFu);
     table_.set_local_addresses(std::move(local_addrs));
+
+    std::vector<std::string> unmatched;
+    for (const auto& name : allowlist) {
+        if (present.count(name) == 0) unmatched.push_back(name);
+    }
+    if (unmatched != unmatched_) {
+        if (!unmatched.empty()) {
+            std::string names;
+            for (const auto& name : unmatched) names += (names.empty() ? "" : ", ") + name;
+            LOG(WARNING, "BeaconListener") << "beacon_listen_interfaces names no interface with an RFC1918 address: "
+                                           << names << (interfaces_.empty() ? " (listening on nothing)" : "")
+                                           << std::endl;
+        }
+        unmatched_ = std::move(unmatched);
+    }
 
     for (auto it = sockets_.begin(); it != sockets_.end();) {
         if (desired.count(it->bind_ip) == 0) {
@@ -687,7 +722,12 @@ void BeaconListener::refresh_sockets() {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #ifdef IP_PKTINFO
-        setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
+        if (setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one)) != 0) {
+            LOG(WARNING, "BeaconListener") << "IP_PKTINFO unavailable on " << existing->address << ": "
+                                           << std::strerror(errno)
+                                           << "; beacons on it are dropped while beacon_listen_interfaces is set"
+                                           << std::endl;
+        }
 #endif
         sockaddr_in sa{};
         sa.sin_family = AF_INET;
@@ -705,10 +745,7 @@ void BeaconListener::refresh_sockets() {
     publish_socket_status();
 }
 
-bool BeaconListener::arrived_on_listened_interface(const SocketState& sock, unsigned ifindex) const {
-    // Without the arrival interface, only a directed-broadcast socket is
-    // tied to a listened interface; 255.255.255.255 arrives on any of them.
-    if (ifindex == 0 && allowlist_active_ && sock.bind_ip == 0xFFFFFFFFu) return false;
+bool BeaconListener::arrived_on_listened_interface(unsigned ifindex) const {
     std::vector<unsigned> listened;
     for (const auto& i : interfaces_) listened.push_back(i.index);
     return beacon_arrival_accepted(allowlist_active_, ifindex, listened);
@@ -795,9 +832,10 @@ void BeaconListener::thread_loop() {
                     }
                 }
 #endif
-                IngestResult result = arrived_on_listened_interface(sock, ifindex)
+                IngestResult result = arrived_on_listened_interface(ifindex)
                                           ? table_.ingest(buf, len, truncated, src, std::chrono::steady_clock::now())
-                                          : table_.reject(IngestResult::WrongInterface);
+                                          : table_.reject(ifindex == 0 ? IngestResult::UnknownInterface
+                                                                       : IngestResult::WrongInterface);
                 log_rejection(result, src);
             }
         }
