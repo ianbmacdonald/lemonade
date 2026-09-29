@@ -19,7 +19,10 @@ using json = nlohmann::json;
 using ordered_json = nlohmann::ordered_json;
 
 const RouteError kBadContentType{400, "", "`Content-Type` is neither `multipart/form-data` nor `application/json`"};
-const RouteError kBadImageRequest{400, "", "The image is missing, not strict base64, not a JPEG or PNG, or `top_k` is invalid"};
+const RouteError kBadImageRequest{
+    400, "",
+    "Malformed request: zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG "
+    "image, a bad `top_k`, or an image the backend cannot decode"};
 const RouteError kImageTooLarge{413, "payload_too_large", "The decoded image exceeds 16 MiB, or the body exceeds 23 MiB"};
 const RouteError kLengthRequired{411, "length_required", "The request carries no `Content-Length` (a chunked upload)"};
 const RouteError kNotImageClassifier{400, "model_not_applicable", "`model` is not an image-classification model"};
@@ -32,10 +35,11 @@ const RouteError kCrashedOnInput{
 const RouteArg kModel{"model", ArgIn::Form, {{"type", "string"}}, false, Support::Available,
                       "The image-classification model to use. Optional when exactly one is loaded."};
 const RouteArg kImage{"image", ArgIn::Form, {{"type", "string"}, {"format", "binary"}}, true, Support::Available,
-                      "The JPEG or PNG image, at most 16 MiB: a multipart file part named `image` (or "
-                      "`file`), or in a JSON body a base64 string or `data:` URL.", {"file"}};
+                      "Multipart: exactly one file part named `image` (or `file`). JSON: a base64 string, "
+                      "or a `data:image/jpeg;base64,...` / `data:image/png;base64,...` URL. Remote "
+                      "`http(s)` URLs are not fetched. At most 16 MiB decoded.", {"file"}};
 const RouteArg kTopK{"top_k", ArgIn::Form, {{"type", "integer"}, {"minimum", 1}, {"maximum", 1000000}}, false, Support::Available,
-                     "Return only the highest-scoring `k` classes. Defaults to 5."};
+                     "Number of labels to return. Defaults to 5; the backend caps it at the model's label count."};
 
 int status_for_backend_error(const json& err) {
     if (err.contains("status_code") && err["status_code"].is_number_integer()) {
@@ -69,21 +73,51 @@ public:
 
     RouteSpec spec() const override {
         RouteSpec s;
-        s.id = "openai.images_classify";
+        s.id = "lemonade.images_classify";
         s.methods = {"POST"};
         s.paths = {"images/classify"};
         s.summary = "Classify an image";
-        s.modality = "image -> class scores";
         s.experimental = true;
         s.description =
-            "Runs an image-classification model, such as `MobileNetV2-1.0-224-TFLite` served by "
-            "`tflite-server`, on one JPEG or PNG image and returns the highest-scoring classes. The "
-            "image is sent as a multipart file part, or as base64 in a JSON body.";
+            "Classifies one image and returns the top-scoring labels. The model must be labeled "
+            "`image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` "
+            "(0.2.0 or newer) subprocess on the CPU. The request is either `multipart/form-data` "
+            "(the same shape as `/v1/images/edits`) or `application/json`. Only JPEG and PNG are "
+            "accepted, and EXIF orientation is not applied.";
         s.notes = {
-            "The body is capped before it is read: a request without `Content-Length` gets `411`, "
-            "and one over 23 MiB gets `413`.",
-            "An image that crashes the backend is never replayed: the backend is reloaded and the "
-            "request fails with `502` `backend_crashed_on_input`.",
+            "`data` is sorted by descending score and is authoritative. `labels` has the same shape "
+            "as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` "
+            "classes), so a repeated name keeps only its highest score there; use `data[].index` "
+            "to tell classes apart.",
+            "The body is capped before it is read: a request without `Content-Length` (a chunked "
+            "upload) gets `411`, and one whose `Content-Length` is over 23 MiB gets `413`.",
+            "An image that crashes the backend is never replayed, because replaying it would crash "
+            "the restarted backend too: the backend is restarted for the next request and this one "
+            "fails with `502` `backend_crashed_on_input`.",
+            "### Model Directory\n\n"
+            "An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 "
+            "output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the "
+            "task and preprocessing:\n\n"
+            "```json\n"
+            "{\n"
+            "  \"task\": \"image-classification\",\n"
+            "  \"labels_file\": \"labels.txt\",\n"
+            "  \"score_normalization\": \"none\",\n"
+            "  \"preprocess\": {\n"
+            "    \"resize\": \"stretch\",\n"
+            "    \"mean\": [127.5, 127.5, 127.5],\n"
+            "    \"std\": [127.5, 127.5, 127.5],\n"
+            "    \"channel_order\": \"RGB\",\n"
+            "    \"layout\": \"auto\"\n"
+            "  },\n"
+            "  \"top_k_default\": 5\n"
+            "}\n"
+            "```\n\n"
+            "A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps "
+            "serving `/v1/classify`. Loading fails with a message naming both layouts when a "
+            "model's label and its directory disagree, and when the installed `tflite-server` is "
+            "too old to report the image-classification task. The per-model `tflite_args` option "
+            "passes flags such as `--max-image-pixels` through to `tflite-server`.",
         };
         s.args = {kModel, kImage, kTopK};
 

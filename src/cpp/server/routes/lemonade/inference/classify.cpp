@@ -53,8 +53,9 @@ public:
             "Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on "
             "a string and returns a score for each label. It serves `onnxruntime` sequence "
             "classifiers (one label set), token classifiers (aggregated span labels) and zero-shot "
-            "models (labels sent with each request), and llama.cpp decision models, which are "
-            "zero-shot. It provides the classification that the router's `classifier` and "
+            "models (labels sent with each request), `tflite` text classifiers, and llama.cpp "
+            "decision models, which are zero-shot. Image-classification models are refused with "
+            "`400`; they are served by [`POST /v1/images/classify`](#post-v1imagesclassify). It provides the classification that the router's `classifier` and "
             "`zero_shot` conditions use.";
         s.notes = {
             "A malformed request, such as one with a blank `input`, a non-positive `top_k`, or a "
