@@ -248,6 +248,9 @@ int main() {
         // onnxruntime is the backend that does serve classification.
         {"onnxruntime + classification", "onnxruntime", {"classification"}, true,
          {"classification"}, ModelType::CLASSIFICATION},
+        {"tflite + classification", "tflite", {"classification"}, true,
+         {"classification"}, ModelType::CLASSIFICATION},
+        {"tflite + chat", "tflite", {"chat"}, false, {}, {}},
         {"executorch + classification", "executorch", {"classification"}, true,
          {"classification"}, ModelType::CLASSIFICATION},
         {"executorch + chat", "executorch", {"chat"}, false, {}, {}},
