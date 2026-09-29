@@ -121,13 +121,14 @@ ordered_json health_schema() {
                     "sockets": {"type": "array", "items": {"type": "object"}, "description": "One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each listened interface's subnet broadcast address (worked out from its address and netmask) plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on."},
                     "interfaces": {"type": "array", "items": {"type": "object"}, "description": "The interfaces being listened on: `name`, `address`, `netmask` and `broadcast`. By default this is every interface with an RFC1918 address. The `beacon_listen_interfaces` setting narrows it; on a gateway whose WAN side is also RFC1918, set it to the LAN bridges or WAN-side hosts are listed too."},
                     "interface_allowlist": {"type": "array", "items": {"type": "string"}, "description": "The `beacon_listen_interfaces` setting, or `[]` when every RFC1918 interface is heard."},
+                    "unmatched_interfaces": {"type": "array", "items": {"type": "string"}, "description": "Entries of `beacon_listen_interfaces` that name no interface with an RFC1918 address. When none match, `listening` is `false` and `error` names them."},
                     "self_instance_id": {"type": "string", "description": "This server's beacon `instance_id`, used to drop its own beacons."},
                     "self_port": {"type": "integer", "description": "This server's HTTP port, used to drop its own beacons."},
                     "ttl_seconds": {"type": "integer", "description": "Seconds a host stays listed after its last beacon."},
                     "max_hosts": {"type": "integer", "description": "Maximum listed hosts."},
                     "distinct_instances": {"type": "integer", "description": "Number of distinct servers heard; a multi-homed server has one row per interface."},
                     "hosts": {"type": "array", "items": {"type": "object"}, "description": "Heard servers, sorted by hostname: `hostname` (sanitised to `[A-Za-z0-9._-]`), `url`, `source_ip`, `instance_id` (or `null` for older servers), `first_seen` and `last_seen` (Unix seconds), `age_seconds`."},
-                    "stats": {"type": "object", "description": "Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch`, `rate_limited`, `table_full`, `wrong_interface` (arrived on an interface that is not being listened on), `evicted`."}
+                    "stats": {"type": "object", "description": "Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch`, `rate_limited`, `table_full`, `wrong_interface` (arrived on an interface that is not being listened on), `unknown_interface` (the arrival interface could not be determined while `beacon_listen_interfaces` is set), `evicted`."}
                 }
             },
             "server_process": {
