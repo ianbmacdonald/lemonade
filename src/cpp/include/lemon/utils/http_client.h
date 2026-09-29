@@ -247,8 +247,9 @@ private:
                                            const CancelToken& cancel);
 
     // One attempt over concurrent Range requests for bytes
-    // [resume_from, total_size) of the .partial file. Sets range_unsupported
-    // when a server answered a ranged request with the whole body.
+    // [resume_from, total_size) of the .partial file. Sets
+    // fall_back_single_stream when a server ignored or rejected (416) a
+    // ranged request.
     static DownloadResult parallel_download_attempt(const std::string& url,
                                                     const std::string& partial_path,
                                                     size_t resume_from,
@@ -259,7 +260,7 @@ private:
                                                     const DownloadOptions& options,
                                                     HttpSecurityPolicy policy,
                                                     const CancelToken& cancel,
-                                                    bool& range_unsupported);
+                                                    bool& fall_back_single_stream);
 };
 
 // Creates a throttled progress callback that prints at most once per second.
