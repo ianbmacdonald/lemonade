@@ -60,6 +60,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
     "args": ""
   },
   "enable_dgpu_gtt": false,
+  "executorch": {
+    "args": ""
+  },
   "extra_models_dir": "",
   "flm": {
     "args": "",
