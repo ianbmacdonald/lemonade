@@ -241,6 +241,7 @@ set(LEMON_BACKENDS
     "openmoss|openmoss"
     "litert|litert"
     "tflite|tflite"
+    "executorch|executorch"
 )
 
 # ============================================================
