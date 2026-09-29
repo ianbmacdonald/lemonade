@@ -89,7 +89,10 @@ private:
         std::chrono::steady_clock::time_point last_seen;
     };
 
-    bool admit_locked(uint32_t src_ip, std::chrono::steady_clock::time_point now);
+    IngestResult ingest_admitted_locked(const char* buf, std::size_t len, bool truncated, uint32_t src_ip,
+                                        std::chrono::steady_clock::time_point now);
+    SourceState& source_state_locked(uint32_t src_ip, std::chrono::steady_clock::time_point now);
+    bool take_global_token_locked(std::chrono::steady_clock::time_point now);
     bool is_pinned_locked(uint32_t src_ip) const;
     void expire_locked(std::chrono::steady_clock::time_point now);
     IngestResult record_locked(IngestResult result);
@@ -149,6 +152,7 @@ private:
     mutable std::mutex status_mtx_;
     bool supported_ = true;
     std::string error_;
+    bool start_failed_ = false;
     nlohmann::json sockets_status_ = nlohmann::json::array();
 
     std::vector<SocketState> sockets_;

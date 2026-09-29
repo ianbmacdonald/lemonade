@@ -10,9 +10,9 @@
 #include <string>
 #include <thread>
 
-#include <nlohmann/json.hpp>
 #include <lemon/utils/beacon_listener.h>
 #include <lemon/utils/network_beacon.h>
+#include <nlohmann/json.hpp>
 
 #include "test_config_helpers.h"
 
