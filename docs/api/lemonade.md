@@ -395,6 +395,9 @@ do on dispatch. Classify-only requests are not counted in the routing metrics.
 `has_images` and `has_tools` are rejected in this mode because those features
 come from the request body itself.
 
+For a router `user.Gateway-Router` whose `code-to-small` rule sends prompts
+containing `code` to `Tiny-Test-Model-GGUF`:
+
 ```bash
 curl -X POST http://localhost:13305/api/v1/routing/validate \
      -H "Content-Type: application/json" \
@@ -415,7 +418,7 @@ always included, and the `decision` object is identical to the
   "decision": {
     "version": "1",
     "route_to": "Tiny-Test-Model-GGUF",
-    "matched_rule": "code-to-test-model",
+    "matched_rule": "code-to-small",
     "default_used": false,
     "outputs": {"pool": "small"},
     "trace": [
