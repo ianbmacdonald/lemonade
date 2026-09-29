@@ -1780,6 +1780,7 @@ labels that name different modes:
 | `audio-generation` | `/audio/generations` | Text-to-audio generation model (e.g. music, sound effects). |
 | `classification` | `/classify` | Text classification model. Also accepted as `classifier`. |
 | `3d` | `/3d/generations` | Text- or image-to-3D mesh generation model. |
+| `image-classification` | `/images/classify` | Image classification model (image in, ranked labels out), served by the `tflite` recipe. |
 
 When a model declares no deployment label at all, it inherits its recipe's
 default: `chat` for `llamacpp`, `flm`, `ryzenai-llm`, `vllm` and `cloud`,
@@ -1789,8 +1790,9 @@ so on.
 Two label sets describe a model that cannot exist, and are refused rather than
 repaired:
 
-- **A mode the recipe's backend does not serve.** `/classify` is served only by
-  `onnxruntime`, so `labels: ["classification"]` on a `llamacpp` model is an
+- **A mode the recipe's backend does not serve.** `/classify` is served by
+  `onnxruntime` and `tflite` (image models use `/images/classify`, served by
+  `tflite`), so `labels: ["classification"]` on a `llamacpp` model is an
   error; register it as the chat model it is.
 - **Two different modes.** `labels: ["chat", "embeddings"]` on a `llamacpp` model
   is an error even though llama.cpp serves both: the subprocess is launched for
