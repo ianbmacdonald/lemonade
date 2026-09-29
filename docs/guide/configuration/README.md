@@ -49,6 +49,7 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
   "auto_evict": false,
   "auto_evict_threshold_pct": 0.9,
   "auto_update_models": false,
+  "beacon_listen": false,
   "broadcast": true,
   "cloud_providers": [],
   "config_version": 2,
@@ -216,6 +217,7 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
 | `auto_evict` | bool | false | Enable dynamic VRAM management based on idle time and global GPU memory pressure. Can be overridden per model. |
 | `auto_evict_threshold_pct` | number | 0.90 | Global VRAM fraction at which pressure eviction is evaluated. Must be greater than 0 and at most 1.0; `0.90` means 90%. |
 | `broadcast` | bool | true | Enable or disable UDP broadcasting for server discovery |
+| `beacon_listen` | bool | false | Linux/macOS only. Listen on UDP 13305 for other Lemonade servers' LAN broadcast beacons from on-link RFC1918 senders and list them under `beacon_listener` in `/v1/health`. Heard hosts are never contacted and never used as providers. The list is as readable as `/health`, so set `LEMONADE_API_KEY` when `host` is not localhost. `stats.url_mismatch` counts multi-homed peers whose source IP differs from their advertised URL. UDP 13305 must be allowed inbound on the LAN side. |
 | `extra_models_dir` | string | "" | Secondary directory recursively scanned for GGUF model files. Empty disables extra discovery; existing paths must be readable by `lemond`. Top-level `chat`, `embeddings`, and `reranking` directories select how models run, see [Model Management](../../embeddable/models.md) |
 | `models_dir` | string | "auto" | Directory for cached model files. `"auto"` follows `HF_HUB_CACHE` / `HF_HOME` / platform default |
 | `ctx_size` | int | -1 | Default context size for LLM models. Use `-1` for auto-resolution: the server computes the largest context that fits in available device memory using GGUF architecture metadata. Use a positive integer to set an explicit size. |

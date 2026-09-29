@@ -8,6 +8,10 @@
 #include <stdexcept>
 #include <thread>
 
+#include <nlohmann/json.hpp>
+
+#include "lemon/utils/beacon_listener.h"
+
 #ifdef _WIN32
     #include <ws2tcpip.h>
     #include <iphlpapi.h>
@@ -83,14 +87,7 @@ bool NetworkBeacon::isRFC1918(const std::string& ipAddress) {
     // Convert to host byte order for easier comparison
     uint32_t ip = ntohl(addr.s_addr);
 
-    // 10.0.0.0/8
-    if ((ip & 0xFF000000) == 0x0A000000) return true;
-
-    // 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
-    if ((ip & 0xFFF00000) == 0xAC100000) return true;
-
-    // 192.168.0.0/16
-    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
+    if (lemon::utils::is_rfc1918_ipv4(ip)) return true;
 
     // 127.0.0.0/8 (loopback)
     if ((ip & 0xFF000000) == 0x7F000000) return true;
@@ -183,15 +180,22 @@ std::vector<NetworkInterfaceInfo> NetworkBeacon::getLocalRFC1918Interfaces() {
 }
 
 std::string NetworkBeacon::buildStandardPayloadPattern(std::string hostname, std::string hostUrl) {
-    std::stringstream ss;
+    std::string instanceId;
+    {
+        std::lock_guard<std::mutex> lock(_netMtx);
+        instanceId = _instanceId;
+    }
+    nlohmann::json j = {{"service", "lemonade"}, {"hostname", hostname}, {"url", hostUrl}};
+    if (!instanceId.empty()) {
+        j["instance_id"] = instanceId;
+    }
+    // replace, not strict: a non-UTF-8 hostname must not throw on the broadcast thread.
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
 
-    ss << "{";
-    ss << "\"service\": \"lemonade\", ";
-    ss << "\"hostname\": \"" << hostname << "\", ";
-    ss << "\"url\": \"" << hostUrl << "\"";
-    ss << "}";
-
-    return ss.str();
+void NetworkBeacon::setInstanceId(const std::string& id) {
+    std::lock_guard<std::mutex> lock(_netMtx);
+    _instanceId = id;
 }
 
 void NetworkBeacon::startBroadcasting(int beaconPort, int serverPort, uint16_t intervalSeconds) {
@@ -244,6 +248,9 @@ void NetworkBeacon::broadcastThreadLoop() {
     loopbackAddr.sin_port = htons(port);
     loopbackAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
+    bool loggedFailure = false;
+    std::chrono::steady_clock::time_point lastFailureLog;
+
     while (true)
     {
         {
@@ -251,46 +258,55 @@ void NetworkBeacon::broadcastThreadLoop() {
             if (!_netThreadRunning) break;
         }
 
-        // Enumerate all RFC1918 interfaces and send a beacon on each
-        auto interfaces = getLocalRFC1918Interfaces();
-        for (const auto& iface : interfaces) {
-            // Skip loopback interfaces here, handled separately below
-            struct sockaddr_in loopCheck{};
-            if (inet_pton(AF_INET, iface.ipAddress.c_str(), &loopCheck.sin_addr) == 1) {
-                uint32_t ip = ntohl(loopCheck.sin_addr.s_addr);
-                if ((ip & 0xFF000000u) == 0x7F000000u) continue;
+        try {
+            // Enumerate all RFC1918 interfaces and send a beacon on each
+            auto interfaces = getLocalRFC1918Interfaces();
+            for (const auto& iface : interfaces) {
+                // Skip loopback interfaces here, handled separately below
+                struct sockaddr_in loopCheck{};
+                if (inet_pton(AF_INET, iface.ipAddress.c_str(), &loopCheck.sin_addr) == 1) {
+                    uint32_t ip = ntohl(loopCheck.sin_addr.s_addr);
+                    if ((ip & 0xFF000000u) == 0x7F000000u) continue;
+                }
+
+                std::string payload = buildStandardPayloadPattern(
+                    hostname,
+                    "http://" + iface.ipAddress + ":" + std::to_string(serverPort) + "/api/v1/"
+                );
+
+                sockaddr_in destAddr{};
+                destAddr.sin_family = AF_INET;
+                destAddr.sin_port = htons(port);
+                inet_pton(AF_INET, iface.broadcastAddress.c_str(), &destAddr.sin_addr);
+
+                if (sendto(_socket, payload.c_str(), (int)payload.size(), 0, (sockaddr*)&destAddr, sizeof(destAddr)) == -1) {
+#ifdef _WIN32
+                    std::cerr << "[NetworkBeacon] sendto failed, error=" << WSAGetLastError() << std::endl;
+#else
+                    std::cerr << "[NetworkBeacon] sendto failed, errno=" << errno << std::endl;
+#endif
+                }
             }
 
-            std::string payload = buildStandardPayloadPattern(
+            // Always send on loopback for same-machine discovery
+            std::string loopbackPayload = buildStandardPayloadPattern(
                 hostname,
-                "http://" + iface.ipAddress + ":" + std::to_string(serverPort) + "/api/v1/"
+                "http://127.0.0.1:" + std::to_string(serverPort) + "/api/v1/"
             );
-
-            sockaddr_in destAddr{};
-            destAddr.sin_family = AF_INET;
-            destAddr.sin_port = htons(port);
-            inet_pton(AF_INET, iface.broadcastAddress.c_str(), &destAddr.sin_addr);
-
-            if (sendto(_socket, payload.c_str(), (int)payload.size(), 0, (sockaddr*)&destAddr, sizeof(destAddr)) == -1) {
+            if (sendto(_socket, loopbackPayload.c_str(), (int)loopbackPayload.size(), 0, (sockaddr*)&loopbackAddr, sizeof(loopbackAddr)) == -1) {
 #ifdef _WIN32
                 std::cerr << "[NetworkBeacon] sendto failed, error=" << WSAGetLastError() << std::endl;
 #else
                 std::cerr << "[NetworkBeacon] sendto failed, errno=" << errno << std::endl;
 #endif
             }
-        }
-
-        // Always send on loopback for same-machine discovery
-        std::string loopbackPayload = buildStandardPayloadPattern(
-            hostname,
-            "http://127.0.0.1:" + std::to_string(serverPort) + "/api/v1/"
-        );
-        if (sendto(_socket, loopbackPayload.c_str(), (int)loopbackPayload.size(), 0, (sockaddr*)&loopbackAddr, sizeof(loopbackAddr)) == -1) {
-#ifdef _WIN32
-            std::cerr << "[NetworkBeacon] sendto failed, error=" << WSAGetLastError() << std::endl;
-#else
-            std::cerr << "[NetworkBeacon] sendto failed, errno=" << errno << std::endl;
-#endif
+        } catch (const std::exception& e) {
+            auto now = std::chrono::steady_clock::now();
+            if (!loggedFailure || now - lastFailureLog >= std::chrono::seconds(60)) {
+                std::cerr << "[NetworkBeacon] beacon send failed: " << e.what() << std::endl;
+                lastFailureLog = now;
+                loggedFailure = true;
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(interval));

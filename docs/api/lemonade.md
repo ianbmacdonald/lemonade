@@ -1568,7 +1568,10 @@ curl http://localhost:13305/v1/health
   "telemetry": {
     "enabled": false
   },
-  "update_check_done": true
+  "update_check_done": true,
+  "beacon_listener": {
+    "enabled": false
+  }
 }
 ```
 
@@ -1604,6 +1607,18 @@ curl http://localhost:13305/v1/health
 - `telemetry` - Structured telemetry state object:
   - `enabled` - Boolean indicating if telemetry collection is active
   - `captures` - *(optional)* Array of captured telemetry components (e.g., `["inputs", "outputs", "thinking"]`), only present when `enabled` is `true`.
+- `beacon_listener` - State of the LAN beacon listener, controlled by the `beacon_listen` [config key](../guide/configuration/README.md). The list is display-only: Lemonade never contacts a heard host, sends it credentials, or routes requests to it. When the listener is off, this is `{"enabled": false}`. When it is on:
+  - `enabled` - `true`
+  - `supported` - `false` on Windows, where the listener is not available in this release
+  - `listening` - Whether at least one UDP socket is bound
+  - `error` - Platform-level error string, or `null`
+  - `sockets` - One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each local RFC1918 interface's directed-broadcast address plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on.
+  - `self_instance_id`, `self_port` - This server's beacon `instance_id` and HTTP port, used to drop its own beacons
+  - `ttl_seconds` - Seconds a host stays listed after its last beacon (15)
+  - `max_hosts` - Maximum listed hosts (32)
+  - `distinct_instances` - Number of distinct servers heard (a multi-homed server has one row per interface)
+  - `hosts` - Heard servers, sorted by hostname: `hostname` (sanitised to `[A-Za-z0-9._-]`), `url`, `source_ip`, `instance_id` (or `null` for older servers), `first_seen` and `last_seen` (Unix seconds), `age_seconds`
+  - `stats` - Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch` (advertised URL host differs from the sender's IP), `rate_limited`, `table_full`, `evicted`
 
 ## `GET /v1/stats`
 <sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>

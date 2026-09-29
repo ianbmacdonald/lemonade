@@ -28,6 +28,7 @@
 #include "cloud_provider_registry.h"
 #include "upgradable_http_server.h"
 #include "websocket_server.h"
+#include "lemon/utils/beacon_listener.h"
 #include "lemon/utils/network_beacon.h"
 #include "lemon/system_metrics_platform.h"
 
@@ -96,6 +97,9 @@ private:
     // Side-effect callback for RuntimeConfig::set(). Receives a nested JSON
     // mirroring the input shape, containing only entries that actually changed.
     void apply_config_side_effects(const json& applied_changes);
+
+    // Start or stop the LAN beacon listener to match config; safe to call repeatedly.
+    void sync_beacon_listener();
 
     // Hot-swap a backend binary when its *_bin config value changes. Unloads
     // affected loaded models, runs install_backend (which downloads/replaces
@@ -402,6 +406,10 @@ private:
     std::string api_key_;
     std::string admin_api_key_;
     NetworkBeacon udp_beacon_;
+    std::string instance_id_;
+    BeaconListener beacon_listener_;
+    std::mutex beacon_listener_mtx_;
+    bool beacon_listener_shutdown_ = false;
 
     // CPU usage tracking
 #if defined(__linux__) || defined(_WIN32)

@@ -51,6 +51,7 @@ public:
     bool auto_evict() const;
     double auto_evict_threshold_pct() const;
     bool inhibit_suspend() const;
+    bool beacon_listen() const;
 
     // Telemetry settings
     bool telemetry_enabled() const;

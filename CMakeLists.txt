@@ -1039,6 +1039,7 @@ set(SOURCES_CORE
     src/cpp/server/utils/version_utils.cpp
     src/cpp/server/utils/wmi_helper.cpp
     src/cpp/server/utils/network_beacon.cpp
+    src/cpp/server/utils/beacon_listener.cpp
     src/cpp/server/utils/tcp_jsonl_client.cpp
     src/cpp/server/backends/backend_utils.cpp
     src/cpp/server/backend_manager.cpp
@@ -3089,6 +3090,21 @@ if(BUILD_TESTING AND EXISTS "${_CONFIG_DISCOVERY_TEST_SRC}")
     add_executable(test_config_discovery test/cpp/test_config_discovery.cpp)
     target_link_libraries(test_config_discovery PRIVATE lemonade-server-core)
     add_cpp_ci_test(ConfigDiscoveryTest CI ON COMMAND test_config_discovery)
+endif()
+
+set(_BEACON_PEER_TABLE_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_beacon_peer_table.cpp")
+if(BUILD_TESTING AND EXISTS "${_BEACON_PEER_TABLE_TEST_SRC}")
+    add_executable(test_beacon_peer_table test/cpp/test_beacon_peer_table.cpp)
+    target_link_libraries(test_beacon_peer_table PRIVATE lemonade-server-core)
+    add_cpp_ci_test(BeaconPeerTableTest CI ON COMMAND test_beacon_peer_table)
+endif()
+
+# Binds real UDP 13305, so it stays out of CI.
+set(_BEACON_LISTENER_SOCKET_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_beacon_listener_socket.cpp")
+if(BUILD_TESTING AND UNIX AND NOT APPLE AND EXISTS "${_BEACON_LISTENER_SOCKET_TEST_SRC}")
+    add_executable(test_beacon_listener_socket test/cpp/test_beacon_listener_socket.cpp)
+    target_link_libraries(test_beacon_listener_socket PRIVATE lemonade-server-core)
+    add_cpp_ci_test(BeaconListenerSocketTest CI OFF COMMAND test_beacon_listener_socket)
 endif()
 
 set(_CONFIG_TELEMETRY_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_config_telemetry.cpp")

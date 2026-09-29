@@ -240,5 +240,38 @@ int main() {
     }
     fs::remove_all(malformed_dir);
 
+    // 11. beacon_listen: default, round-trip, and rejection of non-booleans
+    {
+        RuntimeConfig beacon_cfg(base_cfg);
+        check(beacon_cfg.beacon_listen() == false, "beacon_listen defaults to false");
+        beacon_cfg.set({{"beacon_listen", true}});
+        check(beacon_cfg.beacon_listen() == true, "beacon_listen set to true");
+        check(beacon_cfg.snapshot()["beacon_listen"] == true, "snapshot reflects beacon_listen: true");
+        beacon_cfg.set({{"beacon_listen", false}});
+        check(beacon_cfg.beacon_listen() == false, "beacon_listen set back to false");
+
+        bool threw_set = false;
+        try {
+            beacon_cfg.set({{"beacon_listen", "yes"}});
+        } catch (const std::invalid_argument&) {
+            threw_set = true;
+        }
+        check(threw_set, "set() rejects non-boolean beacon_listen");
+
+        bool threw_ctor = false;
+        try {
+            json bad = base_cfg;
+            bad["beacon_listen"] = "true";
+            RuntimeConfig bad_cfg(bad);
+        } catch (const std::invalid_argument&) {
+            threw_ctor = true;
+        }
+        check(threw_ctor, "constructor rejects non-boolean beacon_listen");
+
+        json defaults = ConfigFile::get_defaults();
+        check(defaults.contains("beacon_listen") && defaults["beacon_listen"] == false,
+              "ConfigFile defaults include beacon_listen: false");
+    }
+
     return test_helpers::report_results("C++ config/discovery");
 }

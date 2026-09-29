@@ -263,6 +263,9 @@ RuntimeConfig::RuntimeConfig(const json& config)
     if (config_.contains("broadcast") && !config_["broadcast"].is_boolean()) {
         throw std::invalid_argument("'broadcast' must be a boolean");
     }
+    if (config_.contains("beacon_listen") && !config_["beacon_listen"].is_boolean()) {
+        throw std::invalid_argument("'beacon_listen' must be a boolean");
+    }
     // Migrate legacy no_broadcast if present
     if (config_.contains("no_broadcast")) {
         if (!config_["no_broadcast"].is_boolean()) {
@@ -462,6 +465,12 @@ bool RuntimeConfig::auto_evict() const {
         return config_["auto_evict"].get<bool>();
     }
     return false;
+}
+
+bool RuntimeConfig::beacon_listen() const {
+    std::shared_lock lock(mutex_);
+    auto it = config_.find("beacon_listen");
+    return it != config_.end() && it->is_boolean() && it->get<bool>();
 }
 
 bool RuntimeConfig::inhibit_suspend() const {
@@ -903,6 +912,10 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
     } else if (key == "inhibit_suspend") {
         if (!value.is_boolean()) {
             throw std::invalid_argument("'inhibit_suspend' must be a boolean");
+        }
+    } else if (key == "beacon_listen") {
+        if (!value.is_boolean()) {
+            throw std::invalid_argument("'beacon_listen' must be a boolean");
         }
     } else if (key == "auto_evict_threshold_pct") {
         if (!value.is_number()) {
