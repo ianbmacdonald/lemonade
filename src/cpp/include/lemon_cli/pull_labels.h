@@ -8,6 +8,7 @@ namespace lemon_cli {
 // Labels `lemonade pull --label` accepts for a manual user.* registration.
 inline const std::vector<std::string>& pull_labels() {
     static const std::vector<std::string> labels = {
+        "audio-generation",
         "chat",
         "coding",
         "dflash",
@@ -18,6 +19,7 @@ inline const std::vector<std::string>& pull_labels() {
         "reasoning",
         "reranking",
         "tool-calling",
+        "transcription",
         "vision"
     };
     return labels;
