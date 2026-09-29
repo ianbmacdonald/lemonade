@@ -192,6 +192,53 @@ int main() {
         res.set_content(payload, "application/octet-stream");
     });
 
+    // Every body range must find the journal already on disk.
+    std::mutex journal_mutex;
+    fs::path journal_watch;
+    int body_ranges_seen = 0;
+    int body_ranges_without_journal = 0;
+    server.Get("/journal.bin", [&](const httplib::Request& req, httplib::Response& res) {
+        log.add(req);
+        const std::string range = req.get_header_value("Range");
+        if (!range.empty() && range != "bytes=0-0") {
+            std::lock_guard<std::mutex> lock(journal_mutex);
+            ++body_ranges_seen;
+            if (!fs::exists(journal_watch)) {
+                ++body_ranges_without_journal;
+            }
+        }
+        res.set_content(payload, "application/octet-stream");
+    });
+    // Upper-half ranges are refused with 416, as by an inconsistent CDN edge.
+    server.Get("/reject416.bin", [&](const httplib::Request& req, httplib::Response& res) {
+        log.add(req);
+        const std::string range = req.get_header_value("Range");
+        if (!range.empty() && range.back() != '-' && range_start(range) >= half) {
+            res.status = 416;
+            res.set_content("", "text/plain");
+            return;
+        }
+        res.set_content(payload, "application/octet-stream");
+    });
+    // The first upper-half range fails once; later requests succeed.
+    std::atomic<int> fail_once{1};
+    server.Get("/fail-once.bin", [&](const httplib::Request& req, httplib::Response& res) {
+        log.add(req);
+        if (range_start(req.get_header_value("Range")) >= half && fail_once.fetch_sub(1) > 0) {
+            res.status = 503;
+            res.set_content("unavailable", "text/plain");
+            return;
+        }
+        res.set_content(payload, "application/octet-stream");
+    });
+    server.Get("/slow-probe.bin", [&](const httplib::Request& req, httplib::Response& res) {
+        log.add(req);
+        if (req.get_header_value("Range") == "bytes=0-0") {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+        res.set_content(payload, "application/octet-stream");
+    });
+
     const int port = server.bind_to_any_port("127.0.0.1");
     std::thread server_thread([&server]() { server.listen_after_bind(); });
     server.wait_until_ready();
@@ -298,8 +345,8 @@ int main() {
         r.check(result.http_code == 503, "the failing range's HTTP status is reported");
         r.check(!fs::exists(f), "no final file after a failed range");
         const std::string partial = read_all(partial_of(f));
-        r.check(partial.size() <= static_cast<size_t>(half) &&
-                    partial == payload.substr(0, partial.size()),
+        printf("  fail503 kept prefix: %zu of %zu bytes\n", partial.size(), payload.size());
+        r.check(partial.size() < payload.size() && partial == payload.substr(0, partial.size()),
                 "partial is cut back to a byte-exact contiguous prefix");
         r.check(!fs::exists(journal_of(f)), "no journal after a cleanly failed attempt");
     }
@@ -365,7 +412,8 @@ int main() {
     {
         const fs::path f = dir / "cancelled.bin";
         log.take();
-        auto cancel = [](size_t, size_t) { return false; };
+        // The probe reports total 0; cancel on the first ranged progress.
+        auto cancel = [](size_t, size_t total) { return total == 0; };
         auto result = HttpClient::download_file(base + "/ranged.bin", f.string(), cancel, {},
                                                 parallel_options(), policy);
         log.take();
@@ -394,6 +442,113 @@ int main() {
         const std::string partial = read_all(partial_of(f));
         r.check(!fs::exists(f) && partial == payload.substr(0, partial.size()),
                 "stalled download keeps only a byte-exact prefix");
+    }
+
+    {
+        const fs::path f = dir / "journal.bin";
+        {
+            std::lock_guard<std::mutex> lock(journal_mutex);
+            journal_watch = journal_of(f);
+        }
+        log.take();
+        auto result = HttpClient::download_file(base + "/journal.bin", f.string(), nullptr, {},
+                                                parallel_options(), policy);
+        log.take();
+        std::lock_guard<std::mutex> lock(journal_mutex);
+        r.check(result.success && read_all(f) == payload, "journal-watched download is intact");
+        r.check(body_ranges_seen >= 4 && body_ranges_without_journal == 0,
+                "the journal is on disk before any range request is sent");
+    }
+
+    {
+        const fs::path f = dir / "reject416.bin";
+        log.take();
+        auto options = parallel_options();
+        options.max_retries = 1;
+        auto result = HttpClient::download_file(base + "/reject416.bin", f.string(), nullptr, {},
+                                                options, policy);
+        const auto ranges = log.take();
+        bool single_stream_seen = false;
+        for (const auto& range : ranges) {
+            if (range.empty() || range.back() == '-') {
+                single_stream_seen = true;
+            }
+        }
+        r.check(result.success && read_all(f) == payload,
+                "a 416 on a range falls back and completes byte-identical");
+        r.check(single_stream_seen, "a 416 on a range switches to a single stream");
+    }
+
+    {
+        const fs::path f = dir / "rate-mid.bin";
+        log.take();
+        fail_once = 1;
+        auto options = parallel_options();
+        options.max_retries = 2;
+        bool capped = false;
+        auto cap_on_first_progress = [&capped](size_t, size_t) {
+            if (!capped) {
+                HttpClient::set_download_rate_limit(1024LL * 1024 * 1024);
+                capped = true;
+            }
+            return true;
+        };
+        auto result = HttpClient::download_file(base + "/fail-once.bin", f.string(),
+                                                cap_on_first_progress, {}, options, policy);
+        HttpClient::set_download_rate_limit(0);
+        const auto ranges = log.take();
+        size_t first_single = ranges.size();
+        for (size_t i = 0; i < ranges.size(); ++i) {
+            if (ranges[i].empty() || ranges[i].back() == '-') {
+                first_single = i;
+                break;
+            }
+        }
+        bool closed_after = false;
+        for (size_t i = first_single; i < ranges.size(); ++i) {
+            if (!ranges[i].empty() && ranges[i].back() != '-') {
+                closed_after = true;
+            }
+        }
+        r.check(result.success && read_all(f) == payload, "download with a mid-flight rate cap is intact");
+        r.check(first_single < ranges.size() && !closed_after,
+                "a rate cap set mid-download moves the retry to a single stream");
+    }
+
+    {
+        // A journal that cannot be written is a local failure: the existing
+        // prefix must survive the retry loop instead of being deleted.
+        const fs::path f = dir / "setup-fail.bin";
+        const size_t kept = 300000;
+        write_all(partial_of(f), payload.substr(0, kept));
+        const fs::path blocker = fs::path(journal_of(f)) += ".tmp";
+        fs::create_directories(blocker);
+        write_all(blocker / "pin", "x");
+        log.take();
+        auto options = parallel_options();
+        options.max_retries = 1;
+        auto result = HttpClient::download_file(base + "/ranged.bin", f.string(), nullptr, {},
+                                                options, policy);
+        log.take();
+        const std::string partial = read_all(partial_of(f));
+        r.check(!result.success, "an unwritable journal fails the download");
+        r.check(partial.size() == kept && partial == payload.substr(0, kept),
+                "a local setup failure keeps the resumable prefix");
+        fs::remove_all(blocker);
+    }
+
+    {
+        const fs::path f = dir / "slow-probe.bin";
+        log.take();
+        const auto started = std::chrono::steady_clock::now();
+        auto cancel = [](size_t, size_t) { return false; };
+        auto result = HttpClient::download_file(base + "/slow-probe.bin", f.string(), cancel, {},
+                                                parallel_options(), policy);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        log.take();
+        r.check(result.cancelled, "cancelling during the range probe reports a cancellation");
+        r.check(elapsed_ms < 2500, "the range probe honours cancellation before the server answers");
     }
 
     server.stop();
