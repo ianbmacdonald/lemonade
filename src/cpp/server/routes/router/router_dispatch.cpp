@@ -15,6 +15,32 @@ namespace lemon {
 
 using json = nlohmann::json;
 
+std::optional<Decision> evaluate_router_policy(ServerContext& ctx, const ModelInfo& info,
+                                               const json& body, bool want_trace) {
+    // The policy is parsed once when the models cache is built. A missing one means
+    // the collection failed to parse.
+    if (!info.route_policy) {
+        LOG(WARNING, "Server") << "Router collection '" << info.model_name
+                               << "' has no parsed routing policy" << std::endl;
+        return std::nullopt;
+    }
+
+    // The engine owns its policy and is rebuilt per request, because its
+    // classifier services are bound to the live Router.
+    RoutePolicy policy = *info.route_policy;
+    ModelLoader* loader = ctx.model_loader;
+    ClassifierServices services = make_router_classifier_services(
+        *ctx.router, [loader](const std::string& m) {
+            loader->ensure_loaded(m, json::object(), LoadPurpose::RoutingDependency);
+        });
+    CostServices cost_services = make_router_cost_services(*ctx.router);
+    RoutingPolicyEngine engine(std::move(policy), std::move(services),
+                               std::move(cost_services));
+
+    RouteContext route_context = build_route_context(body, info.model_name);
+    return engine.route(route_context, want_trace);
+}
+
 std::optional<RouterDispatchResult> router_dispatch(ServerContext& ctx, std::string& model,
                                                     bool want_trace, json& body) {
     if (model.empty()) {
@@ -29,33 +55,15 @@ std::optional<RouterDispatchResult> router_dispatch(ServerContext& ctx, std::str
         if (!is_router_collection_recipe(info.recipe)) {
             return std::nullopt;
         }
-        // The policy is parsed once when the models cache is built. A missing one means
-        // the collection failed to parse, so the request keeps its model (fail open).
-        if (!info.route_policy) {
-            LOG(WARNING, "Server") << "Router collection '" << info.model_name
-                                   << "' has no parsed routing policy" << std::endl;
+        std::optional<Decision> decision = evaluate_router_policy(ctx, info, body, want_trace);
+        if (!decision) {
             return std::nullopt;
         }
 
-        // The engine owns its policy and is rebuilt per request, because its
-        // classifier services are bound to the live Router.
-        RoutePolicy policy = *info.route_policy;
-        ModelLoader* loader = ctx.model_loader;
-        ClassifierServices services = make_router_classifier_services(
-            *ctx.router, [loader](const std::string& m) {
-                loader->ensure_loaded(m, json::object(), LoadPurpose::RoutingDependency);
-            });
-        CostServices cost_services = make_router_cost_services(*ctx.router);
-        RoutingPolicyEngine engine(std::move(policy), std::move(services),
-                                   std::move(cost_services));
-
-        RouteContext route_context = build_route_context(body, info.model_name);
-        Decision decision = engine.route(route_context, want_trace);
-
         RouterDispatchResult result;
         result.requested_model = requested_model;
-        result.selected_model = decision.route_to;
-        result.decision = std::move(decision);
+        result.selected_model = decision->route_to;
+        result.decision = std::move(*decision);
         ctx.router->note_route_decision(utils::conversation_fingerprint(body),
                                         result.selected_model);
 
