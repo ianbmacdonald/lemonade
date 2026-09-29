@@ -2615,5 +2615,13 @@
             "reasoning"
         ],
         "size": 0.5
+    },
+    "MobileNetV2-1.0-224-TFLite": {
+        "checkpoint": "imacdonald/mobilenet_v2_1.0_224-tflite",
+        "recipe": "tflite",
+        "labels": [
+            "image-classification"
+        ],
+        "size": 0.014
     }
 }
