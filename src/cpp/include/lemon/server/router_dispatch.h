@@ -11,6 +11,7 @@
 namespace lemon {
 
 class ModelManager;
+struct ModelInfo;
 struct ServerContext;
 
 struct RouterDispatchResult {
@@ -18,6 +19,13 @@ struct RouterDispatchResult {
     std::string selected_model;
     Decision decision;
 };
+
+// The decision the registered policy of collection.router `info` makes for body. Dispatch
+// and the classify-only /routing/validate share it so the two cannot disagree. It has no
+// dispatch side effects, though routing helper models may load. std::nullopt when the
+// collection has no parsed policy.
+std::optional<Decision> evaluate_router_policy(ServerContext& ctx, const ModelInfo& info,
+                                               const nlohmann::json& body, bool want_trace);
 
 // Naming a collection.router model makes a completion request route itself: this
 // runs the collection's policy on body, rewrites model and the body's model to the
