@@ -48,7 +48,8 @@ std::optional<EventBoundary> find_sse_event_boundary(const std::string& buffer) 
 
 } // namespace
 
-json route_decision_to_json(const Decision& decision) {
+json route_decision_to_json(const Decision& decision,
+                            const ModelNameMapper& public_model_name) {
     json out = {
         {"version", "1"},
         {"route_to", decision.route_to},
