@@ -11,7 +11,7 @@ We have designed a set of Lemonade-specific endpoints to enable client applicati
 |--------|----------|-------------|
 | `POST` | [`/v1/pull`](#post-v1pull) | Install a model |
 | `POST` | [`/v1/models/register`](#post-v1modelsregister) | Register or update a user model definition without downloading it |
-| `POST` | [`/v1/routing/validate`](#post-v1routingvalidate) | Evaluate an ad-hoc routing policy against a prompt without registering it |
+| `POST` | [`/v1/routing/validate`](#post-v1routingvalidate) | Evaluate an ad-hoc or registered routing policy against a prompt without dispatching it |
 | `GET` | [`/v1/downloads`](#get-v1downloads) | List server-owned model download jobs |
 | `POST` | [`/v1/downloads/control`](#post-v1downloadscontrol) | Pause, cancel, or remove server-owned model download jobs |
 | `GET` | [`/v1/registry/search`](#get-v1registrysearch) | Search Hugging Face or ModelScope for model repositories |
@@ -216,6 +216,10 @@ request to the selected candidate. This is the endpoint behind the Router
 Builder's **Test Prompt** tab: it lets a policy be iterated on before it is
 attached to a `collection.router` model.
 
+The same endpoint also classifies against an already registered router: send
+`model` instead of `policy` (see
+[Classify against a registered router](#classify-against-a-registered-router)).
+
 The endpoint performs parser-level structural policy validation: every
 `candidates` entry, `default_model`, rule `route_to`, and classifier model must
 be listed in `components`. It does not consult the live model registry:
@@ -366,12 +370,79 @@ Match `decision.matched_rule` against this document rather than the one you
 sent — a policy authored with only `routing.router` has no `routing.rules` of
 its own, only the synthesized `__route_0`, `__route_1`, … rules shown here.
 
+### Classify against a registered router
+
+Send `model` naming a registered `collection.router` model, instead of
+`policy`, to ask where that router would send a request without dispatching it.
+The rest of the body is read exactly as a chat, completions, or responses
+request addressed to that router would be: `messages`, `prompt`, `input`,
+`tools`, `metadata`, and `max_tokens` build the routing context, and the
+router's registered policy is evaluated by the same code path dispatch uses, so
+the returned `decision` is the one a real request with the same body would get.
+
+No candidate is loaded and nothing is forwarded to a backend. Deterministic
+rules are evaluated locally; model-backed conditions (`semantic_similarity`,
+`classifier`, `llm`, `routing.router`) load and run their helper models, as they
+do on dispatch, and like any load that can evict other loaded models under
+memory pressure. Classify-only requests are not counted in the routing metrics.
+If evaluation fails, validate returns an error, whereas dispatch fails open and
+sends the request on to the router model itself, so an error here does not mean
+the same request would fail on dispatch.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `model` | string | yes | A registered `collection.router` model, by public or `user.` name. Aliases and a `:latest` suffix resolve as they do on dispatch. |
+| `messages` / `prompt` / `input` | array / string or array / string or array | no | The request content to route, in chat, completions, or responses form. |
+| `tools`, `metadata`, `max_tokens` | | no | Read as on dispatch (`tools` sets `has_tools`, images in `messages` set `has_images`). |
+
+`policy` cannot be combined with `model`, and the ad-hoc simulation flags
+`has_images` and `has_tools` are rejected in this mode because those features
+come from the request body itself.
+
+For a router `user.Gateway-Router` whose `code-to-small` rule sends prompts
+containing `code` to `Tiny-Test-Model-GGUF`:
+
+```bash
+curl -X POST http://localhost:13305/api/v1/routing/validate \
+     -H "Content-Type: application/json" \
+     -d '{
+           "model": "user.Gateway-Router",
+           "messages": [{"role": "user", "content": "Please write code for me"}]
+         }'
+```
+
+The response carries the router's public name and the decision. The trace is
+always included, and the `decision` object is identical to the
+`x_lemonade_route` object a routed completion of the same body returns with
+`route_trace: true`:
+
+```json
+{
+  "model": "user.Gateway-Router",
+  "decision": {
+    "version": "1",
+    "route_to": "Tiny-Test-Model-GGUF",
+    "matched_rule": "code-to-small",
+    "default_used": false,
+    "outputs": {"pool": "small"},
+    "trace": [
+      { "condition": "keywords_any", "result": true }
+    ]
+  }
+}
+```
+
 ### Error responses
 
 | Status | Condition |
 |--------|-----------|
 | `400` | Body is not valid JSON, `policy` is missing or not an object, `prompt` is not a string, `has_images`/`has_tools` are not booleans, or `metadata` is not an object of string values. |
 | `400` | The policy document is invalid or internally inconsistent; the `error` field is prefixed with `Invalid routing policy:`. |
+| `400` | Both `policy` and `model` were sent. |
+| `400` | With `model`: `model` is not a string, the model is not a `collection.router`, `has_images`/`has_tools` were sent, `prompt` is not a string or an array of strings/token ids, `input` is not a string or array, or `messages` is not an array. |
+| `404` | With `model`: no model by that name is registered. |
+| `409` | With `model`: a model-backed condition's helper model could not be made resident (`router_residency_conflict`), as on dispatch. |
+| `500` | With `model`: the router's registered policy failed to parse, or a helper model failed in a way its `on_error` policy does not absorb. |
 
 ## `POST /v1/models/check-updates`
 <sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>

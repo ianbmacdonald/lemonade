@@ -215,6 +215,17 @@ curl -X POST http://localhost:13305/api/v1/routing/validate \
      -d '{"policy": {...}, "prompt": "please write a def to reverse a list"}'
 ```
 
+To ask where an already registered router would send a request, without
+dispatching it or loading any candidate, send `model` instead of `policy`. The
+body is read as the equivalent chat/completions request would be, and the
+registered policy is evaluated by the same path dispatch uses:
+
+```bash
+curl -X POST http://localhost:13305/api/v1/routing/validate \
+     -H "Content-Type: application/json" \
+     -d '{"model": "user.My-Router", "messages": [{"role": "user", "content": "..."}]}'
+```
+
 ## The decision on the response
 
 Every routed response carries the header **`x-lemonade-route`** — the matched rule
