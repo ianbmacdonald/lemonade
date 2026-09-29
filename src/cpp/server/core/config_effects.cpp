@@ -25,6 +25,8 @@ void ConfigEffects::apply(const std::string& key, const json& value) {
     if (key == "port" || key == "host" || key == "websocket_port" ||
         key == "broadcast" || key == "no_broadcast") {
         ctx_.listener->rebind();
+    } else if (key == "beacon_listen_interfaces") {
+        ctx_.listener->sync_beacon_listener();
     } else if (key == "beacon_listen") {
         LOG(INFO, "Server") << "Beacon listener "
                             << (config.beacon_listen() ? "enabled" : "disabled") << std::endl;
