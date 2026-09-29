@@ -163,6 +163,7 @@ private:
     std::optional<RouterDispatchResult> route_collection_request(
         const nlohmann::json& request_json,
         const ModelInfo& collection_info);
+    std::function<std::string(const std::string&)> public_model_name_mapper();
     // If request_json addresses a collection.router model, rewrite its "model"
     // field in place to the engine-selected candidate and return the Decision.
     // No-op otherwise.

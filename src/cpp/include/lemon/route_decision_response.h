@@ -11,7 +11,13 @@
 
 namespace lemon {
 
-json route_decision_to_json(const Decision& decision);
+using ModelNameMapper = std::function<std::string(const std::string&)>;
+
+// Engine decisions carry internal component ids (e.g. user.X); a client joins
+// route_to against /v1/models, so every model name is emitted through
+// `public_model_name` when one is given.
+json route_decision_to_json(const Decision& decision,
+                            const ModelNameMapper& public_model_name = nullptr);
 
 std::string route_decision_header_value(const Decision& decision);
 

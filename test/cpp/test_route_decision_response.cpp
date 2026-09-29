@@ -138,6 +138,36 @@ static void test_trace_serializes_label_and_rationale() {
           !out["trace"][1].contains("label") && !out["trace"][1].contains("rationale"));
 }
 
+static void test_model_names_use_public_mapping() {
+    Decision decision;
+    decision.route_to = "user.Gemma3-1B-IT-LiteRT";
+    decision.matched_rule = "__route_0";
+    lemon::TraceEntry candidate;
+    candidate.condition = "classifier:__router";
+    candidate.label = "user.Gemma3-1B-IT-LiteRT";
+    candidate.rationale = "user.Gemma3-1B-IT-LiteRT fits";
+    lemon::TraceEntry other;
+    other.condition = "classifier:pii";
+    other.label = "pii";
+    decision.trace = {candidate, other};
+
+    const lemon::ModelNameMapper public_name = [](const std::string& name) {
+        return name == "user.Gemma3-1B-IT-LiteRT" ? std::string("Gemma3-1B-IT-LiteRT") : name;
+    };
+    json out = lemon::route_decision_to_json(decision, public_name);
+    check("route_to uses the public model name",
+          out.value("route_to", "") == "Gemma3-1B-IT-LiteRT");
+    check("trace candidate label uses the public model name",
+          out["trace"][0].value("label", "") == "Gemma3-1B-IT-LiteRT");
+    check("free-text rationale is not rewritten",
+          out["trace"][0].value("rationale", "") == "user.Gemma3-1B-IT-LiteRT fits");
+    check("non-model label passes through",
+          out["trace"][1].value("label", "") == "pii");
+    check("no mapper keeps the engine's names",
+          lemon::route_decision_to_json(decision).value("route_to", "") ==
+              "user.Gemma3-1B-IT-LiteRT");
+}
+
 int main() {
     test_lf_event_is_injected();
     test_crlf_split_event_is_injected_before_done();
@@ -145,6 +175,7 @@ int main() {
     test_only_first_json_event_gets_route();
     test_route_header_default_value();
     test_trace_serializes_label_and_rationale();
+    test_model_names_use_public_mapping();
 
     if (g_failures == 0) {
         std::printf("All route decision response tests passed.\n");
