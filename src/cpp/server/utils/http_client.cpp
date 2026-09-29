@@ -986,6 +986,103 @@ HttpResponse HttpClient::post_stream(const std::string& url,
     return response;
 }
 
+namespace {
+
+FILE* open_binary_file(const fs::path& path, const char* mode) {
+#ifdef _WIN32
+    const std::string narrow_mode(mode);
+    const std::wstring wide_mode(narrow_mode.begin(), narrow_mode.end());
+    return _wfopen(path.c_str(), wide_mode.c_str());
+#else
+    return fopen(path.c_str(), mode);
+#endif
+}
+
+// Power-loss ordering: the journal may only claim bytes that are already on
+// the device, and it must itself be on the device before any out-of-order byte
+// is written. Without these syncs a restart could trust zero-filled holes.
+bool sync_stdio_file(FILE* fp) {
+    if (fflush(fp) != 0) {
+        return false;
+    }
+#ifdef _WIN32
+    return _commit(_fileno(fp)) == 0;
+#elif defined(__APPLE__)
+    return fsync(fileno(fp)) == 0;
+#else
+    return fdatasync(fileno(fp)) == 0;
+#endif
+}
+
+bool sync_path(const fs::path& path) {
+    FILE* fp = open_binary_file(path, "r+b");
+    if (!fp) {
+        return false;
+    }
+    const bool synced = sync_stdio_file(fp);
+    return (fclose(fp) == 0) && synced;
+}
+
+bool sync_parent_directory(const fs::path& path) {
+#ifdef _WIN32
+    (void)path;
+    return true;
+#else
+    fs::path dir = path.parent_path();
+    if (dir.empty()) {
+        dir = ".";
+    }
+    const int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    const bool synced = ::fsync(fd) == 0;
+    ::close(fd);
+    return synced;
+#endif
+}
+
+// Returns false only when the rename itself failed; *synced reports whether
+// the new directory entry is known to be on the device.
+bool rename_with_sync(const fs::path& from, const fs::path& to, bool* synced) {
+#ifdef _WIN32
+    const bool moved = MoveFileExW(from.c_str(), to.c_str(),
+                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    *synced = moved;
+    return moved;
+#else
+    std::error_code ec;
+    fs::rename(from, to, ec);
+    if (ec) {
+        *synced = false;
+        return false;
+    }
+    *synced = sync_parent_directory(to);
+    return true;
+#endif
+}
+
+bool durable_rename(const fs::path& from, const fs::path& to) {
+    bool synced = false;
+    return rename_with_sync(from, to, &synced) && synced;
+}
+
+// Returns false only when the file could not be removed. The directory sync
+// is best effort: a removal lost to power failure resurrects a journal, which
+// can only discard progress, never vouch for missing bytes. Windows offers no
+// directory sync, so there the delete reaches the disk with NTFS's own log.
+bool durable_remove(const fs::path& path) {
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) {
+        return false;
+    }
+    sync_parent_directory(path);
+    return true;
+}
+
+} // namespace
+
 DownloadResult HttpClient::download_attempt(const std::string& url,
                                             const std::string& output_path,
                                             size_t resume_from,
@@ -1079,7 +1176,10 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
     result.bytes_downloaded = static_cast<size_t>(downloaded);
     result.total_bytes = (total > 0) ? static_cast<size_t>(total) : 0;
 
-    fclose(fp);
+    // A completed transfer must be on the device before the caller renames
+    // it, or a power loss can leave a full-size partial of unwritten bytes.
+    const bool data_synced = (res != CURLE_OK) || sync_stdio_file(fp);
+    const bool closed_cleanly = fclose(fp) == 0;
     curl_slist_free_all(header_list);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.http_code);
 
@@ -1227,6 +1327,13 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
         return result;
     }
 
+    if (!data_synced || !closed_cleanly) {
+        result.error_message = "Download finished but could not be flushed to disk: " + output_path;
+        result.curl_error = result.error_message;
+        result.can_resume = true;
+        return result;
+    }
+
     result.success = true;
     return result;
 }
@@ -1263,65 +1370,6 @@ std::optional<uint64_t> read_range_journal(const fs::path& journal) {
     } catch (...) {
         return std::nullopt;
     }
-}
-
-FILE* open_binary_file(const fs::path& path, const char* mode) {
-#ifdef _WIN32
-    const std::string narrow_mode(mode);
-    const std::wstring wide_mode(narrow_mode.begin(), narrow_mode.end());
-    return _wfopen(path.c_str(), wide_mode.c_str());
-#else
-    return fopen(path.c_str(), mode);
-#endif
-}
-
-// Power-loss ordering: the journal may only claim bytes that are already on
-// the device, and it must itself be on the device before any out-of-order byte
-// is written. Without these syncs a restart could trust zero-filled holes.
-bool sync_stdio_file(FILE* fp) {
-    if (fflush(fp) != 0) {
-        return false;
-    }
-#ifdef _WIN32
-    return _commit(_fileno(fp)) == 0;
-#elif defined(__APPLE__)
-    return fsync(fileno(fp)) == 0;
-#else
-    return fdatasync(fileno(fp)) == 0;
-#endif
-}
-
-bool sync_path(const fs::path& path) {
-    FILE* fp = open_binary_file(path, "r+b");
-    if (!fp) {
-        return false;
-    }
-    const bool synced = sync_stdio_file(fp);
-    return (fclose(fp) == 0) && synced;
-}
-
-bool durable_rename(const fs::path& from, const fs::path& to) {
-#ifdef _WIN32
-    return MoveFileExW(from.c_str(), to.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    std::error_code ec;
-    fs::rename(from, to, ec);
-    if (ec) {
-        return false;
-    }
-    fs::path dir = to.parent_path();
-    if (dir.empty()) {
-        dir = ".";
-    }
-    const int fd = ::open(dir.c_str(), O_RDONLY);
-    if (fd < 0) {
-        return false;
-    }
-    const bool synced = ::fsync(fd) == 0;
-    ::close(fd);
-    return synced;
-#endif
 }
 
 bool write_range_journal(const fs::path& journal, uint64_t prefix) {
@@ -1366,8 +1414,7 @@ bool normalize_partial_file(const fs::path& partial) {
             }
         }
     }
-    fs::remove(journal, ec);
-    return !ec;
+    return durable_remove(journal);
 }
 
 bool seek_binary_file(FILE* fp, uint64_t offset) {
@@ -1645,10 +1692,9 @@ DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
     // normalized), so its bytes stay resumable.
     auto local_failure = [&](const std::string& message) {
         sync_fp_closer.close();
-        normalize_partial_file(partial_fs);
         result.error_message = message;
         result.curl_error = message;
-        result.can_resume = true;
+        result.can_resume = normalize_partial_file(partial_fs);
         return result;
     };
 
@@ -1879,8 +1925,13 @@ DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
             cancelled = true;
         } else if (callback && now - last_report >= kParallelProgressInterval) {
             last_report = now;
-            if (!callback(static_cast<size_t>(completed_bytes + in_flight),
-                          static_cast<size_t>(remaining))) {
+            // An exception must not unwind past the live curl handles.
+            try {
+                if (!callback(static_cast<size_t>(completed_bytes + in_flight),
+                              static_cast<size_t>(remaining))) {
+                    cancelled = true;
+                }
+            } catch (...) {
                 cancelled = true;
             }
         }
@@ -1906,9 +1957,15 @@ DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
         const uintmax_t size = fs::file_size(partial_fs, ec);
         if (!ec && size == total_size && sync_stdio_file(sync_fp)) {
             sync_fp_closer.close();
-            fs::remove(journal, ec);
+            // Record completion first so a resurrected journal cannot truncate
+            // the finished file.
+            write_range_journal(journal, total_size);
+            durable_remove(journal);
             if (callback) {
-                callback(static_cast<size_t>(remaining), static_cast<size_t>(remaining));
+                try {
+                    callback(static_cast<size_t>(remaining), static_cast<size_t>(remaining));
+                } catch (...) {
+                }
             }
             result.success = true;
             result.http_code = 206;
@@ -1956,6 +2013,7 @@ DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
         return result;
     }
     if (write_failed) {
+        result.can_resume = true;
         result.curl_code = static_cast<int>(CURLE_WRITE_ERROR);
         result.curl_error = curl_easy_strerror(CURLE_WRITE_ERROR);
         result.disk_full = disk_nearly_full(get_disk_space_probe_path(partial_fs));
@@ -2128,7 +2186,7 @@ DownloadResult HttpClient::download_file(const std::string& url,
 
             if (options.resume_partial && fs::exists(partial_path_fs)) {
                 size_t new_offset = fs::file_size(partial_path_fs);
-                if (new_offset > resume_offset) {
+                if (new_offset != resume_offset) {
                     resume_offset = new_offset;
                     LOG(INFO, "Download") << "Resuming from "
                               << std::fixed << std::setprecision(1)
@@ -2217,13 +2275,18 @@ DownloadResult HttpClient::download_file(const std::string& url,
 
             // Download complete - rename .partial to final path
             std::error_code ec;
-            fs::rename(partial_path_fs, output_path_fs, ec);
-            if (ec) {
+            bool rename_synced = false;
+            if (!rename_with_sync(partial_path_fs, output_path_fs, &rename_synced)) {
                 // Rename failed - try copy and delete
                 fs::copy_file(partial_path_fs, output_path_fs, fs::copy_options::overwrite_existing, ec);
                 if (!ec) {
+                    rename_synced = sync_path(output_path_fs) && sync_parent_directory(output_path_fs);
                     fs::remove(partial_path_fs, ec);
                 }
+            }
+            if (!ec && !rename_synced) {
+                LOG(WARNING, "Download") << "Could not confirm the completed file reached the disk: "
+                                         << output_path << std::endl;
             }
             if (ec) {
                 final_result.success = false;
