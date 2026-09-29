@@ -50,9 +50,12 @@ std::optional<EventBoundary> find_sse_event_boundary(const std::string& buffer) 
 
 json route_decision_to_json(const Decision& decision,
                             const ModelNameMapper& public_model_name) {
+    auto model_name = [&public_model_name](const std::string& name) {
+        return public_model_name ? public_model_name(name) : name;
+    };
     json out = {
         {"version", "1"},
-        {"route_to", decision.route_to},
+        {"route_to", model_name(decision.route_to)},
         {"matched_rule", decision.matched_rule},
         {"default_used", decision.default_used},
         {"outputs", decision.outputs.is_object() ? decision.outputs : json::object()},
@@ -68,7 +71,9 @@ json route_decision_to_json(const Decision& decision,
                 trace_entry["score"] = *entry.score;
             }
             if (!entry.label.empty()) {
-                trace_entry["label"] = entry.label;
+                // A router label is a candidate name, so it must join
+                // route_to; a mapper leaves non-model labels unchanged.
+                trace_entry["label"] = model_name(entry.label);
             }
             if (!entry.rationale.empty()) {
                 trace_entry["rationale"] = entry.rationale;
