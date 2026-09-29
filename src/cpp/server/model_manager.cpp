@@ -5557,7 +5557,7 @@ void ModelManager::download_from_manifest(const json& manifest, std::map<std::st
         if (fs::exists(output_path) && !fs::exists(partial_path)) {
             bytes_on_disk = file_size;  // File already complete
         } else if (fs::exists(partial_path)) {
-            bytes_on_disk = fs::file_size(partial_path);  // Partial download
+            bytes_on_disk = HttpClient::resumable_partial_bytes(output_path);
         }
 
         utils::DownloadOptions download_opts;
@@ -5568,6 +5568,8 @@ void ModelManager::download_from_manifest(const json& manifest, std::map<std::st
         download_opts.low_speed_limit = 1000;
         download_opts.low_speed_time = 60;
         download_opts.connect_timeout = 60;
+        download_opts.allow_parallel = true;
+        download_opts.expected_size = file_size;
         if (file_desc.contains("hash") && file_desc["hash"].is_object()) {
             const auto& hash = file_desc["hash"];
             if (hash.contains("algorithm") && hash["algorithm"].is_string() &&

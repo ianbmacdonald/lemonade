@@ -19,6 +19,14 @@
 #include <vector>
 #include <mbedtls/md.h>
 
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace lemon {
@@ -29,6 +37,8 @@ std::atomic<bool> g_download_cancelled{false};
 std::atomic<long> HttpClient::default_timeout_seconds_{300};
 
 std::atomic<int64_t> HttpClient::download_rate_limit_bytes_per_second_{0};
+
+std::atomic<int> HttpClient::download_connections_{HttpClient::kDefaultDownloadConnections};
 
 // Serializes transfers so concurrent downloads cannot exceed the cap in aggregate.
 static std::mutex g_download_gate;
@@ -262,6 +272,107 @@ static HashCheckResult verify_file_hash(const fs::path& path, const ExpectedHash
     return result;
 }
 
+// A ".verified" sidecar records that the file at this path passed a full content
+// verification: algorithm, digest, size and mtime, one per line. A later check
+// whose expected digest, size and mtime all match skips the full re-hash — on
+// large models that re-hash dominates repeat pulls (hashing runs ~280 MB/s, so
+// a 340 GiB model costs ~20 min per pull with no bytes to download). Any
+// mismatch, including a touched or replaced file, falls back to the full hash.
+// Accepted tradeoff: corruption that preserves both size and mtime (bit rot) is
+// no longer caught on repeat pulls; deleting the .verified file forces a full
+// re-verification.
+
+static fs::path verified_sidecar_path(const fs::path& file) {
+    fs::path p = file;
+    p += ".verified";
+    return p;
+}
+
+static void remove_verified_sidecar(const fs::path& file) {
+    std::error_code ec;
+    fs::remove(verified_sidecar_path(file), ec);
+}
+
+static bool read_file_facts(const fs::path& file, uintmax_t& size, long long& mtime) {
+    std::error_code ec;
+    size = fs::file_size(file, ec);
+    if (ec) {
+        return false;
+    }
+    const auto t = fs::last_write_time(file, ec);
+    if (ec) {
+        return false;
+    }
+    mtime = static_cast<long long>(t.time_since_epoch().count());
+    return true;
+}
+
+static void write_verified_sidecar(const fs::path& file, const ExpectedHash& expected) {
+    uintmax_t size = 0;
+    long long mtime = 0;
+    if (!read_file_facts(file, size, mtime)) {
+        return;
+    }
+    std::ofstream out(verified_sidecar_path(file), std::ios::trunc);
+    if (!out.is_open()) {
+        LOG(WARNING, "Download") << "Could not record verification sidecar (repeat pulls will re-hash): "
+                                 << verified_sidecar_path(file).string() << std::endl;
+        return;
+    }
+    out << expected.algorithm << "\n"
+        << expected.value << "\n"
+        << size << "\n"
+        << mtime << "\n";
+}
+
+static bool sidecar_attests(const fs::path& file, const ExpectedHash& expected) {
+    std::ifstream in(verified_sidecar_path(file));
+    if (!in.is_open()) {
+        return false;
+    }
+    std::string algorithm, digest, size_line, mtime_line;
+    if (!std::getline(in, algorithm) || !std::getline(in, digest) ||
+        !std::getline(in, size_line) || !std::getline(in, mtime_line)) {
+        return false;
+    }
+    if (algorithm != expected.algorithm || lower_copy(digest) != expected.value) {
+        return false;
+    }
+    uintmax_t size = 0;
+    long long mtime = 0;
+    if (!read_file_facts(file, size, mtime)) {
+        return false;
+    }
+    try {
+        if (std::stoull(size_line) != size || std::stoll(mtime_line) != mtime) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// verify_file_hash plus the sidecar fast path: attested files skip the re-hash;
+// full verifications record a fresh attestation, failed ones drop it.
+static HashCheckResult verify_file_hash_cached(const fs::path& path, const ExpectedHash& expected) {
+    if (sidecar_attests(path, expected)) {
+        LOG(INFO, "Download") << "Hash previously verified (sidecar match); skipping re-hash: "
+                              << path.string() << std::endl;
+        HashCheckResult result;
+        result.ok = true;
+        result.actual = expected.value;
+        return result;
+    }
+    auto result = verify_file_hash(path, expected);
+    if (result.ok && expected.present()) {
+        write_verified_sidecar(path, expected);
+    } else if (!result.ok) {
+        remove_verified_sidecar(path);
+    }
+    return result;
+}
+
 } // namespace
 
 // Callback for writing response data to string
@@ -358,6 +469,40 @@ static fs::path get_disk_space_probe_path(const fs::path& output_path) {
     }
 
     return fs::path(".");
+}
+
+static void classify_curl_failure(CURLcode res, bool& retryable, bool& permanent) {
+    switch (res) {
+        case CURLE_COULDNT_CONNECT:
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_RESOLVE_PROXY:
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_SEND_ERROR:
+        case CURLE_RECV_ERROR:
+        case CURLE_GOT_NOTHING:
+        case CURLE_PARTIAL_FILE:
+        case CURLE_SSL_CONNECT_ERROR:
+            retryable = true;
+            break;
+        // A rejected scheme (e.g. an https-only policy hit on an http URL or
+        // a disallowed redirect target) and a malformed URL can never
+        // succeed on retry. Fail permanently so the outer loop stops
+        // immediately and preserves any existing partial file.
+        case CURLE_UNSUPPORTED_PROTOCOL:
+        case CURLE_URL_MALFORMAT:
+            permanent = true;
+            retryable = false;
+            break;
+        default:
+            retryable = false;
+    }
+}
+
+// CURLE_WRITE_ERROR typically means disk full; confirm against free space.
+static bool disk_nearly_full(const fs::path& probe_path) {
+    std::error_code ec;
+    auto si = fs::space(probe_path, ec);
+    return !ec && si.available < 1024 * 1024;
 }
 
 static size_t header_callback(char* buffer, size_t size, size_t nitems, void* userdata) {
@@ -841,6 +986,103 @@ HttpResponse HttpClient::post_stream(const std::string& url,
     return response;
 }
 
+namespace {
+
+FILE* open_binary_file(const fs::path& path, const char* mode) {
+#ifdef _WIN32
+    const std::string narrow_mode(mode);
+    const std::wstring wide_mode(narrow_mode.begin(), narrow_mode.end());
+    return _wfopen(path.c_str(), wide_mode.c_str());
+#else
+    return fopen(path.c_str(), mode);
+#endif
+}
+
+// Power-loss ordering: the journal may only claim bytes that are already on
+// the device, and it must itself be on the device before any out-of-order byte
+// is written. Without these syncs a restart could trust zero-filled holes.
+bool sync_stdio_file(FILE* fp) {
+    if (fflush(fp) != 0) {
+        return false;
+    }
+#ifdef _WIN32
+    return _commit(_fileno(fp)) == 0;
+#elif defined(__APPLE__)
+    return fsync(fileno(fp)) == 0;
+#else
+    return fdatasync(fileno(fp)) == 0;
+#endif
+}
+
+bool sync_path(const fs::path& path) {
+    FILE* fp = open_binary_file(path, "r+b");
+    if (!fp) {
+        return false;
+    }
+    const bool synced = sync_stdio_file(fp);
+    return (fclose(fp) == 0) && synced;
+}
+
+bool sync_parent_directory(const fs::path& path) {
+#ifdef _WIN32
+    (void)path;
+    return true;
+#else
+    fs::path dir = path.parent_path();
+    if (dir.empty()) {
+        dir = ".";
+    }
+    const int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    const bool synced = ::fsync(fd) == 0;
+    ::close(fd);
+    return synced;
+#endif
+}
+
+// Returns false only when the rename itself failed; *synced reports whether
+// the new directory entry is known to be on the device.
+bool rename_with_sync(const fs::path& from, const fs::path& to, bool* synced) {
+#ifdef _WIN32
+    const bool moved = MoveFileExW(from.c_str(), to.c_str(),
+                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    *synced = moved;
+    return moved;
+#else
+    std::error_code ec;
+    fs::rename(from, to, ec);
+    if (ec) {
+        *synced = false;
+        return false;
+    }
+    *synced = sync_parent_directory(to);
+    return true;
+#endif
+}
+
+bool durable_rename(const fs::path& from, const fs::path& to) {
+    bool synced = false;
+    return rename_with_sync(from, to, &synced) && synced;
+}
+
+// Returns false only when the file could not be removed. The directory sync
+// is best effort: a removal lost to power failure resurrects a journal, which
+// can only discard progress, never vouch for missing bytes. Windows offers no
+// directory sync, so there the delete reaches the disk with NTFS's own log.
+bool durable_remove(const fs::path& path) {
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) {
+        return false;
+    }
+    sync_parent_directory(path);
+    return true;
+}
+
+} // namespace
+
 DownloadResult HttpClient::download_attempt(const std::string& url,
                                             const std::string& output_path,
                                             size_t resume_from,
@@ -934,7 +1176,10 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
     result.bytes_downloaded = static_cast<size_t>(downloaded);
     result.total_bytes = (total > 0) ? static_cast<size_t>(total) : 0;
 
-    fclose(fp);
+    // A completed transfer must be on the device before the caller renames
+    // it, or a power loss can leave a full-size partial of unwritten bytes.
+    const bool data_synced = (res != CURLE_OK) || sync_stdio_file(fp);
+    const bool closed_cleanly = fclose(fp) == 0;
     curl_slist_free_all(header_list);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.http_code);
 
@@ -973,40 +1218,10 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
         bool retryable = false;
         bool disk_full = false;
         const fs::path disk_space_probe_path = get_disk_space_probe_path(output_path_fs);
-        switch (res) {
-            case CURLE_COULDNT_CONNECT:
-            case CURLE_COULDNT_RESOLVE_HOST:
-            case CURLE_COULDNT_RESOLVE_PROXY:
-            case CURLE_OPERATION_TIMEDOUT:
-            case CURLE_SEND_ERROR:
-            case CURLE_RECV_ERROR:
-            case CURLE_GOT_NOTHING:
-            case CURLE_PARTIAL_FILE:
-            case CURLE_SSL_CONNECT_ERROR:
-                retryable = true;
-                break;
-            // A rejected scheme (e.g. an https-only policy hit on an http URL or
-            // a disallowed redirect target) and a malformed URL can never
-            // succeed on retry. Fail permanently so the outer loop stops
-            // immediately and preserves any existing partial file.
-            case CURLE_UNSUPPORTED_PROTOCOL:
-            case CURLE_URL_MALFORMAT:
-                result.permanent = true;
-                retryable = false;
-                break;
-            case CURLE_WRITE_ERROR: {
-                // CURLE_WRITE_ERROR (23) typically means disk full.
-                // Check available disk space to confirm.
-                std::error_code ec;
-                auto si = fs::space(disk_space_probe_path, ec);
-                if (!ec && si.available < 1024 * 1024) {  // Less than 1 MB free
-                    disk_full = true;
-                }
-                retryable = false;
-                break;
-            }
-            default:
-                retryable = false;
+        if (res == CURLE_WRITE_ERROR) {
+            disk_full = disk_nearly_full(disk_space_probe_path);
+        } else {
+            classify_curl_failure(res, retryable, result.permanent);
         }
 
         size_t current_file_size = 0;
@@ -1112,7 +1327,721 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
         return result;
     }
 
+    if (!data_synced || !closed_cleanly) {
+        result.error_message = "Download finished but could not be flushed to disk: " + output_path;
+        result.curl_error = result.error_message;
+        result.can_resume = true;
+        return result;
+    }
+
     result.success = true;
+    return result;
+}
+
+namespace {
+
+constexpr uint64_t kMaxRangeChunkBytes = 256ULL * 1024 * 1024;
+constexpr auto kParallelProgressInterval = std::chrono::milliseconds(100);
+
+// A parallel download writes ranges out of order, so the .partial file's size
+// stops meaning "bytes written from the start". While "<partial>.ranges"
+// exists it records the contiguous prefix that is known to be written; a
+// resume truncates back to that prefix (normalize_partial_file) so every
+// size-based resume and progress reading stays truthful.
+fs::path range_journal_path(const fs::path& partial) {
+    fs::path p = partial;
+    p += ".ranges";
+    return p;
+}
+
+std::optional<uint64_t> read_range_journal(const fs::path& journal) {
+    std::ifstream in(journal);
+    std::string line;
+    if (!in.is_open() || !std::getline(in, line)) {
+        return std::nullopt;
+    }
+    try {
+        size_t consumed = 0;
+        const unsigned long long value = std::stoull(line, &consumed);
+        if (consumed != line.size()) {
+            return std::nullopt;
+        }
+        return static_cast<uint64_t>(value);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+bool write_range_journal(const fs::path& journal, uint64_t prefix) {
+    fs::path tmp = journal;
+    tmp += ".tmp";
+    FILE* fp = open_binary_file(tmp, "wb");
+    if (!fp) {
+        return false;
+    }
+    const std::string line = std::to_string(prefix) + "\n";
+    bool ok = fwrite(line.data(), 1, line.size(), fp) == line.size() && sync_stdio_file(fp);
+    ok = (fclose(fp) == 0) && ok;
+    return ok && durable_rename(tmp, journal);
+}
+
+// Returns false if an out-of-order partial could not be reset; the caller must
+// not resume from it. The truncation is synced before the journal goes, so a
+// power loss can never leave the old tail without its journal.
+bool normalize_partial_file(const fs::path& partial) {
+    const fs::path journal = range_journal_path(partial);
+    std::error_code ec;
+    fs::path tmp = journal;
+    tmp += ".tmp";
+    fs::remove(tmp, ec);
+    if (!fs::exists(journal, ec)) {
+        return true;
+    }
+    if (fs::exists(partial, ec)) {
+        const uint64_t prefix = read_range_journal(journal).value_or(0);
+        const uint64_t size = fs::file_size(partial, ec);
+        if (ec) {
+            return false;
+        }
+        if (size > prefix) {
+            fs::resize_file(partial, prefix, ec);
+            if (ec || !sync_path(partial)) {
+                std::error_code remove_ec;
+                fs::remove(partial, remove_ec);
+                if (remove_ec) {
+                    return false;
+                }
+            }
+        }
+    }
+    return durable_remove(journal);
+}
+
+bool seek_binary_file(FILE* fp, uint64_t offset) {
+#ifdef _WIN32
+    return _fseeki64(fp, static_cast<__int64>(offset), SEEK_SET) == 0;
+#else
+    return fseeko(fp, static_cast<off_t>(offset), SEEK_SET) == 0;
+#endif
+}
+
+bool parse_u64(const std::string& text, uint64_t& out) {
+    if (text.empty() || !std::all_of(text.begin(), text.end(),
+                                     [](unsigned char c) { return std::isdigit(c) != 0; })) {
+        return false;
+    }
+    try {
+        out = static_cast<uint64_t>(std::stoull(text));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Final-response status and Content-Range ("bytes S-E/T"). Reset on every
+// status line so a redirect hop's headers never describe the final body.
+struct RangeHeaderState {
+    long status = 0;
+    bool have_content_range = false;
+    uint64_t range_start = 0;
+    uint64_t range_end = 0;
+    uint64_t range_total = 0;
+};
+
+size_t range_header_callback(char* buffer, size_t size, size_t nitems, void* userdata) {
+    const size_t total = size * nitems;
+    auto* state = static_cast<RangeHeaderState*>(userdata);
+    if (!state) {
+        return total;
+    }
+
+    std::string line(buffer, total);
+    if (line.rfind("HTTP/", 0) == 0) {
+        *state = RangeHeaderState{};
+        std::istringstream iss(line);
+        std::string version;
+        iss >> version >> state->status;
+        return total;
+    }
+
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos ||
+        lower_copy(trim_copy(line.substr(0, colon))) != "content-range") {
+        return total;
+    }
+
+    const std::string value = lower_copy(trim_copy(line.substr(colon + 1)));
+    const std::string unit = "bytes ";
+    const size_t dash = value.find('-');
+    const size_t slash = value.find('/');
+    if (value.rfind(unit, 0) != 0 || dash == std::string::npos || slash == std::string::npos ||
+        dash > slash) {
+        return total;
+    }
+    RangeHeaderState parsed = *state;
+    if (parse_u64(value.substr(unit.size(), dash - unit.size()), parsed.range_start) &&
+        parse_u64(value.substr(dash + 1, slash - dash - 1), parsed.range_end) &&
+        parse_u64(value.substr(slash + 1), parsed.range_total)) {
+        parsed.have_content_range = true;
+        *state = parsed;
+    }
+    return total;
+}
+
+struct RangeProbe {
+    bool supported = false;
+    bool cancelled = false;
+    uint64_t total = 0;
+};
+
+struct ProbeCancel {
+    const ProgressCallback* callback = nullptr;
+    size_t resume_offset = 0;
+    bool cancelled = false;
+};
+
+int probe_xferinfo_callback(void* clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    auto* cancel = static_cast<ProbeCancel*>(clientp);
+    if (g_download_cancelled.load()) {
+        cancel->cancelled = true;
+        return 1;
+    }
+    try {
+        if (*cancel->callback && !(*cancel->callback)(cancel->resume_offset, 0)) {
+            cancel->cancelled = true;
+            return 1;
+        }
+    } catch (...) {
+        cancel->cancelled = true;
+        return 1;
+    }
+    return 0;
+}
+
+size_t probe_write_callback(char*, size_t size, size_t nmemb, void* userdata) {
+    auto* received = static_cast<size_t*>(userdata);
+    *received += size * nmemb;
+    // A server that ignores Range starts sending the whole file; stop it.
+    return *received <= 1 ? size * nmemb : 0;
+}
+
+struct HeaderList {
+    curl_slist* list = nullptr;
+    explicit HeaderList(const std::map<std::string, std::string>& headers) {
+        for (const auto& header : headers) {
+            const std::string line = header.first + ": " + header.second;
+            list = curl_slist_append(list, line.c_str());
+        }
+    }
+    ~HeaderList() { curl_slist_free_all(list); }
+    HeaderList(const HeaderList&) = delete;
+    HeaderList& operator=(const HeaderList&) = delete;
+};
+
+RangeProbe probe_range_support(const std::string& url,
+                               const std::map<std::string, std::string>& headers,
+                               const DownloadOptions& options,
+                               HttpSecurityPolicy policy,
+                               const ProgressCallback& callback,
+                               size_t resume_offset) {
+    RangeProbe probe;
+    if (g_download_cancelled.load()) {
+        probe.cancelled = true;
+        return probe;
+    }
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        return probe;
+    }
+    RangeHeaderState state;
+    size_t received = 0;
+    HeaderList header_list(headers);
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (!apply_http_security_policy(curl, policy, true)) {
+        curl_easy_cleanup(curl);
+        return probe;
+    }
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, probe_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &received);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, range_header_callback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &state);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, static_cast<long>(options.connect_timeout));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "lemon.cpp/1.0");
+    if (header_list.list) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list.list);
+    }
+    ProbeCancel cancel;
+    cancel.callback = &callback;
+    cancel.resume_offset = resume_offset;
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, probe_xferinfo_callback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &cancel);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+
+    const CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    if (cancel.cancelled) {
+        probe.cancelled = true;
+        return probe;
+    }
+
+    if (res == CURLE_OK && state.status == 206 && state.have_content_range &&
+        state.range_start == 0 && state.range_end == 0 && state.range_total > 0) {
+        probe.supported = true;
+        probe.total = state.range_total;
+    }
+    return probe;
+}
+
+struct RangeTransfer {
+    CURL* easy = nullptr;
+    FILE* fp = nullptr;
+    size_t chunk = 0;
+    uint64_t start = 0;
+    uint64_t length = 0;
+    uint64_t total_size = 0;
+    uint64_t written = 0;
+    RangeHeaderState headers;
+    bool body_checked = false;
+    bool range_ignored = false;
+    bool bad_range = false;
+    bool write_failed = false;
+    uint64_t last_written = 0;
+    std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
+};
+
+size_t range_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* t = static_cast<RangeTransfer*>(userdata);
+    const size_t n = size * nmemb;
+    const RangeHeaderState& h = t->headers;
+    if (h.status < 200 || h.status >= 300) {
+        return n;  // Error body; the status decides the outcome.
+    }
+    if (!t->body_checked) {
+        t->body_checked = true;
+        if (h.status != 206) {
+            t->range_ignored = true;
+            return 0;
+        }
+        if (!h.have_content_range || h.range_start != t->start ||
+            h.range_end != t->start + t->length - 1 || h.range_total != t->total_size) {
+            t->bad_range = true;
+            return 0;
+        }
+    }
+    if (t->written + n > t->length) {
+        t->bad_range = true;
+        return 0;
+    }
+    if (fwrite(ptr, 1, n, t->fp) != n) {
+        t->write_failed = true;
+        return 0;
+    }
+    t->written += n;
+    return n;
+}
+
+} // namespace
+
+size_t HttpClient::resumable_partial_bytes(const std::string& output_path) {
+    const fs::path partial = path_from_utf8(output_path + ".partial");
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(partial, ec);
+    if (ec) {
+        return 0;
+    }
+    const fs::path journal = range_journal_path(partial);
+    if (fs::exists(journal, ec)) {
+        return static_cast<size_t>((std::min)(static_cast<uint64_t>(size),
+                                              read_range_journal(journal).value_or(0)));
+    }
+    return static_cast<size_t>(size);
+}
+
+DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
+                                                     const std::string& partial_path,
+                                                     size_t resume_from,
+                                                     size_t total_size,
+                                                     int connections,
+                                                     ProgressCallback callback,
+                                                     const std::map<std::string, std::string>& headers,
+                                                     const DownloadOptions& options,
+                                                     HttpSecurityPolicy policy,
+                                                     bool& fall_back_single_stream) {
+    DownloadResult result;
+    fall_back_single_stream = false;
+    const fs::path partial_fs = path_from_utf8(partial_path);
+    const fs::path journal = range_journal_path(partial_fs);
+    const uint64_t remaining = static_cast<uint64_t>(total_size) - resume_from;
+    result.total_bytes = static_cast<size_t>(remaining);
+
+    struct FileCloser {
+        FILE* fp = nullptr;
+        void close() {
+            if (fp) {
+                fclose(fp);
+                fp = nullptr;
+            }
+        }
+        ~FileCloser() { close(); }
+    } sync_fp_closer;
+
+    // Local setup failures leave the partial untouched (or honestly
+    // normalized), so its bytes stay resumable.
+    auto local_failure = [&](const std::string& message) {
+        sync_fp_closer.close();
+        result.error_message = message;
+        result.curl_error = message;
+        result.can_resume = normalize_partial_file(partial_fs);
+        return result;
+    };
+
+    FILE* sync_fp = open_binary_file(partial_fs, resume_from == 0 ? "wb" : "r+b");
+    if (!sync_fp) {
+        return local_failure("Failed to open file for writing: " + partial_path);
+    }
+    sync_fp_closer.fp = sync_fp;
+
+    // The resumed prefix and then the journal reach the device before the
+    // first out-of-order byte can land.
+    if (!sync_stdio_file(sync_fp) || !write_range_journal(journal, resume_from)) {
+        return local_failure("Failed to record download progress: " + journal.string());
+    }
+
+    const uint64_t min_chunk = (std::max<uint64_t>)(1, options.parallel_min_bytes / 4);
+    uint64_t chunk_bytes = remaining / (static_cast<uint64_t>(connections) * 4);
+    chunk_bytes = (std::max)(min_chunk, (std::min)(chunk_bytes, kMaxRangeChunkBytes));
+    std::vector<std::pair<uint64_t, uint64_t>> chunks;
+    for (uint64_t offset = resume_from; offset < total_size; offset += chunk_bytes) {
+        chunks.emplace_back(offset, (std::min)(chunk_bytes, static_cast<uint64_t>(total_size) - offset));
+    }
+    std::vector<bool> chunk_done(chunks.size(), false);
+    size_t next_chunk = 0;
+    size_t prefix_chunks = 0;
+    uint64_t prefix = resume_from;
+    uint64_t completed_bytes = 0;
+
+    CURLM* multi = curl_multi_init();
+    if (!multi) {
+        return local_failure("Failed to initialize CURL multi handle");
+    }
+    // Multiplexing would put every range on one HTTP/2 connection and share
+    // one flow-control window, which is the single-stream bottleneck again.
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, static_cast<long>(CURLPIPE_NOTHING));
+
+    HeaderList header_list(headers);
+    std::vector<std::unique_ptr<RangeTransfer>> active;
+
+    bool failed = false;
+    bool cancelled = false;
+    bool stalled = false;
+    bool write_failed = false;
+    bool bad_range = false;
+    bool setup_failed = false;
+    CURLcode fail_code = CURLE_OK;
+    long fail_http = 0;
+    std::string fail_message;
+
+    auto release = [&](RangeTransfer* t) {
+        if (t->easy) {
+            curl_multi_remove_handle(multi, t->easy);
+            curl_easy_cleanup(t->easy);
+            t->easy = nullptr;
+        }
+        if (t->fp) {
+            fclose(t->fp);
+            t->fp = nullptr;
+        }
+    };
+
+    auto start_transfer = [&](size_t index) -> bool {
+        auto t = std::make_unique<RangeTransfer>();
+        t->chunk = index;
+        t->start = chunks[index].first;
+        t->length = chunks[index].second;
+        t->total_size = total_size;
+        t->fp = open_binary_file(partial_fs, "r+b");
+        if (!t->fp || !seek_binary_file(t->fp, t->start)) {
+            fail_message = "Failed to open file for writing: " + partial_path;
+            release(t.get());
+            return false;
+        }
+        t->easy = curl_easy_init();
+        if (!t->easy) {
+            fail_message = "Failed to initialize CURL";
+            release(t.get());
+            return false;
+        }
+        CURL* easy = t->easy;
+        curl_easy_setopt(easy, CURLOPT_URL, url.c_str());
+        if (!apply_http_security_policy(easy, policy, true)) {
+            fail_message = "Failed to apply HTTP security policy";
+            release(t.get());
+            return false;
+        }
+        const std::string range = std::to_string(t->start) + "-" +
+                                  std::to_string(t->start + t->length - 1);
+        curl_easy_setopt(easy, CURLOPT_RANGE, range.c_str());
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, range_write_callback);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA, t.get());
+        curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, range_header_callback);
+        curl_easy_setopt(easy, CURLOPT_HEADERDATA, &t->headers);
+        curl_easy_setopt(easy, CURLOPT_PRIVATE, t.get());
+        curl_easy_setopt(easy, CURLOPT_TIMEOUT, 0L);
+        curl_easy_setopt(easy, CURLOPT_USERAGENT, "lemon.cpp/1.0");
+        curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, static_cast<long>(options.connect_timeout));
+        curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT, static_cast<long>(options.low_speed_limit));
+        curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, static_cast<long>(options.low_speed_time));
+        if (header_list.list) {
+            curl_easy_setopt(easy, CURLOPT_HTTPHEADER, header_list.list);
+        }
+        if (curl_multi_add_handle(multi, easy) != CURLM_OK) {
+            fail_message = "Failed to start range request";
+            curl_easy_cleanup(easy);
+            t->easy = nullptr;
+            release(t.get());
+            return false;
+        }
+        active.push_back(std::move(t));
+        return true;
+    };
+
+    auto finish_transfer = [&](RangeTransfer* t, CURLcode res) {
+        long http_code = 0;
+        curl_easy_getinfo(t->easy, CURLINFO_RESPONSE_CODE, &http_code);
+        const bool closed_cleanly = (fclose(t->fp) == 0);
+        t->fp = nullptr;
+        const bool ok = res == CURLE_OK && http_code == 206 && t->body_checked &&
+                        !t->bad_range && t->written == t->length && closed_cleanly;
+        if (ok) {
+            chunk_done[t->chunk] = true;
+            completed_bytes += t->length;
+            const uint64_t old_prefix = prefix;
+            while (prefix_chunks < chunks.size() && chunk_done[prefix_chunks]) {
+                prefix += chunks[prefix_chunks].second;
+                ++prefix_chunks;
+            }
+            // A skipped or failed journal update only understates the prefix,
+            // which is safe.
+            if (prefix != old_prefix && sync_stdio_file(sync_fp)) {
+                write_range_journal(journal, prefix);
+            }
+        } else if (!failed) {
+            failed = true;
+            fail_http = http_code;
+            if (t->range_ignored) {
+                fall_back_single_stream = true;
+                fail_message = "Server ignored a Range request (HTTP " +
+                               std::to_string(http_code) + "); retrying as a single stream";
+            } else if (http_code == 416) {
+                // One edge node refusing a range must not cost the journaled
+                // prefix; the single-stream path re-checks the remote size.
+                fall_back_single_stream = true;
+                fail_http = 0;
+                fail_message = "Server rejected a Range request (HTTP 416); retrying as a single stream";
+            } else if (t->write_failed || !closed_cleanly) {
+                write_failed = true;
+            } else if (res != CURLE_OK && !t->bad_range) {
+                fail_code = res;
+            } else if (http_code < 400) {
+                bad_range = true;
+                std::ostringstream oss;
+                oss << "Range response for bytes " << t->start << "-" << (t->start + t->length - 1)
+                    << " did not match the request (HTTP " << http_code << ", received "
+                    << t->written << " of " << t->length << " bytes)";
+                fail_message = oss.str();
+            }
+        }
+        release(t);
+    };
+
+    const int no_progress_timeout = options.no_progress_timeout;
+    auto last_report = std::chrono::steady_clock::now() - kParallelProgressInterval;
+
+    while (true) {
+        while (!failed && active.size() < static_cast<size_t>(connections) &&
+               next_chunk < chunks.size()) {
+            if (!start_transfer(next_chunk)) {
+                failed = true;
+                setup_failed = true;
+                break;
+            }
+            ++next_chunk;
+        }
+        if (failed || active.empty()) {
+            break;
+        }
+
+        int running = 0;
+        const CURLMcode perform_code = curl_multi_perform(multi, &running);
+        if (perform_code != CURLM_OK) {
+            failed = true;
+            setup_failed = true;
+            fail_message = std::string("CURL multi error: ") + curl_multi_strerror(perform_code);
+            break;
+        }
+
+        int queued = 0;
+        while (CURLMsg* msg = curl_multi_info_read(multi, &queued)) {
+            if (msg->msg != CURLMSG_DONE) {
+                continue;
+            }
+            char* priv = nullptr;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &priv);
+            auto* t = reinterpret_cast<RangeTransfer*>(priv);
+            const CURLcode res = msg->data.result;
+            finish_transfer(t, res);
+            active.erase(std::remove_if(active.begin(), active.end(),
+                                        [t](const std::unique_ptr<RangeTransfer>& p) {
+                                            return p.get() == t;
+                                        }),
+                         active.end());
+        }
+        if (failed) {
+            break;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        uint64_t in_flight = 0;
+        for (auto& t : active) {
+            in_flight += t->written;
+            if (t->written > t->last_written) {
+                t->last_written = t->written;
+                t->last_progress = now;
+            } else if (no_progress_timeout > 0) {
+                const long limit = t->written == 0 ? static_cast<long>(no_progress_timeout) * 5L
+                                                   : static_cast<long>(no_progress_timeout);
+                const auto idle = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - t->last_progress).count();
+                if (idle >= limit) {
+                    stalled = true;
+                }
+            }
+        }
+
+        if (g_download_cancelled.load()) {
+            cancelled = true;
+        } else if (callback && now - last_report >= kParallelProgressInterval) {
+            last_report = now;
+            // An exception must not unwind past the live curl handles.
+            try {
+                if (!callback(static_cast<size_t>(completed_bytes + in_flight),
+                              static_cast<size_t>(remaining))) {
+                    cancelled = true;
+                }
+            } catch (...) {
+                cancelled = true;
+            }
+        }
+        if (cancelled || stalled) {
+            failed = true;
+            break;
+        }
+
+        curl_multi_poll(multi, nullptr, 0, 100, nullptr);
+    }
+
+    uint64_t attempt_bytes = completed_bytes;
+    for (auto& t : active) {
+        attempt_bytes += t->written;
+        release(t.get());
+    }
+    active.clear();
+    curl_multi_cleanup(multi);
+    result.bytes_downloaded = static_cast<size_t>(attempt_bytes);
+
+    if (!failed) {
+        std::error_code ec;
+        const uintmax_t size = fs::file_size(partial_fs, ec);
+        if (!ec && size == total_size && sync_stdio_file(sync_fp)) {
+            sync_fp_closer.close();
+            // Record completion first so a resurrected journal cannot truncate
+            // the finished file.
+            write_range_journal(journal, total_size);
+            durable_remove(journal);
+            if (callback) {
+                try {
+                    callback(static_cast<size_t>(remaining), static_cast<size_t>(remaining));
+                } catch (...) {
+                }
+            }
+            result.success = true;
+            result.http_code = 206;
+            return result;
+        }
+        failed = true;
+        if (!ec && size == total_size) {
+            setup_failed = true;
+            fail_message = "Could not flush downloaded data to disk: " + partial_path;
+        } else {
+            bad_range = true;
+            fail_message = "Parallel download finished with an unexpected file size";
+        }
+    }
+    sync_fp_closer.close();
+
+    // Drop every byte past the contiguous prefix so the partial is an honest
+    // resume point for whichever path (parallel or single stream) runs next.
+    if (!normalize_partial_file(partial_fs)) {
+        result.error_message = "Download interrupted and the partial file could not be reset: " +
+                               partial_path;
+        result.can_resume = false;
+        return result;
+    }
+    const bool have_prefix = prefix > 0;
+    result.http_code = fail_http;
+
+    if (cancelled) {
+        result.cancelled = true;
+        result.can_resume = true;
+        result.error_message = "Download cancelled by user";
+        return result;
+    }
+    if (setup_failed || fall_back_single_stream) {
+        result.can_resume = true;
+        result.error_message = fail_message.empty() ? "Parallel download failed" : fail_message;
+        result.curl_error = result.error_message;
+        return result;
+    }
+    if (stalled) {
+        result.can_resume = have_prefix;
+        result.error_message = "Download stalled: no bytes received for " +
+                               std::to_string(no_progress_timeout) + " seconds";
+        result.curl_error = result.error_message;
+        return result;
+    }
+    if (write_failed) {
+        result.can_resume = true;
+        result.curl_code = static_cast<int>(CURLE_WRITE_ERROR);
+        result.curl_error = curl_easy_strerror(CURLE_WRITE_ERROR);
+        result.disk_full = disk_nearly_full(get_disk_space_probe_path(partial_fs));
+        result.error_message = result.disk_full
+            ? "Disk full: not enough space to complete download"
+            : "Download failed: could not write to " + partial_path;
+        return result;
+    }
+    if (fail_code != CURLE_OK) {
+        bool retryable = false;
+        classify_curl_failure(fail_code, retryable, result.permanent);
+        result.curl_code = static_cast<int>(fail_code);
+        result.curl_error = curl_easy_strerror(fail_code);
+        result.can_resume = retryable && have_prefix;
+        result.error_message = "Download failed: " + result.curl_error +
+                               " (CURL code: " + std::to_string(result.curl_code) + ")";
+        return result;
+    }
+    if (fail_http >= 400) {
+        const bool transient = fail_http == 408 || fail_http == 429 || fail_http >= 500;
+        result.can_resume = transient && have_prefix;
+        result.error_message = "HTTP error " + std::to_string(fail_http) + " for URL: " + url;
+        result.curl_error = "HTTP " + std::to_string(fail_http);
+        return result;
+    }
+    result.can_resume = bad_range && have_prefix;
+    result.error_message = fail_message.empty() ? "Parallel download failed" : fail_message;
+    result.curl_error = result.error_message;
     return result;
 }
 
@@ -1137,10 +2066,16 @@ DownloadResult HttpClient::download_file(const std::string& url,
     fs::path output_path_fs = path_from_utf8(output_path);
     fs::path partial_path_fs = path_from_utf8(partial_path);
 
+    if (!normalize_partial_file(partial_path_fs)) {
+        final_result.success = false;
+        final_result.error_message = "Interrupted parallel download could not be reset: " + partial_path;
+        return final_result;
+    }
+
     // If a verified final file exists next to a stale .partial file, trust the
     // verified final file and remove the stale partial.
     if (expected_hash.present() && fs::exists(output_path_fs) && fs::exists(partial_path_fs)) {
-        auto hash_result = verify_file_hash(output_path_fs, expected_hash);
+        auto hash_result = verify_file_hash_cached(output_path_fs, expected_hash);
         if (hash_result.ok) {
             std::error_code remove_partial_ec;
             fs::remove(partial_path_fs, remove_partial_ec);
@@ -1166,7 +2101,7 @@ DownloadResult HttpClient::download_file(const std::string& url,
     // matches; otherwise remove it and force a fresh download.
     if (fs::exists(output_path_fs) && !fs::exists(partial_path_fs)) {
         if (expected_hash.present()) {
-            auto hash_result = verify_file_hash(output_path_fs, expected_hash);
+            auto hash_result = verify_file_hash_cached(output_path_fs, expected_hash);
             if (hash_result.ok) {
                 final_result.success = true;
                 final_result.bytes_downloaded = 0;
@@ -1207,6 +2142,39 @@ DownloadResult HttpClient::download_file(const std::string& url,
         }
     }
 
+    // A rate cap is enforced per transfer and by serializing downloads, so
+    // splitting one file across connections would multiply it; stay single.
+    // Re-evaluated before every attempt so a cap set mid-download applies.
+    auto parallel_allowed = []() {
+        return download_connections_.load() > 1 && download_rate_limit_bytes_per_second_.load() <= 0;
+    };
+
+    bool use_parallel = false;
+    size_t parallel_total = 0;
+    if (options.allow_parallel && parallel_allowed() &&
+        (options.expected_size == 0 || options.expected_size >= options.parallel_min_bytes)) {
+        const RangeProbe probe = probe_range_support(url, headers, options, policy, callback,
+                                                     resume_offset);
+        if (probe.cancelled) {
+            final_result.cancelled = true;
+            final_result.can_resume = true;
+            final_result.error_message = "Download cancelled by user";
+            LOG(INFO, "Download") << " Cancelled by user" << std::endl;
+            return final_result;
+        }
+        if (!probe.supported) {
+            LOG(INFO, "Download") << "Server did not honour a Range request; using a single stream"
+                                  << std::endl;
+        } else if (probe.total >= options.parallel_min_bytes && resume_offset < probe.total) {
+            use_parallel = true;
+            parallel_total = static_cast<size_t>(probe.total);
+            LOG(INFO, "Download") << "Downloading with " << download_connections_.load()
+                                  << " parallel connections ("
+                                  << std::fixed << std::setprecision(1)
+                                  << (probe.total / (1024.0 * 1024.0)) << " MB)" << std::endl;
+        }
+    }
+
     for (int attempt = 0; attempt <= options.max_retries; ++attempt) {
         if (attempt > 0) {
             LOG(INFO, "Download") << " Retry " << attempt << "/" << options.max_retries
@@ -1218,13 +2186,21 @@ DownloadResult HttpClient::download_file(const std::string& url,
 
             if (options.resume_partial && fs::exists(partial_path_fs)) {
                 size_t new_offset = fs::file_size(partial_path_fs);
-                if (new_offset > resume_offset) {
+                if (new_offset != resume_offset) {
                     resume_offset = new_offset;
                     LOG(INFO, "Download") << "Resuming from "
                               << std::fixed << std::setprecision(1)
                               << (resume_offset / (1024.0 * 1024.0)) << " MB" << std::endl;
                 }
+            } else if (!fs::exists(partial_path_fs)) {
+                resume_offset = 0;
             }
+        }
+
+        if (use_parallel && !parallel_allowed()) {
+            LOG(INFO, "Download") << "Parallel download disabled by configuration; continuing as a single stream"
+                                  << std::endl;
+            use_parallel = false;
         }
 
         ProgressCallback adjusted_callback = nullptr;
@@ -1242,7 +2218,15 @@ DownloadResult HttpClient::download_file(const std::string& url,
             options.force_initial_range_request ||
             (retrying_without_partial && options.range_retry_on_zero_byte_retry);
 
-        {
+        if (use_parallel) {
+            bool fall_back_single_stream = false;
+            final_result = parallel_download_attempt(url, partial_path, resume_offset, parallel_total,
+                                                     download_connections_.load(), adjusted_callback,
+                                                     headers, options, policy, fall_back_single_stream);
+            if (fall_back_single_stream) {
+                use_parallel = false;
+            }
+        } else {
             // Released between attempts so retry backoff does not stall other downloads.
             const int64_t rate_limit = download_rate_limit_bytes_per_second_.load();
             std::optional<std::lock_guard<std::mutex>> gate;
@@ -1291,17 +2275,28 @@ DownloadResult HttpClient::download_file(const std::string& url,
 
             // Download complete - rename .partial to final path
             std::error_code ec;
-            fs::rename(partial_path_fs, output_path_fs, ec);
-            if (ec) {
+            bool rename_synced = false;
+            if (!rename_with_sync(partial_path_fs, output_path_fs, &rename_synced)) {
                 // Rename failed - try copy and delete
                 fs::copy_file(partial_path_fs, output_path_fs, fs::copy_options::overwrite_existing, ec);
                 if (!ec) {
+                    rename_synced = sync_path(output_path_fs) && sync_parent_directory(output_path_fs);
                     fs::remove(partial_path_fs, ec);
                 }
+            }
+            if (!ec && !rename_synced) {
+                LOG(WARNING, "Download") << "Could not confirm the completed file reached the disk: "
+                                         << output_path << std::endl;
             }
             if (ec) {
                 final_result.success = false;
                 final_result.error_message = "Download succeeded but failed to rename file: " + ec.message();
+            } else if (expected_hash.present()) {
+                write_verified_sidecar(output_path_fs, expected_hash);
+            } else {
+                // An unverified replacement invalidates any prior attestation:
+                // a sidecar must never attest an inode it did not see.
+                remove_verified_sidecar(output_path_fs);
             }
             return final_result;
         }
