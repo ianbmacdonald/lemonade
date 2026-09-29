@@ -485,6 +485,12 @@ The following options are available depending on the recipe being used:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--tflite-args ARGS` | Custom arguments to pass to tflite-server | `""` |
+
+#### ExecuTorch (`executorch` recipe)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--executorch-args ARGS` | Custom arguments to pass to et-server | `""` |
 <!-- END GENERATED: cli-recipe-options -->
 **Notes:**
 - Unspecified options will use the backend's default values

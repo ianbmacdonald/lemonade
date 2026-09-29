@@ -6,6 +6,7 @@ const RAW_BASE = 'https://raw.githubusercontent.com/lemonade-sdk/lemonade';
 const RECIPE_PRIORITY = [
   'acestep',
   'ds4',
+  'executorch',
   'flm',
   'llamacpp-hrx',
   'kokoro',
@@ -40,7 +41,8 @@ const RECIPE_DISPLAY_NAMES = {
   trellis: 'TRELLIS.2',
   openmoss: 'OpenMOSS TTS',
   litert: 'LiteRT',
-  tflite: 'TFLite'
+  tflite: 'TFLite',
+  executorch: 'ExecuTorch'
 };
 /* END GENERATED: models-js-recipes */
 
