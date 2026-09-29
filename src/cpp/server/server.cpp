@@ -48,6 +48,7 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
+#include <random>
 #include <filesystem>
 #include <system_error>
 #include <algorithm>
@@ -373,6 +374,15 @@ Server::Server(std::shared_ptr<RuntimeConfig> config,
       config_dir_(config_dir),
       port_(config->port()), running_(false), udp_beacon_(),
       metrics_platform_(create_metrics_platform()) {
+
+    {
+        std::random_device rd;
+        std::mt19937_64 gen((static_cast<uint64_t>(rd()) << 32) ^ rd());
+        std::ostringstream id;
+        id << std::hex << std::setw(16) << std::setfill('0') << gen();
+        instance_id_ = id.str();
+    }
+    udp_beacon_.setInstanceId(instance_id_);
 
     // Set global HttpClient timeout
     utils::HttpClient::set_default_timeout(config->global_timeout());
@@ -2048,6 +2058,8 @@ void Server::run() {
         }
     }
 
+    sync_beacon_listener();
+
     while (true) {
         // Check for shutdown signal from the main thread
         if (shutdown_requested_.load()) {
@@ -2228,6 +2240,11 @@ bool Server::startup_failed() const {
 }
 
 void Server::stop() {
+    {
+        std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
+        beacon_listener_shutdown_ = true;
+        beacon_listener_.stop();
+    }
     if (running_) {
         LOG(INFO, "Server") << "Stopping HTTP server..." << std::endl;
         udp_beacon_.stopBroadcasting();
@@ -2606,6 +2623,8 @@ void Server::handle_health(const httplib::Request& req, httplib::Response& res) 
 
     // Add update check status
     response["update_check_done"] = update_check_done_.load();
+
+    response["beacon_listener"] = beacon_listener_.status_json();
 
     res.set_content(response.dump(), "application/json");
 }
@@ -7291,6 +7310,15 @@ void Server::handle_bin_change(const std::string& section,
     model_manager_->invalidate_models_cache();
 }
 
+void Server::sync_beacon_listener() {
+    std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
+    if (!beacon_listener_shutdown_ && config_->beacon_listen()) {
+        beacon_listener_.start(instance_id_, port_.load());
+    } else {
+        beacon_listener_.stop();
+    }
+}
+
 void Server::apply_config_side_effects(const json& applied_changes) {
     for (auto& [key, value] : applied_changes.items()) {
         if (key == "port") {
@@ -7299,6 +7327,7 @@ void Server::apply_config_side_effects(const json& applied_changes) {
             if (new_port != current_port) {
                 LOG(INFO, "Server") << "Port change requested: " << current_port << " -> " << new_port << std::endl;
                 port_.store(new_port);
+                beacon_listener_.set_self_port(new_port);
                 if (running_) {
                     rebind_requested_ = true;
                     udp_beacon_.stopBroadcasting();
@@ -7369,6 +7398,10 @@ void Server::apply_config_side_effects(const json& applied_changes) {
                     udp_beacon_.startBroadcasting(13305, port_, 2);
                 }
             }
+        } else if (key == "beacon_listen") {
+            LOG(INFO, "Server") << "Beacon listener "
+                                << (config_->beacon_listen() ? "enabled" : "disabled") << std::endl;
+            sync_beacon_listener();
         } else if (key == "extra_models_dir") {
             std::string dir = config_->extra_models_dir();
             LOG(INFO, "Server") << "Extra models dir changed to: " << dir << std::endl;
