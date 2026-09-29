@@ -12,6 +12,7 @@
   "auto_evict_threshold_pct": 0.9,
   "auto_update_models": false,
   "beacon_listen": false,
+  "beacon_listen_interfaces": [],
   "broadcast": true,
   "cloud_providers": [],
   "config_version": 2,

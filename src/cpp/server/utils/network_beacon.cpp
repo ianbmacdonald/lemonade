@@ -161,16 +161,30 @@ std::vector<NetworkInterfaceInfo> NetworkBeacon::getLocalRFC1918Interfaces() {
 
         if (!isRFC1918(ip)) continue;
 
-        // Get broadcast address for broadcast-capable interfaces
+        // The subnet broadcast is derived from the netmask, not ifa_broadaddr:
+        // when an address has no configured brd (OpenWrt/prplOS bridges),
+        // glibc and musl both report the unicast address there, while the
+        // kernel still treats ip|~mask as this subnet's broadcast.
         std::string bcastStr = "255.255.255.255"; // fallback
-        if ((ifa->ifa_flags & IFF_BROADCAST) && ifa->ifa_broadaddr != nullptr) {
-            char bcast[INET_ADDRSTRLEN];
-            auto bsa = (struct sockaddr_in*)ifa->ifa_broadaddr;
-            inet_ntop(AF_INET, &bsa->sin_addr, bcast, sizeof(bcast));
-            bcastStr = bcast;
+        std::string maskStr;
+        if (ifa->ifa_netmask != nullptr && ifa->ifa_netmask->sa_family == AF_INET) {
+            char mask[INET_ADDRSTRLEN];
+            auto msa = (struct sockaddr_in*)ifa->ifa_netmask;
+            inet_ntop(AF_INET, &msa->sin_addr, mask, sizeof(mask));
+            maskStr = mask;
+            uint32_t ipHost = ntohl(sa->sin_addr.s_addr);
+            uint32_t maskHost = ntohl(msa->sin_addr.s_addr);
+            // /31 and /32 have no subnet broadcast.
+            if ((ifa->ifa_flags & IFF_BROADCAST) && (~maskHost) > 1u) {
+                struct in_addr bcastAddr;
+                bcastAddr.s_addr = htonl(ipHost | ~maskHost);
+                char bcast[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &bcastAddr, bcast, sizeof(bcast));
+                bcastStr = bcast;
+            }
         }
 
-        interfaces.push_back({ip, bcastStr});
+        interfaces.push_back({ip, bcastStr, ifa->ifa_name ? ifa->ifa_name : "", maskStr});
     }
 
     freeifaddrs(ifaddr);

@@ -406,6 +406,7 @@ void HttpListener::start() {
 
 void HttpListener::sync_beacon_listener() {
     std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
+    beacon_listener_.set_interface_allowlist(config_->beacon_listen_interfaces());
     if (!beacon_listener_shutdown_ && config_->beacon_listen()) {
         beacon_listener_.start(instance_id_, port_.load());
     } else {

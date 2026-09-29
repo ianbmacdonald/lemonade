@@ -19,6 +19,8 @@
 struct NetworkInterfaceInfo {
     std::string ipAddress;
     std::string broadcastAddress;
+    std::string name;
+    std::string netmask;
 };
 
 class NetworkBeacon {
