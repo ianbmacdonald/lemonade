@@ -2,6 +2,7 @@
 #include "lemon_cli/model_selection.h"
 #include "lemon_cli/recipe_import.h"
 #include "lemon_cli/hf_pull.h"
+#include "lemon_cli/pull_labels.h"
 #include "lemon_cli/bench.h"
 #include "lemon_cli/chat_repl.h"
 #include <lemon_cli/agent_config_file.h>
@@ -49,19 +50,6 @@
 #endif
 
 #include "lemon/utils/aixlog.hpp"
-
-static const std::vector<std::string> VALID_LABELS = {
-    "chat",
-    "coding",
-    "dflash",
-    "embeddings",
-    "hot",
-    "mtp",
-    "reasoning",
-    "reranking",
-    "tool-calling",
-    "vision"
-};
 
 static const std::vector<std::string> SUPPORTED_AGENTS = {
     "claude",
@@ -1417,7 +1405,7 @@ int main(int argc, char* argv[]) {
         ->group("Manual Configuration Options")
         ->type_name("LABEL")
         ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll)
-        ->check(CLI::IsMember(VALID_LABELS));
+        ->check(CLI::IsMember(lemon_cli::pull_labels()));
     pull_cmd->add_option("--components", config.components,
         "Components for a user.* omni collection (use with --recipe collection.omni). "
         "Components must already be registered (built-in or previously pulled user.* models).")
