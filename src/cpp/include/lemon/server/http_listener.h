@@ -46,7 +46,7 @@ public:
     // the running listeners. Only what changed is restarted.
     void rebind();
 
-    // Starts or stops the LAN beacon listener to match config; safe to call repeatedly.
+    // Idempotent: start(), stop() and the config side-effect path all converge on config.
     void sync_beacon_listener();
     nlohmann::json beacon_listener_status() const { return beacon_listener_.status_json(); }
 
