@@ -225,6 +225,7 @@ public:
     json embeddings(const json& request);
     json reranking(const json& request);
     json classify(const json& request);
+    json classify_image(const json& params, std::string image_bytes);
     json get_slots();
     json slots_action(int slot_id, const std::string& action, const json& request_body);
     json tokenize(const json& request);
@@ -406,8 +407,11 @@ private:
     void record_request_telemetry_for_model(const ModelTelemetryIdentity& identity,
                                             const StreamingProxy::TelemetryData& telemetry);
 
+    // retry_after_watchdog_reset=false is for requests whose input may itself be
+    // what crashed the backend: replaying it would crash the fresh one too.
     template<typename Func>
-    auto execute_inference(const json& request, Func&& inference_func) -> decltype(inference_func(nullptr));
+    auto execute_inference(const json& request, Func&& inference_func,
+                           bool retry_after_watchdog_reset = true) -> decltype(inference_func(nullptr));
 
     template<typename Func>
     void execute_streaming(const std::string& request_body, httplib::DataSink& sink, Func&& streaming_func, std::shared_ptr<telemetry::InferenceSpan> span = nullptr);

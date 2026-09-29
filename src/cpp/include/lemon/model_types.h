@@ -56,7 +56,10 @@ enum class ModelType {
     TTS,
     AUDIO_GENERATION,  // text -> audio clip (music, sound effects)
     CLASSIFICATION,    // text -> {label: score} (router classifier models)
-    MESH               // image -> 3D mesh (glTF-binary)
+    MESH,              // image -> 3D mesh (glTF-binary)
+    // image -> ranked labels. Kept apart from CLASSIFICATION so image models never
+    // join the text-classifier pool the router's `classifier` condition reads.
+    IMAGE_CLASSIFICATION
 };
 
 // Bitmask pattern for models that use multiple devices
@@ -91,6 +94,7 @@ inline std::string model_type_to_string(ModelType type) {
         case ModelType::AUDIO_GENERATION: return "audio-generation";
         case ModelType::CLASSIFICATION: return "classification";
         case ModelType::MESH: return "mesh";
+        case ModelType::IMAGE_CLASSIFICATION: return "image-classification";
         default: return "unknown";
     }
 }
@@ -169,6 +173,10 @@ inline bool find_deployment_mode(const Labels& labels, ModelType& out) {
         }
         if (label == "3d") {
             out = ModelType::MESH;
+            return true;
+        }
+        if (label == "image-classification") {
+            out = ModelType::IMAGE_CLASSIFICATION;
             return true;
         }
     }
