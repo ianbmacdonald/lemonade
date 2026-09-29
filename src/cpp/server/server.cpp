@@ -26,6 +26,7 @@
 #include "lemon/utils/json_utils.h"
 #include "lemon/utils/model_name_utils.h"
 #include "lemon/utils/path_utils.h"
+#include "lemon/utils/process_memory.h"
 #include "lemon/utils/session_utils.h"
 #include "lemon/streaming_proxy.h"
 #include "lemon/logging_config.h"
@@ -2529,6 +2530,15 @@ void Server::ensure_collection_loaded(const ModelInfo& info) {
     }
 }
 
+static void add_memory_fields(nlohmann::json& obj, const lemon::utils::ProcessMemory& mem) {
+    if (mem.has_rss) {
+        obj["rss_mib"] = lemon::utils::to_mib(mem.rss_kib);
+    }
+    if (mem.has_anon) {
+        obj["anon_mib"] = lemon::utils::to_mib(mem.anon_kib);
+    }
+}
+
 void Server::handle_health(const httplib::Request& req, httplib::Response& res) {
     // For HEAD requests, just return 200 OK without processing
     if (req.method == "HEAD") {
@@ -2569,6 +2579,18 @@ void Server::handle_health(const httplib::Request& req, httplib::Response& res) 
 
     // Multi-model support: Add all loaded models
     response["all_models_loaded"] = router_->get_all_loaded_models();
+
+    // Sampled after the router lock is released: a backend evicted in the gap
+    // just loses its memory fields for this one response.
+    for (auto& model : response["all_models_loaded"]) {
+        const int pid = model.value("pid", 0);
+        if (pid > 0) {
+            add_memory_fields(model, lemon::utils::read_process_memory(pid));
+        }
+    }
+    nlohmann::json server_process = {{"pid", lemon::utils::current_process_id()}};
+    add_memory_fields(server_process, lemon::utils::read_self_memory());
+    response["server_process"] = server_process;
 
     // Add max model limits
     response["max_models"] = router_->get_max_model_limits();

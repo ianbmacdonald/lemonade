@@ -1504,6 +1504,11 @@ curl http://localhost:13305/v1/health
   "version":"9.3.3",
   "websocket_port":9000,
   "model_loaded": "Llama-3.2-1B-Instruct-Hybrid",
+  "server_process": {
+    "pid": 812,
+    "rss_mib": 41.7,
+    "anon_mib": 22.3
+  },
   "all_models_loaded": [
     {
       "model_name": "Llama-3.2-1B-Instruct-Hybrid",
@@ -1514,6 +1519,8 @@ curl http://localhost:13305/v1/health
       "pinned": true,
       "recipe": "ryzenai-llm",
       "pid": 12345,
+      "rss_mib": 1812.6,
+      "anon_mib": 402.9,
       "launch_command": [
         "~/.cache/lemonade/bin/ryzenai/npu/ryzenai-server.exe",
         "-m", "~/.cache/lemonade/models/Llama-3.2-1B-Instruct-Hybrid",
@@ -1534,6 +1541,8 @@ curl http://localhost:13305/v1/health
       "pinned": false,
       "recipe": "llamacpp",
       "pid": 12346,
+      "rss_mib": 164.2,
+      "anon_mib": 38.5,
       "launch_command": [
         "~/.cache/lemonade/bin/llamacpp/rocm-stable/llama-server.exe",
         "-m", "~/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1-GGUF/.../nomic-embed-text-v1.Q4_K_S.gguf",
@@ -1589,9 +1598,15 @@ curl http://localhost:13305/v1/health
   - `is_streaming` - Boolean indicating if the model is actively generating output tokens (true after first chunk arrives, false when all streaming requests complete)
   - `backend_url` - URL of the backend server process handling this model (useful for debugging)
   - `pid` - The Process ID (PID) of the backend engine handling this model
+  - `rss_mib` - *(optional)* Resident memory of the backend process in MiB (`VmRSS`, rounded to one decimal). This includes memory-mapped model weights and shared libraries, so pages shared between backends can be counted more than once. Linux only; a best-effort point-in-time sample that is omitted when it can't be read (for example on other platforms, for cloud models, or when the process has just exited). Only the direct backend process is measured, not its children.
+  - `anon_mib` - *(optional)* Private anonymous memory of the backend process in MiB (`RssAnon`, rounded to one decimal). This is the part of `rss_mib` that is not backed by files, which is closer to the memory the backend really costs. Same availability rules as `rss_mib`.
   - `launch_command` - *(optional)* The command used to start the backend engine, as an array with the program first and its arguments after it. Every local backend has one. Cloud models don't, because they don't start a program. The values shown are the ones actually used, so a `ctx_size` of `auto` appears here as a real number, and any flags Lemonade added on its own are included.
   - `recipe` - Backend/device recipe used to load the model (e.g., `"ryzenai-llm"`, `"llamacpp"`, `"flm"`)
   - `recipe_options` - Options used to load the model (e.g., `"ctx_size"`, `"llamacpp_backend"`, `"llamacpp_args"`, `"whispercpp_args"`)
+- `server_process` - The Lemonade Server process itself:
+  - `pid` - Process ID of the server
+  - `rss_mib` - *(optional)* Resident memory of the server in MiB, with the same meaning and availability as the per-model field
+  - `anon_mib` - *(optional)* Private anonymous memory of the server in MiB, with the same meaning and availability as the per-model field
 - `pinned_models` - Counts of pinned models currently loaded in memory per model type (e.g., `llm`, `embedding`, etc.)
 - `max_models` - Maximum number of models that can be loaded simultaneously per type (set via `max_loaded_models` in [Server Configuration](../guide/configuration/README.md)):
   - `llm` - Maximum LLM/chat models

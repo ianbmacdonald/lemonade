@@ -26,6 +26,7 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 import time
 import unittest
 import shutil
@@ -207,6 +208,25 @@ class EndpointTests(ServerTestBase):
         self.assertIn("pid", model_info)
         self.assertIsInstance(model_info["pid"], int)
         self.assertGreater(model_info["pid"], 0)
+
+    def _assert_memory_fields(self, info):
+        """Assert rss_mib/anon_mib are sane on Linux and absent elsewhere."""
+        if sys.platform.startswith("linux"):
+            self.assertIn("rss_mib", info)
+            self.assertIn("anon_mib", info)
+            self.assertIsInstance(info["rss_mib"], (int, float))
+            self.assertIsInstance(info["anon_mib"], (int, float))
+            self.assertGreater(info["rss_mib"], 0)
+            self.assertGreaterEqual(info["anon_mib"], 0)
+            self.assertLessEqual(info["anon_mib"], info["rss_mib"])
+        else:
+            self.assertNotIn("rss_mib", info)
+            self.assertNotIn("anon_mib", info)
+
+    def _assert_loaded_model_memory(self, model_info):
+        """Assert /health exposes the wrapped backend's memory on Linux."""
+        self.assertIsNotNone(model_info, "Model should appear in /health")
+        self._assert_memory_fields(model_info)
 
     def _assert_loaded_model_launch_command(self, model_info):
         """Assert /health exposes the command the wrapped backend was started with."""
@@ -407,6 +427,12 @@ class EndpointTests(ServerTestBase):
         self.assertIn("llm", max_models)
         self.assertIn("embedding", max_models)
         self.assertIn("reranking", max_models)
+
+        self.assertIn("server_process", data)
+        server_process = data["server_process"]
+        self.assertIsInstance(server_process["pid"], int)
+        self.assertGreater(server_process["pid"], 0)
+        self._assert_memory_fields(server_process)
 
         # telemetry should have enabled, and captures iff enabled is True
         self.assertIn("telemetry", data)
@@ -1086,6 +1112,7 @@ class EndpointTests(ServerTestBase):
         # Verify model is loaded via health endpoint and exposes backend PID
         loaded_model = self._get_loaded_model_info(ENDPOINT_TEST_MODEL)
         self._assert_loaded_model_pid(loaded_model)
+        self._assert_loaded_model_memory(loaded_model)
         self._assert_loaded_model_launch_command(loaded_model)
 
         print(f"[OK] Loaded model: {ENDPOINT_TEST_MODEL}")
