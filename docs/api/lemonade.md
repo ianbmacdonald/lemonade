@@ -21,6 +21,7 @@ We have designed a set of Lemonade-specific endpoints to enable client applicati
 | `POST` | [`/v1/unload`](#post-v1unload) | Unload a model |
 | `POST` | [`/v1/audio/generations`](#post-v1audiogenerations) | Generate audio (music or sound effects) from a text prompt |
 | `POST` | [`/v1/classify`](#post-v1classify) | Classify input text with an encoder classifier (label scores) |
+| `POST` | [`/v1/images/classify`](#post-v1imagesclassify) | Classify an image (JPEG or PNG) and return ranked labels |
 | `POST` | [`/v1/3d/generations`](#post-v13dgenerations) | Generate a textured 3D mesh (GLB) from an image |
 | `POST` | [`/v1/models/check-updates`](#post-v1modelscheck-updates) | Manually check downloaded models for upstream updates |
 | `GET` | [`/v1/models/{id}/files`](#get-v1modelsidfiles) | List resolved local file metadata for one model |
@@ -49,7 +50,7 @@ We have designed a set of Lemonade-specific endpoints to enable client applicati
 ## `POST /v1/classify`
 <sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
 
-Run an encoder text-classifier (PII, prompt-safety, domain, etc.) on an input string and return per-label scores in `[0, 1]`. The target model must use the `onnxruntime` recipe. Both sequence-classification (one label set) and token-classification (aggregated span labels) models are supported.
+Run an encoder text-classifier (PII, prompt-safety, domain, etc.) on an input string and return per-label scores in `[0, 1]`. The target model must use the `onnxruntime` or `tflite` recipe. Image-classification models are refused here with `400`; send images to [`/v1/images/classify`](#post-v1imagesclassify). Both sequence-classification (one label set) and token-classification (aggregated span labels) models are supported.
 
 **Supported architectures:** single-sequence encoder families — BERT, DistilBERT, RoBERTa, XLM-RoBERTa, DeBERTa (v1/v2), ELECTRA, ALBERT, CamemBERT. A stock `optimum-cli export onnx` directory of one of these works as-is.
 
@@ -68,7 +69,7 @@ The endpoint is available at:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `model` | string | yes* | Classifier model id (a model with the `onnxruntime` recipe). *Optional when a classification model is already loaded; the loaded model is used and echoed in the response. |
+| `model` | string | yes* | Classifier model id (a model with the `onnxruntime` or `tflite` recipe). *Optional when a classification model is already loaded; the loaded model is used and echoed in the response. |
 | `input` | string | yes | Text to classify. `text` is accepted as an alias. |
 | `top_k` | integer | no | Return only the highest-scoring `k` labels. |
 
@@ -96,6 +97,92 @@ curl -X POST http://localhost:13305/v1/classify   -H "Content-Type: application/
 Label names come from the model's `id2label` — from `config.json`, or from `manifest.json` when one is present to override it; some upstream models only declare generic `LABEL_<n>` names — see the model card for their meaning.
 
 Malformed requests (invalid JSON, missing `input`/`text`, non-string fields, non-positive `top_k`) return `400` with an `error` object before any model is loaded.
+
+## `POST /v1/images/classify`
+<sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
+
+Classify one image and return the top-scoring labels. The model must be labeled `image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` (0.2.0 or newer) subprocess on the CPU.
+
+The endpoint is available at:
+
+- `/v1/images/classify`
+- `/api/v1/images/classify`
+- `/v0/images/classify`
+- `/api/v0/images/classify`
+
+### Parameters
+
+The request is either `multipart/form-data` (the same shape as `/v1/images/edits`) or `application/json`.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `model` | string | yes* | Image-classification model id. *Optional when exactly one image-classification model is loaded. |
+| `image` | file or string | yes | Multipart: exactly one file part named `image` (or `file`). JSON: a base64 string, or a `data:image/jpeg;base64,...` / `data:image/png;base64,...` URL. Remote `http(s)` URLs are not fetched. |
+| `top_k` | integer | no | Number of labels to return, from 1 to 1,000,000. Default 5; the backend caps it at the model's label count. |
+
+Only JPEG and PNG are accepted. EXIF orientation is not applied.
+
+### Example requests
+
+```bash
+curl -X POST http://localhost:13305/v1/images/classify \
+  -F model=user.MobileNetV2-1.0-224-TFLite -F top_k=3 -F image=@grace_hopper.jpg
+```
+
+```bash
+curl -X POST http://localhost:13305/v1/images/classify \
+  -H "Content-Type: application/json" \
+  -d "{\"model\": \"user.MobileNetV2-1.0-224-TFLite\", \"top_k\": 3, \"image\": \"$(base64 -w0 grace_hopper.jpg)\"}"
+```
+
+### Response format
+
+```json
+{
+  "object": "image_classification",
+  "model": "user.MobileNetV2-1.0-224-TFLite",
+  "data": [
+    {"index": 653, "label": "military uniform", "score": 0.803491},
+    {"index": 440, "label": "bearskin", "score": 0.037449},
+    {"index": 668, "label": "mortarboard", "score": 0.017009}
+  ],
+  "labels": {"military uniform": 0.803491, "bearskin": 0.037449, "mortarboard": 0.017009},
+  "timings": {"decode_ms": 2.1, "preprocess_ms": 0.9, "inference_ms": 18.4}
+}
+```
+
+`data` is sorted by descending score and is authoritative. `labels` has the same shape as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` classes), so a repeated name keeps only its highest score there; use `data[].index` to tell classes apart. `timings` is passed through from the backend when it reports them.
+
+### Errors and limits
+
+| Status | When |
+|--------|------|
+| `400` | Malformed request: not multipart or JSON, zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG image, a bad `top_k`, a model that is not an image-classification model (`code: model_not_applicable`), or an image the backend cannot decode (corrupt or truncated, 12-bit or arithmetic-coded JPEG, too many pixels, decode memory budget exceeded). |
+| `411` | No `Content-Length` (for example a chunked upload). The request is refused before its body is read. |
+| `413` | `Content-Length` over 23 MiB (refused before the body is read), or a decoded image over 16 MiB (`code: payload_too_large`). |
+| `502` | The backend crashed while processing this image (`code: backend_crashed_on_input`). The request is not retried, because replaying the same input would crash the restarted backend too; the backend is restarted for the next request. |
+
+### Model directory
+
+An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the task and preprocessing:
+
+```json
+{
+  "task": "image-classification",
+  "labels_file": "labels.txt",
+  "score_normalization": "none",
+  "preprocess": {
+    "resize": "stretch",
+    "mean": [127.5, 127.5, 127.5],
+    "std": [127.5, 127.5, 127.5],
+    "channel_order": "RGB",
+    "layout": "auto"
+  },
+  "top_k_default": 5
+}
+```
+
+A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps serving `/v1/classify`. Loading fails with a message naming both layouts when a model's label and its directory disagree, and when the installed `tflite-server` is too old to report the image-classification task. The per-model `tflite_args` option passes flags such as `--max-image-pixels` through to `tflite-server`.
 
 ## Routing (`collection.router`)
 <sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
