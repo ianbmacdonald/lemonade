@@ -131,6 +131,12 @@ bool socket_bound(const json& st, const std::string& address) {
 
 int run_netns_tests() {
     std::puts("=== RUNNING BEACON LISTENER NETNS BROADCAST TESTS ===");
+
+    check(!lemon::beacon_arrival_accepted(true, 0, {2}),
+          "allow-list active, arrival interface unknown: rejected (fail closed)");
+    check(lemon::beacon_arrival_accepted(false, 0, {2}), "no allow-list, arrival interface unknown: accepted");
+    check(lemon::beacon_arrival_accepted(true, 2, {2}), "allow-list active, arrival on listened interface: accepted");
+    check(!lemon::beacon_arrival_accepted(true, 3, {2}), "allow-list active, arrival on other interface: rejected");
     if (!enter_private_netns()) return 0;
 
     NetworkBeacon nb;
@@ -197,6 +203,28 @@ int run_netns_tests() {
                        std::chrono::milliseconds(2000)),
               "changing the allow-list rebinds without a restart");
         check(!socket_bound(listener.status_json(), "10.213.0.255:13305"), "old interface is released");
+        check(listener.status_json().value("unmatched_interfaces", json()) == json::array(),
+              "a fully matched allow-list reports no unmatched interfaces");
+
+        listener.set_interface_allowlist({"lbt0", "nope0"});
+        check(wait_for([&] { return socket_bound(listener.status_json(), "10.213.0.255:13305"); },
+                       std::chrono::milliseconds(2000)),
+              "partially matched allow-list still listens on lbt0");
+        json partial = listener.status_json();
+        check(partial.value("unmatched_interfaces", json()) == json::array({"nope0"}),
+              "partially matched allow-list reports nope0 as unmatched");
+        check(partial["listening"] == true && partial["error"].is_null(),
+              "partially matched allow-list is listening without an error");
+
+        listener.set_interface_allowlist({"nope0", "nope1"});
+        check(wait_for([&] { return !listener.status_json().value("listening", true); },
+                       std::chrono::milliseconds(2000)),
+              "allow-list matching no interface is not listening");
+        json none = listener.status_json();
+        check(none.value("unmatched_interfaces", json()) == json::array({"nope0", "nope1"}),
+              "allow-list matching no interface reports every entry as unmatched");
+        check(none["error"].is_string() && none["error"].get<std::string>().find("nope0") != std::string::npos,
+              "allow-list matching no interface explains itself in error");
         listener.stop();
     }
 

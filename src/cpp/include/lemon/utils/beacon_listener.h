@@ -47,6 +47,10 @@ enum class IngestResult {
 
 const char* ingest_result_name(IngestResult result);
 
+// Whether a beacon that arrived on ifindex (0 = unknown) may be ingested.
+bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
+                             const std::vector<unsigned>& listened_ifindexes);
+
 struct HeardHost {
     std::string hostname;
     std::string url;
