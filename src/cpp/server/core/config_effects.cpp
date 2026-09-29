@@ -52,6 +52,10 @@ void ConfigEffects::apply(const std::string& key, const json& value) {
             LOG(INFO, "Server") << "Download rate limit disabled" << std::endl;
         }
         utils::HttpClient::set_download_rate_limit(bps);
+    } else if (key == "download_connections") {
+        const int connections = config.download_connections();
+        LOG(INFO, "Server") << "Download connections per file set to " << connections << std::endl;
+        utils::HttpClient::set_download_connections(connections);
     } else if (key == "allowed_origins") {
         LOG(INFO, "Server") << "Allowed origins updated: " << config.allowed_origins() << std::endl;
     } else if (key == "model_catalogs") {

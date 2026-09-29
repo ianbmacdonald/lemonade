@@ -3,6 +3,7 @@
 #include <lemon/utils/cancel_token.h>
 #include <lemon/utils/http_security_policy.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -97,6 +98,16 @@ struct DownloadOptions {
     // for non-LFS file ETags. SHA256 is used for LFS objects and release assets.
     std::string expected_hash;
     std::string expected_hash_algorithm;
+
+    // Opt in to splitting one large file across concurrent HTTP Range
+    // requests (see HttpClient::set_download_connections). Falls back to a
+    // single stream when the server ignores Range, the file is smaller than
+    // parallel_min_bytes, or a download rate limit is active.
+    bool allow_parallel = false;
+    size_t parallel_min_bytes = 64ULL * 1024 * 1024;
+    // Size hint from the caller's manifest; lets small files skip the
+    // range-support probe. 0 = unknown.
+    size_t expected_size = 0;
 };
 
 class HttpClient {
@@ -122,6 +133,18 @@ public:
 
     static int64_t get_download_rate_limit() {
         return download_rate_limit_bytes_per_second_.load();
+    }
+
+    // Concurrent Range requests per file for downloads that set
+    // DownloadOptions::allow_parallel. 1 = single stream.
+    static constexpr int kDefaultDownloadConnections = 8;
+    static constexpr int kMaxDownloadConnections = 32;
+    static void set_download_connections(int connections) {
+        download_connections_ = (std::max)(1, (std::min)(connections, kMaxDownloadConnections));
+    }
+
+    static int get_download_connections() {
+        return download_connections_.load();
     }
 
     // Simple GET request. timeout_seconds=0 (default) uses default_timeout_seconds_.
@@ -196,6 +219,11 @@ public:
                                         HttpSecurityPolicy policy = HttpSecurityPolicy::ExternalHttpsOnly,
                                         const CancelToken& cancel = CancelToken());
 
+    // Bytes of output_path + ".partial" that a resumed download_file will keep.
+    // Differs from the partial's file size while an interrupted parallel
+    // download has left out-of-order ranges past its contiguous prefix.
+    static size_t resumable_partial_bytes(const std::string& output_path);
+
     // Check if URL is reachable. Redirects are never followed.
     static bool is_reachable(
         const std::string& url,
@@ -205,6 +233,7 @@ public:
 private:
     static std::atomic<long> default_timeout_seconds_;
     static std::atomic<int64_t> download_rate_limit_bytes_per_second_;
+    static std::atomic<int> download_connections_;
 
     // Single download attempt, may resume from offset
     static DownloadResult download_attempt(const std::string& url,
@@ -216,6 +245,21 @@ private:
                                            bool initial_range_request,
                                            HttpSecurityPolicy policy,
                                            const CancelToken& cancel);
+
+    // One attempt over concurrent Range requests for bytes
+    // [resume_from, total_size) of the .partial file. Sets range_unsupported
+    // when a server answered a ranged request with the whole body.
+    static DownloadResult parallel_download_attempt(const std::string& url,
+                                                    const std::string& partial_path,
+                                                    size_t resume_from,
+                                                    size_t total_size,
+                                                    int connections,
+                                                    ProgressCallback callback,
+                                                    const std::map<std::string, std::string>& headers,
+                                                    const DownloadOptions& options,
+                                                    HttpSecurityPolicy policy,
+                                                    const CancelToken& cancel,
+                                                    bool& range_unsupported);
 };
 
 // Creates a throttled progress callback that prints at most once per second.
