@@ -10,7 +10,6 @@
 #include <nlohmann/json.hpp>
 
 #include "../telemetry.h"
-#include "lemon/image_classify_request.h"
 #include "lemon/runtime_config.h"
 #include "lemon/server/route_registry.h"
 #include "lemon/utils/origin_utils.h"
@@ -19,6 +18,12 @@
 namespace lemon {
 
 namespace {
+
+// httplib runs pre-routing, the handler and post-routing for one request on
+// one worker thread, and post-routing runs on every path that answers the
+// request, including body-read failures. So a slot taken in pre-routing is
+// released in post-routing even when the handler never runs.
+thread_local bool t_holds_image_classify_slot = false;
 
 // Parse a W3C Trace Context "traceparent" header per the spec grammar
 // (https://www.w3.org/TR/trace-context/): version "-" trace-id "-" parent-id
@@ -90,7 +95,11 @@ RequestMiddleware::RequestMiddleware(RuntimeConfig* config, const RouteRegistry*
 
 void RequestMiddleware::install(httplib::Server& server) {
     server.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        release_image_classify_slot();
         return pre_route(req, res);
+    });
+    server.set_post_routing_handler([this](const httplib::Request&, httplib::Response&) {
+        release_image_classify_slot();
     });
 
     server.set_default_headers({
@@ -182,29 +191,62 @@ httplib::Server::HandlerResponse RequestMiddleware::pre_route(const httplib::Req
     if (auth == httplib::Server::HandlerResponse::Handled) {
         return auth;
     }
-
-    // Runs before httplib reads the body, so an oversized upload is refused
-    // without lemond ever buffering it (httplib's own cap is 100 MB).
     if (req.method == "POST" && image_classify::is_image_classify_path(req.path)) {
-        const bool has_length = req.has_header("Content-Length");
-        const int status = image_classify::precheck_content_length(
-            has_length, has_length ? req.get_header_value_u64("Content-Length") : 0);
-        if (status != 0) {
-            res.status = status;
-            const bool too_large = status == 413;
-            nlohmann::json error = {{"error", {
-                {"message", too_large
-                    ? "Request body exceeds " +
-                          std::to_string(image_classify::kMaxImageClassifyRequestBytes /
-                                         (1024 * 1024)) + " MiB"
-                    : std::string("Content-Length required")},
-                {"type", "invalid_request_error"},
-                {"code", too_large ? "payload_too_large" : "length_required"}}}};
-            res.set_content(error.dump(), "application/json");
-            return httplib::Server::HandlerResponse::Handled;
-        }
+        return precheck_image_classify(req, res);
     }
     return auth;
+}
+
+void RequestMiddleware::release_image_classify_slot() {
+    if (t_holds_image_classify_slot) {
+        t_holds_image_classify_slot = false;
+        image_classify_inflight_.release();
+    }
+}
+
+// Runs before httplib reads the body, so an oversized upload is refused without
+// lemond ever buffering it (httplib's own cap is 100 MB).
+httplib::Server::HandlerResponse RequestMiddleware::precheck_image_classify(
+    const httplib::Request& req, httplib::Response& res) {
+    const bool has_length = req.has_header("Content-Length");
+    const int status = image_classify::precheck_request_headers(
+        has_length, has_length ? req.get_header_value_u64("Content-Length") : 0,
+        req.has_header("Transfer-Encoding"), req.has_header("Content-Encoding"));
+    if (status != 0) {
+        std::string message;
+        std::string code;
+        if (status == 413) {
+            message = "Request body exceeds " +
+                      std::to_string(image_classify::kMaxImageClassifyRequestBytes /
+                                     (1024 * 1024)) + " MiB";
+            code = "payload_too_large";
+        } else if (status == 415) {
+            message = "Content-Encoding is not supported on this route";
+            code = "unsupported_content_encoding";
+        } else {
+            message = "Content-Length required (Transfer-Encoding is not supported on this route)";
+            code = "length_required";
+        }
+        res.status = status;
+        nlohmann::json error = {{"error", {
+            {"message", message},
+            {"type", "invalid_request_error"},
+            {"code", code}}}};
+        res.set_content(error.dump(), "application/json");
+        return httplib::Server::HandlerResponse::Handled;
+    }
+    if (!image_classify_inflight_.try_acquire()) {
+        res.status = 503;
+        res.set_header("Retry-After", "1");
+        nlohmann::json error = {{"error", {
+            {"message", "Too many image classification requests in flight; retry shortly"},
+            {"type", "server_busy"},
+            {"code", "server_busy"}}}};
+        res.set_content(error.dump(), "application/json");
+        return httplib::Server::HandlerResponse::Handled;
+    }
+    t_holds_image_classify_slot = true;
+    return httplib::Server::HandlerResponse::Unhandled;
 }
 
 httplib::Server::HandlerResponse RequestMiddleware::authenticate(const httplib::Request& req,

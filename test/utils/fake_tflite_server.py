@@ -9,6 +9,8 @@ task=image-classification, and serves POST /classify/image:
 
 - a body containing POISON crashes the process with SIGSEGV, which is how the
   non-replay test proves lemond does not resend a crashing input;
+- a body containing SLOW is answered after SLOW_SECONDS, which lets the
+  in-flight cap test hold requests open;
 - a PNG whose IHDR claims more than --max-image-pixels pixels, or whose data
   is truncated, gets 400 like the real decoder;
 - anything else gets a fixed ranked prediction list.
@@ -23,11 +25,14 @@ import os
 import signal
 import struct
 import sys
+import time
 from email.parser import BytesParser
 from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 POISON = b"B169-POISON-IMAGE"
+SLOW = b"B169-SLOW-IMAGE"
+SLOW_SECONDS = 4
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -108,6 +113,8 @@ def make_handler(args):
             if POISON in image:
                 _log("crashes.log", str(os.getpid()))
                 os.kill(os.getpid(), signal.SIGSEGV)
+            if SLOW in image:
+                time.sleep(SLOW_SECONDS)
             if image.startswith(PNG_SIGNATURE):
                 problem = _png_problem(image, args.max_image_pixels)
                 if problem:
