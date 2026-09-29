@@ -6,6 +6,7 @@
 #include <optional>
 #include "lemon/collection_orchestrator.h"
 #include "lemon/hf_variants.h"
+#include "lemon/image_classify_request.h"
 #include "lemon/model_registry.h"
 #include "lemon/route_decision_response.h"
 #include "lemon/routing_classifier_services.h"
@@ -233,6 +234,40 @@ int get_http_status_from_error(const std::string& error_code) {
         return 404;
     }
 }
+
+// Order matters: forward_multipart_request nests the backend's status under
+// error.details, so that is the fallback after a top-level status_code.
+int http_status_for_backend_error(const nlohmann::json& err) {
+    if (err.contains("status_code") && err["status_code"].is_number_integer()) {
+        return err["status_code"].get<int>();
+    }
+    if (err.contains("details") && err["details"].is_object() &&
+        err["details"].contains("status_code") &&
+        err["details"]["status_code"].is_number_integer()) {
+        return err["details"]["status_code"].get<int>();
+    }
+    if (err.contains("code") && err["code"].is_string()) {
+        return get_http_status_from_error(err["code"].get<std::string>());
+    }
+    if (err.contains("type") && err["type"].is_string()) {
+        // LemonException::to_json carries only {message, type}.
+        const std::string type = err["type"].get<std::string>();
+        if (type == "invalid_request" || type == "invalid_request_error" ||
+            type == "unsupported_operation") {
+            return 400;
+        }
+        if (type == "model_not_loaded") {
+            return 404;
+        }
+    }
+    return 500;
+}
+
+// httplib runs pre-routing, the handler and post-routing for one request on
+// one worker thread, and post-routing runs on every path that answers the
+// request, including body-read failures. So a slot taken in pre-routing is
+// released in post-routing even when the handler never runs.
+thread_local bool t_holds_image_classify_slot = false;
 
 bool is_quiet_polling_path(const std::string& path) {
     return path == "/api/v0/downloads" || path == "/api/v1/downloads" ||
@@ -1034,7 +1069,18 @@ httplib::Server::HandlerResponse Server::authenticate_request(const httplib::Req
 
 void Server::setup_routes(httplib::Server &web_server) {
     // Add pre-routing handler to log ALL incoming requests (except health checks)
+    web_server.set_post_routing_handler([this](const httplib::Request&, httplib::Response&) {
+        if (t_holds_image_classify_slot) {
+            t_holds_image_classify_slot = false;
+            image_classify_inflight_.release();
+        }
+    });
+
     web_server.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        if (t_holds_image_classify_slot) {
+            t_holds_image_classify_slot = false;
+            image_classify_inflight_.release();
+        }
         this->log_request(req);
 
         // Unconditionally set Vary: Origin to prevent caching issues, preserving existing values
@@ -1071,7 +1117,54 @@ void Server::setup_routes(httplib::Server &web_server) {
             }
         }
 
-        return authenticate_request(req, res);
+        const auto auth = authenticate_request(req, res);
+        if (auth == httplib::Server::HandlerResponse::Handled) {
+            return auth;
+        }
+
+        // Runs before httplib reads the body, so an oversized upload is refused
+        // without lemond ever buffering it (httplib's own cap is 100 MB).
+        if (req.method == "POST" && image_classify::is_image_classify_path(req.path)) {
+            const bool has_length = req.has_header("Content-Length");
+            const int status = image_classify::precheck_request_headers(
+                has_length, has_length ? req.get_header_value_u64("Content-Length") : 0,
+                req.has_header("Transfer-Encoding"), req.has_header("Content-Encoding"));
+            if (status != 0) {
+                std::string message;
+                std::string code;
+                if (status == 413) {
+                    message = "Request body exceeds " +
+                              std::to_string(image_classify::kMaxImageClassifyRequestBytes /
+                                             (1024 * 1024)) + " MiB";
+                    code = "payload_too_large";
+                } else if (status == 415) {
+                    message = "Content-Encoding is not supported on this route";
+                    code = "unsupported_content_encoding";
+                } else {
+                    message = "Content-Length required (Transfer-Encoding is not supported on this route)";
+                    code = "length_required";
+                }
+                res.status = status;
+                nlohmann::json error = {{"error", {
+                    {"message", message},
+                    {"type", "invalid_request_error"},
+                    {"code", code}}}};
+                res.set_content(error.dump(), "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            if (!image_classify_inflight_.try_acquire()) {
+                res.status = 503;
+                res.set_header("Retry-After", "1");
+                nlohmann::json error = {{"error", {
+                    {"message", "Too many image classification requests in flight; retry shortly"},
+                    {"type", "server_busy"},
+                    {"code", "server_busy"}}}};
+                res.set_content(error.dump(), "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            t_holds_image_classify_slot = true;
+        }
+        return auth;
     });
 
     web_server.Get("/live", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1267,6 +1360,9 @@ void Server::setup_routes(httplib::Server &web_server) {
     });
     register_post("images/upscale", [this](const httplib::Request& req, httplib::Response& res) {
         handle_image_upscale(req, res);
+    });
+    register_post("images/classify", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_image_classify(req, res);
     });
     // Generative-audio endpoint: text -> audio clip (music, sound effects)
     register_post("audio/generations", [this](const httplib::Request& req, httplib::Response& res) {
@@ -4414,6 +4510,19 @@ void Server::handle_classify(const httplib::Request& req, httplib::Response& res
         if (request_json.contains("model") && request_json["model"].is_string()) {
             requested_model = request_json["model"].get<std::string>();
         }
+        if (!requested_model.empty()) {
+            if (auto info = router_->try_get_model_info(requested_model);
+                info && info->type == ModelType::IMAGE_CLASSIFICATION) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", {
+                    {"message", "model '" + requested_model +
+                        "' is an image-classification model; POST /v1/images/classify"},
+                    {"type", "invalid_request_error"},
+                    {"code", "model_not_applicable"}}}}.dump(),
+                    "application/json");
+                return;
+            }
+        }
         auto span = telemetry::TelemetryTracker::start_span("CLASSIFIER", "classify", requested_model, request_json);
 
         // Handle model loading/switching using helper function
@@ -4461,25 +4570,7 @@ void Server::handle_classify(const httplib::Request& req, httplib::Response& res
 
         auto response = router_->classify(request_json);
         if (response.contains("error") && response["error"].is_object()) {
-            const auto& err = response["error"];
-            if (err.contains("status_code") && err["status_code"].is_number_integer()) {
-                res.status = err["status_code"].get<int>();
-            } else if (err.contains("code") && err["code"].is_string()) {
-                res.status = get_http_status_from_error(err["code"].get<std::string>());
-            } else if (err.contains("type") && err["type"].is_string()) {
-                // LemonException::to_json carries only {message, type}.
-                const std::string type = err["type"].get<std::string>();
-                if (type == "invalid_request" || type == "invalid_request_error" ||
-                    type == "unsupported_operation") {
-                    res.status = 400;
-                } else if (type == "model_not_loaded") {
-                    res.status = 404;
-                } else {
-                    res.status = 500;
-                }
-            } else {
-                res.status = 500;
-            }
+            res.status = http_status_for_backend_error(response["error"]);
             res.set_content(response.dump(), "application/json");
             return;
         }
@@ -4505,6 +4596,166 @@ void Server::handle_classify(const httplib::Request& req, httplib::Response& res
         LOG(ERROR, "Server") << "ERROR in handle_classify: " << e.what() << std::endl;
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
+        res.set_content(error.dump(), "application/json");
+    }
+}
+
+void Server::handle_image_classify(const httplib::Request& req, httplib::Response& res) {
+    auto send_error = [&res](int status, const std::string& message, const std::string& code = "") {
+        res.status = status;
+        nlohmann::json error = {{"error", {
+            {"message", message},
+            {"type", "invalid_request_error"}}}};
+        if (!code.empty()) error["error"]["code"] = code;
+        res.set_content(error.dump(), "application/json");
+    };
+
+    auto send_if_paused = [this, &res](const std::string& model) {
+        auto paused = router_->image_classify_cooldown_error(model);
+        if (!paused) return false;
+        res.status = 503;
+        res.set_header("Retry-After",
+                       std::to_string((*paused)["error"]["retry_after"].get<long long>()));
+        res.set_content(paused->dump(), "application/json");
+        return true;
+    };
+
+    try {
+        std::uint64_t received = req.body.size();
+        for (const auto& [name, field] : req.form.fields) received += name.size() + field.content.size();
+        for (const auto& [name, file] : req.form.files) received += name.size() + file.content.size();
+        if (received > image_classify::kMaxImageClassifyRequestBytes) {
+            send_error(413, "Request body exceeds " +
+                                std::to_string(image_classify::kMaxImageClassifyRequestBytes /
+                                               (1024 * 1024)) + " MiB",
+                       "payload_too_large");
+            return;
+        }
+
+        image_classify::ParsedRequest parsed;
+        if (req.is_multipart_form_data()) {
+            std::optional<std::string> model;
+            std::optional<std::string> top_k;
+            if (req.form.has_field("model")) model = req.form.get_field("model");
+            if (req.form.has_field("top_k")) top_k = req.form.get_field("top_k");
+            std::vector<std::string_view> parts;
+            for (const auto& [name, file] : req.form.files) {
+                if (name == "image" || name == "file") parts.emplace_back(file.content);
+            }
+            parsed = image_classify::from_form(model, top_k, parts);
+        } else {
+            const std::string content_type = req.get_header_value("Content-Type");
+            if (!content_type.empty() &&
+                content_type.find("application/json") == std::string::npos) {
+                send_error(400, "Content-Type must be multipart/form-data or application/json");
+                return;
+            }
+            parsed = image_classify::parse_json(req.body);
+        }
+        if (!parsed.ok()) {
+            send_error(parsed.status, parsed.error,
+                       parsed.status == 413 ? "payload_too_large" : "");
+            return;
+        }
+
+        nlohmann::json params = std::move(parsed.params);
+        normalize_client_model_name(params);
+        normalize_and_resolve_request_model(params);
+
+        std::string requested_model;
+        if (params.contains("model") && params["model"].is_string()) {
+            requested_model = params["model"].get<std::string>();
+        }
+
+        if (!requested_model.empty()) {
+            if (auto info = router_->try_get_model_info(requested_model);
+                info && info->type != ModelType::IMAGE_CLASSIFICATION) {
+                send_error(400, "model '" + requested_model +
+                                    "' is not an image-classification model",
+                           "model_not_applicable");
+                return;
+            }
+            if (send_if_paused(requested_model)) return;
+            try {
+                auto_load_model_if_needed(requested_model, extract_auto_load_options(params));
+            } catch (const std::exception& e) {
+                LOG(ERROR, "Server") << "Failed to load image-classification model: "
+                                     << e.what() << std::endl;
+                auto error_response = create_model_error(requested_model, e.what());
+                res.status = get_http_status_from_error(
+                    error_response["error"]["code"].get<std::string>());
+                res.set_content(error_response.dump(), "application/json");
+                return;
+            }
+        } else {
+            requested_model = router_->get_sole_loaded_model_of_type(
+                ModelType::IMAGE_CLASSIFICATION, /*include_dead_backends=*/true);
+            if (requested_model.empty()) {
+                send_error(400, "No 'model' specified and no single image-classification model "
+                                "is loaded (load one, or name it in the request)");
+                return;
+            }
+            if (send_if_paused(requested_model)) return;
+            params["model"] = requested_model;
+        }
+
+        auto response = router_->classify_image(params, std::move(parsed.bytes));
+        if (response.contains("error") && response["error"].is_object()) {
+            res.status = http_status_for_backend_error(response["error"]);
+            if (response["error"].contains("retry_after") &&
+                response["error"]["retry_after"].is_number_integer()) {
+                res.set_header("Retry-After",
+                               std::to_string(response["error"]["retry_after"].get<long long>()));
+            }
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        // The envelope is the public contract, not the backend's raw body.
+        if (!response.contains("predictions") || !response["predictions"].is_array()) {
+            res.status = 500;
+            nlohmann::json error = {{"error", {
+                {"message", "backend returned malformed image classification"},
+                {"type", "classification_error"}}}};
+            res.set_content(error.dump(), "application/json");
+            return;
+        }
+        nlohmann::json data = nlohmann::json::array();
+        nlohmann::json labels = nlohmann::json::object();
+        for (const auto& p : response["predictions"]) {
+            if (!p.is_object() || !p.contains("index") || !p["index"].is_number_integer() ||
+                !p.contains("score") || !p["score"].is_number()) {
+                res.status = 500;
+                nlohmann::json error = {{"error", {
+                    {"message", "backend returned malformed image classification"},
+                    {"type", "classification_error"}}}};
+                res.set_content(error.dump(), "application/json");
+                return;
+            }
+            const std::string label = p.contains("label") && p["label"].is_string()
+                                          ? p["label"].get<std::string>()
+                                          : std::to_string(p["index"].get<long long>());
+            data.push_back({{"index", p["index"]}, {"label", label}, {"score", p["score"]}});
+            // Duplicate class names keep the first (highest) score; data[] is authoritative.
+            if (!labels.contains(label)) labels[label] = p["score"];
+        }
+        nlohmann::json enveloped = {
+            {"object", "image_classification"},
+            {"model", requested_model},
+            {"data", std::move(data)},
+            {"labels", std::move(labels)},
+        };
+        if (response.contains("timings") && response["timings"].is_object()) {
+            enveloped["timings"] = response["timings"];
+        }
+        res.set_content(enveloped.dump(), "application/json");
+
+    } catch (const std::exception& e) {
+        LOG(ERROR, "Server") << "ERROR in handle_image_classify: " << e.what() << std::endl;
+        res.status = 500;
+        nlohmann::json error = {{"error", {
+            {"message", e.what()},
+            {"type", "internal_error"}}}};
         res.set_content(error.dump(), "application/json");
     }
 }

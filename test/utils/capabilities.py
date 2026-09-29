@@ -262,6 +262,17 @@ CAPABILITIES = {
             },
         },
     },
+    "image_classification": {
+        "tflite": {
+            "backends": ["system"],
+            "supports": {
+                "image_classify": True,
+            },
+            "test_models": {
+                "image_classification": "user.MobileNetV2-1.0-224-TFLite",
+            },
+        },
+    },
     "tts": {
         "openmoss": {
             "backends": ["vulkan", "cuda"],

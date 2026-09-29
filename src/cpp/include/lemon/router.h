@@ -16,6 +16,7 @@
 #include <optional>
 #include <nlohmann/json.hpp>
 #include <httplib.h>
+#include "crash_breaker.h"
 #include "wrapped_server.h"
 #include "model_residency.h"
 #include "model_manager.h"
@@ -190,7 +191,9 @@ public:
     // The single live model of this type, or "" when none or more than one is
     // loaded. Endpoints that let the caller omit "model" use this so an
     // ambiguous choice is refused rather than silently resolved.
-    std::string get_sole_loaded_model_of_type(ModelType type) const;
+    // include_dead_backends also counts a model whose backend has exited; the
+    // request that uses it then reloads it.
+    std::string get_sole_loaded_model_of_type(ModelType type, bool include_dead_backends = false) const;
 
     json get_all_loaded_models() const;
 
@@ -225,6 +228,11 @@ public:
     json embeddings(const json& request);
     json reranking(const json& request);
     json classify(const json& request);
+    json classify_image(const json& params, std::string image_bytes);
+    // The 503 error to return while image classification for this model is
+    // paused after repeated backend crashes; checked before any auto-load so a
+    // paused model is not reloaded either.
+    std::optional<json> image_classify_cooldown_error(const std::string& model_name);
     json get_slots();
     json slots_action(int slot_id, const std::string& action, const json& request_body);
     json tokenize(const json& request);
@@ -304,6 +312,7 @@ private:
 
     // Concurrency control for load operations
     mutable std::mutex load_mutex_;              // Protects loading state and loaded_servers_
+    CrashBreaker image_crash_breaker_{3, std::chrono::seconds(60), std::chrono::seconds(60)};
     bool is_loading_ = false;                    // True when a load operation is in progress
     std::condition_variable load_cv_;            // Signals when load completes
 
@@ -406,8 +415,12 @@ private:
     void record_request_telemetry_for_model(const ModelTelemetryIdentity& identity,
                                             const StreamingProxy::TelemetryData& telemetry);
 
+    // retry_after_watchdog_reset=false is for requests whose input may itself be
+    // what crashed the backend: replaying it would crash the fresh one too, so
+    // the reload is also left to the next request.
     template<typename Func>
-    auto execute_inference(const json& request, Func&& inference_func) -> decltype(inference_func(nullptr));
+    auto execute_inference(const json& request, Func&& inference_func,
+                           bool retry_after_watchdog_reset = true) -> decltype(inference_func(nullptr));
 
     template<typename Func>
     void execute_streaming(const std::string& request_body, httplib::DataSink& sink, Func&& streaming_func, std::shared_ptr<telemetry::InferenceSpan> span = nullptr);

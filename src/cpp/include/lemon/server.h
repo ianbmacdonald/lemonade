@@ -26,6 +26,7 @@
 #include "model_manager.h"
 #include "backend_manager.h"
 #include "cloud_provider_registry.h"
+#include "image_classify_request.h"
 #include "upgradable_http_server.h"
 #include "websocket_server.h"
 #include "lemon/utils/beacon_listener.h"
@@ -175,6 +176,9 @@ private:
     void handle_embeddings(const httplib::Request& req, httplib::Response& res);
     void handle_reranking(const httplib::Request& req, httplib::Response& res);
     void handle_classify(const httplib::Request& req, httplib::Response& res);
+    void handle_image_classify(const httplib::Request& req, httplib::Response& res);
+    image_classify::InflightLimiter image_classify_inflight_{
+        image_classify::kMaxConcurrentImageClassify};
     void handle_slots(const httplib::Request& req, httplib::Response& res);
     void handle_slots_by_id(const httplib::Request& req, httplib::Response& res);
     void handle_tokenize(const httplib::Request& req, httplib::Response& res);

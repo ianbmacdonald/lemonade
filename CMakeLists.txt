@@ -1013,6 +1013,7 @@ set(SOURCES_CORE
     src/cpp/server/model_manager.cpp
     src/cpp/server/model_registry.cpp
     src/cpp/server/hf_variants.cpp
+    src/cpp/server/image_classify_request.cpp
     src/cpp/server/wrapped_server.cpp
     src/cpp/server/streaming_proxy.cpp
     src/cpp/server/system_info.cpp
@@ -2543,6 +2544,44 @@ if(BUILD_TESTING AND EXISTS "${_MODEL_TYPE_CLASSIFIER_TEST_SRC}")
 
     include(CTest)
     add_cpp_ci_test(ModelTypeClassifierTest CI ON COMMAND test_model_type_classifier)
+endif()
+
+# Request parsing and size limits for POST /v1/images/classify. Pure functions,
+# so the test compiles the one source it needs.
+set(_IMAGE_CLASSIFY_REQUEST_TEST_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_image_classify_request.cpp"
+)
+if(BUILD_TESTING AND EXISTS "${_IMAGE_CLASSIFY_REQUEST_TEST_SRC}")
+    add_executable(test_image_classify_request
+        test/cpp/test_image_classify_request.cpp
+        src/cpp/server/image_classify_request.cpp
+    )
+    target_include_directories(test_image_classify_request PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
+    )
+    target_link_libraries(test_image_classify_request PRIVATE nlohmann_json::nlohmann_json)
+
+    include(CTest)
+    add_cpp_ci_test(ImageClassifyRequestTest CI ON COMMAND test_image_classify_request)
+endif()
+
+# tflite model-directory layout detection (text vs image classifier).
+set(_TFLITE_LAYOUT_TEST_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_tflite_layout.cpp"
+)
+if(BUILD_TESTING AND EXISTS "${_TFLITE_LAYOUT_TEST_SRC}")
+    add_executable(test_tflite_layout
+        test/cpp/test_tflite_layout.cpp
+    )
+    target_include_directories(test_tflite_layout PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include
+    )
+    target_link_libraries(test_tflite_layout PRIVATE lemonade-server-core)
+    add_dependencies(test_tflite_layout copy_resources)
+
+    include(CTest)
+    add_cpp_ci_test(TfliteLayoutTest CI ON COMMAND test_tflite_layout)
 endif()
 
 set(_DOCS_ENDPOINT_TEST_SRC

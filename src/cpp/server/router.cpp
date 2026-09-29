@@ -1275,14 +1275,15 @@ std::string Router::get_loaded_recipe() const {
     return server->get_recipe_options().get_recipe();
 }
 
-std::string Router::get_sole_loaded_model_of_type(ModelType type) const {
+std::string Router::get_sole_loaded_model_of_type(ModelType type, bool include_dead_backends) const {
     std::lock_guard<std::mutex> lock(load_mutex_);
 
     WrappedServer* standard_match = nullptr;
     WrappedServer* helper_match = nullptr;
     bool helper_ambiguous = false;
     for (const auto& server : loaded_servers_) {
-        if (!server->is_backend_alive() || server->get_model_type() != type) {
+        if ((!include_dead_backends && !server->is_backend_alive()) ||
+            server->get_model_type() != type) {
             continue;
         }
         if (server->get_residency_class() == ResidencyClass::Standard) {
@@ -1387,7 +1388,8 @@ json Router::get_max_model_limits() const {
         {"transcription", max},
         {"image", max},
         {"tts", max},
-        {"classification", max}
+        {"classification", max},
+        {"image-classification", max}
     };
 }
 
@@ -1514,7 +1516,8 @@ std::string Router::get_streaming_transcription_address(const std::string& model
 }
 
 template<typename Func>
-auto Router::execute_inference(const json& request, Func&& inference_func) -> decltype(inference_func(nullptr)) {
+auto Router::execute_inference(const json& request, Func&& inference_func,
+                               bool retry_after_watchdog_reset) -> decltype(inference_func(nullptr)) {
     std::string requested_model;
     if (request.contains("model") && request["model"].is_string()) {
         requested_model = request["model"].get<std::string>();
@@ -1589,6 +1592,16 @@ auto Router::execute_inference(const json& request, Func&& inference_func) -> de
             }
 
             server->release_inference();
+
+            if (watchdog_reset && !retry_after_watchdog_reset) {
+                return json{{"error", {
+                    {"message", "The backend for model '" + requested_model +
+                                    "' crashed while processing this input; it was not retried"},
+                    {"type", ErrorType::BACKEND_ERROR},
+                    {"code", "backend_crashed_on_input"},
+                    {"status_code", 502},
+                    {"retryable", false}}}};
+            }
 
             if (attempt == 0 && watchdog_reset) {
                 if (restart_model_name.empty()) {
@@ -2087,6 +2100,74 @@ json Router::classify(const json& request) {
                 span->end_with_error(error_msg);
             } else {
                 // Label scores classify user content; keep them out of telemetry.
+                span->end_with_success(nlohmann::json::object(), "");
+            }
+        }
+        return response;
+    } catch (const std::exception& e) {
+        if (span) span->end_with_error(e.what());
+        throw;
+    }
+}
+
+std::optional<json> Router::image_classify_cooldown_error(const std::string& model_name) {
+    const long long wait = image_crash_breaker_.blocked_seconds(
+        resolve_model_name(model_name), CrashBreaker::Clock::now());
+    if (wait == 0) {
+        return std::nullopt;
+    }
+    return json{{"error", {
+        {"message", "The backend for model '" + model_name +
+                        "' crashed repeatedly on recent inputs; image classification is paused"},
+        {"type", ErrorType::BACKEND_ERROR},
+        {"code", "backend_crash_cooldown"},
+        {"status_code", 503},
+        {"retry_after", wait},
+        {"retryable", true}}}};
+}
+
+json Router::classify_image(const json& params, std::string image_bytes) {
+    std::string requested_model = params.value("model", "");
+    if (auto paused = image_classify_cooldown_error(requested_model)) {
+        return *paused;
+    }
+    std::shared_ptr<telemetry::InferenceSpan> span = telemetry::TelemetryTracker::start_span(
+        "CLASSIFIER", "image_classify", requested_model, params);
+
+    try {
+        json response = execute_inference(params, [&](WrappedServer* server) {
+            ModelTelemetryIdentity identity = get_telemetry_identity(server);
+            if (span) {
+                span->set_attribute("classifier.backend", identity.recipe);
+                span->set_attribute("classifier.device_type", identity.device);
+                span->set_attribute("classifier.checkpoint", identity.checkpoint);
+                span->set_attribute("classifier.recipe", identity.recipe);
+            }
+            auto image_server = dynamic_cast<IImageClassificationServer*>(server);
+            if (!image_server) {
+                return ErrorResponse::from_exception(UnsupportedOperationException(
+                    "Image classification", device_type_to_string(server->get_device_type())));
+            }
+            // Runs at most once: retry is disabled below, so the bytes can move.
+            return image_server->classify_image(params, std::move(image_bytes));
+        }, /*retry_after_watchdog_reset=*/false);
+
+        if (response.contains("error") && response["error"].is_object() &&
+            response["error"].value("code", "") == "backend_crashed_on_input" &&
+            image_crash_breaker_.record_crash(resolve_model_name(requested_model),
+                                              CrashBreaker::Clock::now())) {
+            LOG(WARNING, "Router") << "Image classification for '" << requested_model
+                                   << "' paused after repeated backend crashes" << std::endl;
+        }
+
+        if (span) {
+            if (response.contains("error")) {
+                std::string error_msg = "Request failed";
+                if (response["error"].contains("message") && response["error"]["message"].is_string()) {
+                    error_msg = response["error"]["message"].get<std::string>();
+                }
+                span->end_with_error(error_msg);
+            } else {
                 span->end_with_success(nlohmann::json::object(), "");
             }
         }
@@ -2942,7 +3023,8 @@ json Router::get_pinned_model_counts() const {
         {"transcription", count_pinned_servers_in_pool(ModelType::TRANSCRIPTION, ResidencyClass::Standard)},
         {"image", count_pinned_servers_in_pool(ModelType::IMAGE, ResidencyClass::Standard)},
         {"tts", count_pinned_servers_in_pool(ModelType::TTS, ResidencyClass::Standard)},
-        {"classification", count_pinned_servers_in_pool(ModelType::CLASSIFICATION, ResidencyClass::Standard)}
+        {"classification", count_pinned_servers_in_pool(ModelType::CLASSIFICATION, ResidencyClass::Standard)},
+        {"image-classification", count_pinned_servers_in_pool(ModelType::IMAGE_CLASSIFICATION, ResidencyClass::Standard)}
     };
 }
 
@@ -2955,7 +3037,8 @@ json Router::get_pinned_helper_counts() const {
         {"transcription", count_pinned_servers_in_pool(ModelType::TRANSCRIPTION, ResidencyClass::RoutingHelper)},
         {"image", count_pinned_servers_in_pool(ModelType::IMAGE, ResidencyClass::RoutingHelper)},
         {"tts", count_pinned_servers_in_pool(ModelType::TTS, ResidencyClass::RoutingHelper)},
-        {"classification", count_pinned_servers_in_pool(ModelType::CLASSIFICATION, ResidencyClass::RoutingHelper)}
+        {"classification", count_pinned_servers_in_pool(ModelType::CLASSIFICATION, ResidencyClass::RoutingHelper)},
+        {"image-classification", count_pinned_servers_in_pool(ModelType::IMAGE_CLASSIFICATION, ResidencyClass::RoutingHelper)}
     };
 }
 

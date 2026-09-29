@@ -41,6 +41,7 @@ const std::vector<std::pair<uint32_t, std::string>> kModeInterfaces = {
     {lemon::CAP_IMAGE, "image"},
     {lemon::CAP_AUDIO_GENERATION, "audio-generation"},
     {lemon::CAP_MODEL_3D, "3d"},
+    {lemon::CAP_IMAGE_CLASSIFICATION, "image-classification"},
 };
 
 // Capabilities that name no deployment mode, so kModeInterfaces omits them by
@@ -248,6 +249,10 @@ int main() {
         // onnxruntime is the backend that does serve classification.
         {"onnxruntime + classification", "onnxruntime", {"classification"}, true,
          {"classification"}, ModelType::CLASSIFICATION},
+        {"tflite + image-classification", "tflite", {"image-classification"}, true,
+         {"image-classification"}, ModelType::IMAGE_CLASSIFICATION},
+        {"onnxruntime + image-classification", "onnxruntime", {"image-classification"},
+         false, {}, {}},
         // Aliases of one mode are one claim, not two.
         {"llamacpp + embedding alias", "llamacpp", {"embedding", "embeddings"}, true,
          {"embedding", "embeddings"}, ModelType::EMBEDDING},
