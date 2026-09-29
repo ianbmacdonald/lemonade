@@ -179,6 +179,15 @@ public:
 
     void handle(RouteRequest& req, httplib::Response& res) override {
         const httplib::Request& http = req.http;
+        auto send_if_paused = [this, &res](const std::string& model) {
+            auto paused = ctx_.router->image_classify_cooldown_error(model);
+            if (!paused) return false;
+            res.status = 503;
+            res.set_header("Retry-After",
+                           std::to_string((*paused)["error"]["retry_after"].get<long long>()));
+            res.set_content(paused->dump(), "application/json");
+            return true;
+        };
         try {
             std::uint64_t received = http.body.size();
             for (const auto& [name, field] : http.form.fields) received += name.size() + field.content.size();
@@ -234,6 +243,7 @@ public:
                                        "model '" + model + "' is not an image-classification model");
                     return;
                 }
+                if (send_if_paused(model)) return;
                 try {
                     ctx_.model_loader->ensure_loaded(model);
                 } catch (const std::exception& e) {
@@ -251,6 +261,7 @@ public:
                         "is loaded (load one, or name it in the request)");
                     return;
                 }
+                if (send_if_paused(model)) return;
                 params["model"] = model;
             }
 
