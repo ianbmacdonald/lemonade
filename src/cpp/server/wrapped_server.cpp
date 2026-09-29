@@ -570,6 +570,7 @@ bool WrappedServer::wait_for_ready(const std::string& endpoint, long timeout_sec
     LOG(DEBUG, "WrappedServer") << "Waiting for " + server_name_ + " to be ready..." << std::endl;
 
     const int max_attempts = (timeout_seconds * 1000) / poll_interval_ms;
+    startup_exit_code_ = -1;
 
     for (int i = 0; i < max_attempts; i++) {
         if (load_cancel_ && load_cancel_->load()) {
@@ -588,6 +589,7 @@ bool WrappedServer::wait_for_ready(const std::string& endpoint, long timeout_sec
             int exit_code = has_process_handle(exited_handle)
                 ? utils::ProcessManager::reap_process(exited_handle)
                 : -1;
+            startup_exit_code_ = exit_code;
             LOG(ERROR, "WrappedServer") << server_name_ << " process has terminated with exit code: "
                      << exit_code << std::endl;
             LOG(ERROR, "WrappedServer") << "This usually means:" << std::endl;

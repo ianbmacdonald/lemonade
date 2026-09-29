@@ -11,6 +11,7 @@ the generator instead. Prose outside the markers is preserved. -->
 |--------|------|--------------------|---------------|----------|
 | `acestep` | ACE-Step | yes | no | cuda, rocm, vulkan |
 | `ds4` | DwarfStar4 (experimental) | no | yes | rocm |
+| `executorch` | ExecuTorch | no | no | system |
 | `flm` | FastFlowLM NPU | no | yes | npu |
 | `kokoro` | Kokoro | no | no | cpu, metal |
 | `litert` | LiteRT | no | no | system |
@@ -38,6 +39,7 @@ the generator instead. Prose outside the markers is preserved. -->
 | `acestep` | vulkan | linux, windows | amd_gpu; cpu (x86_64); nvidia_gpu |
 | `acestep` | rocm | linux, windows | amd_gpu (gfx103X, gfx110X, gfx1150, gfx1151, gfx1152, gfx120X) |
 | `ds4` | rocm | linux | amd_gpu (gfx1151) |
+| `executorch` | system | linux | cpu (x86_64) |
 | `flm` | npu | linux, windows | amd_npu (XDNA2) |
 | `kokoro` | metal | macos | metal |
 | `kokoro` | cpu | linux, windows | cpu (x86_64) |
@@ -101,6 +103,12 @@ the generator instead. Prose outside the markers is preserved. -->
 |--------|----------|------|---------|-------------|
 | `ctx_size` | `--ctx-size` | SIZE | -1 | Context size for the model |
 | `ds4_args` | `--ds4-args` | ARGS | "" | Custom arguments to pass to ds4-server |
+
+#### `executorch` — ExecuTorch
+
+| Option | CLI flag | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `executorch_args` | `--executorch-args` | ARGS | "" | Custom arguments to pass to et-server |
 
 #### `flm` — FastFlowLM NPU
 

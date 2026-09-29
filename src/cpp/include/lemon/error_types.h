@@ -97,6 +97,14 @@ private:
     int status_code_;
 };
 
+// A backend load failure that evicting every other model and retrying cannot
+// fix, or would make worse: the Router rethrows it without the nuclear retry.
+class NonRetryableLoadException : public LemonException {
+public:
+    explicit NonRetryableLoadException(const std::string& message)
+        : LemonException(message, ErrorType::PROCESS_ERROR) {}
+};
+
 class NetworkException : public LemonException {
 public:
     NetworkException(const std::string& message)

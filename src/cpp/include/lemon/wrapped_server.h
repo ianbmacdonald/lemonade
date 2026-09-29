@@ -600,6 +600,11 @@ protected:
     // Wait for server to be ready (can be overridden for custom health checks)
     virtual bool wait_for_ready(const std::string& endpoint, long timeout_seconds = 600, long poll_interval_ms = 100);
 
+    // wait_for_ready() reaps a child that exits during startup, which is the only
+    // point its status is observable: this keeps that status for the caller, or
+    // -1 when the child was still running (timeout, cancel) or never started.
+    int startup_exit_code() const { return startup_exit_code_; }
+
     // Configure/start the generic backend watchdog. Non-streaming requests are
     // always monitored so a hung backend becomes a reload+retry delay instead
     // of a stuck user request. Streaming can still avoid replaying partial data.
@@ -669,6 +674,7 @@ protected:
     long load_duration_ms_;
     bool pinned_ = false;
     std::atomic<bool>* load_cancel_ = nullptr;
+    int startup_exit_code_ = -1;
 
 private:
     static uint64_t next_instance_id() {
