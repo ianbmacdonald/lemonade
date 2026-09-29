@@ -124,15 +124,17 @@ Only JPEG and PNG are accepted. EXIF orientation is not applied.
 
 ### Example requests
 
+The examples use the built-in `MobileNetV2-1.0-224-TFLite` model (`lemonade pull MobileNetV2-1.0-224-TFLite`). A `user.*` model registered from the same checkpoint works the same way under its own name.
+
 ```bash
 curl -X POST http://localhost:13305/v1/images/classify \
-  -F model=user.MobileNetV2-1.0-224-TFLite -F top_k=3 -F image=@grace_hopper.jpg
+  -F model=MobileNetV2-1.0-224-TFLite -F top_k=3 -F image=@grace_hopper.jpg
 ```
 
 ```bash
 curl -X POST http://localhost:13305/v1/images/classify \
   -H "Content-Type: application/json" \
-  -d "{\"model\": \"user.MobileNetV2-1.0-224-TFLite\", \"top_k\": 3, \"image\": \"$(base64 -w0 grace_hopper.jpg)\"}"
+  -d "{\"model\": \"MobileNetV2-1.0-224-TFLite\", \"top_k\": 3, \"image\": \"$(base64 -w0 grace_hopper.jpg)\"}"
 ```
 
 ### Response format
@@ -140,7 +142,7 @@ curl -X POST http://localhost:13305/v1/images/classify \
 ```json
 {
   "object": "image_classification",
-  "model": "user.MobileNetV2-1.0-224-TFLite",
+  "model": "MobileNetV2-1.0-224-TFLite",
   "data": [
     {"index": 653, "label": "military uniform", "score": 0.803491},
     {"index": 440, "label": "bearskin", "score": 0.037449},
