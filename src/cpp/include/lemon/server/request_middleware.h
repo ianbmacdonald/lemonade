@@ -5,6 +5,8 @@
 
 #include <httplib.h>
 
+#include "lemon/image_classify_request.h"
+
 namespace lemon {
 
 class RouteRegistry;
@@ -28,12 +30,17 @@ private:
     httplib::Server::HandlerResponse authenticate(const httplib::Request& req,
                                                   httplib::Response& res);
     void log_response(const httplib::Request& req, const httplib::Response& res);
+    httplib::Server::HandlerResponse precheck_image_classify(const httplib::Request& req,
+                                                             httplib::Response& res);
+    void release_image_classify_slot();
 
     RuntimeConfig* config_;
     const RouteRegistry* registry_;
     std::string api_key_;
     std::string admin_api_key_;
     std::atomic<bool> metrics_access_logged_{false};
+    image_classify::InflightLimiter image_classify_inflight_{
+        image_classify::kMaxConcurrentImageClassify};
 };
 
 } // namespace lemon

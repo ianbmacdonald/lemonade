@@ -1,8 +1,10 @@
 // Request parsing and limits for POST /v1/images/classify
 // (lemon::image_classify). Pure functions, no server.
 
+#include "lemon/crash_breaker.h"
 #include "lemon/image_classify_request.h"
 
+#include <chrono>
 #include <cstdio>
 #include <optional>
 #include <string>
@@ -94,6 +96,8 @@ void test_json() {
     check("json: PNG data URL accepted", data_url.ok() && data_url.mime == "image/png");
     auto data_upper = parse_json(json_body("DATA:IMAGE/JPEG;BASE64," + b64(kJpeg)));
     check("json: data URL scheme is case-insensitive", data_upper.ok());
+    check("json: image/jpg data URL accepted as an alias",
+          parse_json(json_body("data:image/jpg;base64," + b64(kJpeg))).ok());
     check("json: non-image data URL rejected",
           parse_json(json_body("data:text/plain;base64," + b64("hello"))).status == 400);
     check("json: non-base64 data URL rejected",
@@ -131,6 +135,11 @@ void test_json() {
     auto big = parse_json(json_body(b64(over)));
     check("size: 16 MiB + 1 is 413", big.status == 413);
     check("size: empty image is 400", parse_json(json_body("")).status == 400);
+    std::string oversized_text(kMaxImageBase64Chars + 4, '@');
+    check("size: over-long image string is 413 before any decoding",
+          parse_json(json_body(oversized_text)).status == 413);
+    check("base64: whitespace-heavy input decodes",
+          parse_json(json_body("  " + b64(kJpeg).insert(4, "\\n  \\r\\n"))).ok());
 }
 
 void test_form() {
@@ -159,12 +168,23 @@ void test_form() {
 }
 
 void test_precheck_and_path() {
-    check("precheck: no Content-Length is 411", precheck_content_length(false, 0) == 411);
-    check("precheck: 1 KiB passes", precheck_content_length(true, 1024) == 0);
+    const auto kMax = kMaxImageClassifyRequestBytes;
+    check("precheck: no Content-Length is 411",
+          precheck_request_headers(false, 0, false, false) == 411);
+    check("precheck: 1 KiB passes", precheck_request_headers(true, 1024, false, false) == 0);
     check("precheck: exactly the limit passes",
-          precheck_content_length(true, kMaxImageClassifyRequestBytes) == 0);
-    check("precheck: limit + 1 is 413",
-          precheck_content_length(true, kMaxImageClassifyRequestBytes + 1) == 413);
+          precheck_request_headers(true, kMax, false, false) == 0);
+    check("precheck: limit + 1 is 413", precheck_request_headers(true, kMax + 1, false, false) == 413);
+    check("precheck: chunked without Content-Length is 411",
+          precheck_request_headers(false, 0, true, false) == 411);
+    check("precheck: Content-Length 0 plus Transfer-Encoding is 411",
+          precheck_request_headers(true, 0, true, false) == 411);
+    check("precheck: small Content-Length plus Transfer-Encoding is 411",
+          precheck_request_headers(true, 1024, true, false) == 411);
+    check("precheck: any Content-Encoding is 415",
+          precheck_request_headers(true, 1024, false, true) == 415);
+    check("precheck: Content-Encoding with chunked is 415",
+          precheck_request_headers(false, 0, true, true) == 415);
 
     for (const char* p : {"/api/v0/images/classify", "/api/v1/images/classify",
                           "/v0/images/classify", "/v1/images/classify"}) {
@@ -176,6 +196,44 @@ void test_precheck_and_path() {
     }
 }
 
+void test_inflight_limiter() {
+    InflightLimiter limiter(2);
+    const bool first = limiter.try_acquire();
+    const bool second = limiter.try_acquire();
+    check("limiter: admits up to the cap", first && second && limiter.in_flight() == 2);
+    check("limiter: refuses past the cap", !limiter.try_acquire() && limiter.in_flight() == 2);
+    limiter.release();
+    check("limiter: a release frees a slot", limiter.try_acquire() && limiter.in_flight() == 2);
+    limiter.release();
+    limiter.release();
+    check("limiter: drains to zero", limiter.in_flight() == 0);
+}
+
+void test_crash_breaker() {
+    using namespace std::chrono;
+    lemon::CrashBreaker breaker(3, seconds(60), seconds(60));
+    const auto t0 = lemon::CrashBreaker::Clock::time_point{} + hours(1);
+    check("breaker: open by default", breaker.blocked_seconds("m", t0) == 0);
+    check("breaker: first crash does not trip", !breaker.record_crash("m", t0));
+    check("breaker: second crash does not trip", !breaker.record_crash("m", t0 + seconds(10)));
+    check("breaker: still open below the threshold", breaker.blocked_seconds("m", t0 + seconds(11)) == 0);
+    check("breaker: third crash in the window trips", breaker.record_crash("m", t0 + seconds(20)));
+    check("breaker: blocked for the cool-down",
+          breaker.blocked_seconds("m", t0 + seconds(20)) == 60 &&
+              breaker.blocked_seconds("m", t0 + seconds(79)) == 1);
+    check("breaker: partial second rounds up",
+          breaker.blocked_seconds("m", t0 + seconds(79) + milliseconds(500)) == 1);
+    check("breaker: other keys unaffected", breaker.blocked_seconds("other", t0 + seconds(30)) == 0);
+    check("breaker: reopens after the cool-down", breaker.blocked_seconds("m", t0 + seconds(80)) == 0);
+    check("breaker: count restarts after tripping", !breaker.record_crash("m", t0 + seconds(81)));
+
+    lemon::CrashBreaker spaced(3, seconds(60), seconds(60));
+    spaced.record_crash("m", t0);
+    spaced.record_crash("m", t0 + seconds(30));
+    check("breaker: crashes outside the window expire",
+          !spaced.record_crash("m", t0 + seconds(61)) && spaced.blocked_seconds("m", t0 + seconds(61)) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -184,6 +242,8 @@ int main() {
     test_json();
     test_form();
     test_precheck_and_path();
+    test_inflight_limiter();
+    test_crash_breaker();
     if (failures == 0) {
         std::printf("\nAll image classify request checks passed.\n");
         return 0;

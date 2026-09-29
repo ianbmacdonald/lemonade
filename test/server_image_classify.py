@@ -35,8 +35,11 @@ import base64
 import json
 import os
 import shutil
+import gzip
 import socket
 import struct
+import threading
+import time
 import zlib
 
 import requests
@@ -59,6 +62,7 @@ REFERENCE_INDEX = 653
 REFERENCE_SCORE = 0.803491
 REFERENCE_TOL = 0.02
 POISON = b"B169-POISON-IMAGE"
+SLOW = b"B169-SLOW-IMAGE"
 
 _opts = argparse.Namespace(
     image_model_dir=None,
@@ -107,7 +111,11 @@ def _raw_request(headers, body=b""):
     """Sends a request without a client library, so headers such as a
     Content-Length far larger than the body reach the server unaltered."""
     with socket.create_connection(("localhost", PORT), timeout=30) as sock:
-        sock.sendall(headers.encode() + body)
+        try:
+            sock.sendall(headers.encode() + body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The server may answer and close before a large body is sent.
+            pass
         data = b""
         while b"\r\n\r\n" not in data:
             chunk = sock.recv(65536)
@@ -235,6 +243,72 @@ class ImageClassifyTests(ServerTestBase):
         )
         self.assertEqual(status, 411, body[:300])
         self.assertEqual(json.loads(body)["error"]["code"], "length_required")
+
+    def _assert_refused_unread(self, headers, body, expected_status, expected_code):
+        rss_before = _vm_rss_kb(_opts.lemond_pid) if _opts.lemond_pid else None
+        status, reply = _raw_request(headers, body)
+        self.assertEqual(status, expected_status, reply[:300])
+        self.assertEqual(json.loads(reply)["error"]["code"], expected_code)
+        if rss_before is not None:
+            growth_kb = _vm_rss_kb(_opts.lemond_pid) - rss_before
+            self.assertLess(growth_kb, 10 * 1024, f"lemond RSS grew {growth_kb} KiB")
+            print(f"[OK] lemond RSS growth {growth_kb} KiB")
+
+    def test_006b_gzip_body_is_415(self):
+        # 60 MiB of JSON that gzips to about 60 KB: httplib would inflate it
+        # past the 61 KB Content-Length the guard saw.
+        payload = gzip.compress(
+            b'{"image":"' + b"A" * (60 * 1024 * 1024) + b'"}', compresslevel=9
+        )
+        self._assert_refused_unread(
+            f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
+            "Content-Type: application/json\r\nContent-Encoding: gzip\r\n"
+            f"Content-Length: {len(payload)}\r\n\r\n",
+            payload,
+            415,
+            "unsupported_content_encoding",
+        )
+
+    def test_006c_chunked_with_zero_content_length_is_411(self):
+        # A small first slice of a chunked body; httplib would read chunks
+        # until the terminator, however many the client sends.
+        chunk = b"A" * (32 * 1024)
+        body = b"".join(b"%x\r\n" % len(chunk) + chunk + b"\r\n" for _ in range(2))
+        self._assert_refused_unread(
+            f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
+            "Content-Type: application/json\r\nContent-Length: 0\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n",
+            body,
+            411,
+            "length_required",
+        )
+
+    def test_006d_chunked_with_small_content_length_is_411(self):
+        self._assert_refused_unread(
+            f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
+            "Content-Type: application/json\r\nContent-Length: 1024\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n",
+            b"5\r\nhello\r\n0\r\n\r\n",
+            411,
+            "length_required",
+        )
+
+    def test_006e_aborted_uploads_release_their_slot(self):
+        # Each upload is admitted, then the client disappears mid-body. If the
+        # in-flight slot leaked, a few of these would leave the route at 503.
+        for _ in range(4):
+            with socket.create_connection(("localhost", PORT), timeout=30) as sock:
+                sock.sendall(
+                    (
+                        f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
+                        "Content-Type: application/json\r\nContent-Length: 100000\r\n\r\n"
+                    ).encode()
+                    + b'{"image":"'
+                )
+        time.sleep(1)
+        self._assert_status(
+            self._post_json({"image": "@@@@"}), 400, "request after aborted uploads"
+        )
 
     def test_007_two_image_parts_rejected(self):
         files = [
@@ -434,13 +508,101 @@ class ImageClassifyTests(ServerTestBase):
             lines(crashes) - crashes_before, 1, "the poison image was replayed"
         )
 
+        # No model named: the sole image model is chosen even though its
+        # backend is down, and this request reloads it.
+        response = self._post_form(
+            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+            data={"top_k": "1"},
+        )
+        self._assert_reference(response, 1)
+        self.assertEqual(
+            lines(starts) - starts_before, 1, "expected exactly one reload"
+        )
+
+    def test_509_inflight_cap(self):
+        if not _opts.fake_backend:
+            self.skipTest("needs --fake-backend")
+        self._require_model()
+        results = []
+
+        def slow_request():
+            results.append(
+                self._post_form(
+                    {"image": ("slow.jpg", _jpeg_like(SLOW), "image/jpeg")},
+                    data={"model": MODEL, "top_k": "1"},
+                )
+            )
+
+        threads = [threading.Thread(target=slow_request) for _ in range(2)]
+        for t in threads:
+            t.start()
+        time.sleep(1.5)
+        response = self._post_form(
+            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+            data={"model": MODEL, "top_k": "1"},
+        )
+        for t in threads:
+            t.join()
+        self._assert_status(response, 503, "third concurrent request")
+        self.assertEqual(response.json()["error"]["code"], "server_busy")
+        self.assertEqual(response.headers.get("Retry-After"), "1")
+        for r in results:
+            self._assert_reference(r, 1)
+        self._assert_reference(
+            self._post_form(
+                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+                data={"model": MODEL, "top_k": "1"},
+            ),
+            1,
+        )
+
+    def test_510_repeated_crashes_pause_the_model(self):
+        # Runs last: it leaves the model paused for up to a minute.
+        if not _opts.fake_backend or not _opts.fake_state_dir:
+            self.skipTest("needs --fake-backend and --fake-state-dir")
+        self._require_model()
+        crashes = os.path.join(_opts.fake_state_dir, "crashes.log")
+        starts = os.path.join(_opts.fake_state_dir, "starts.log")
+
+        def lines(path):
+            if not os.path.exists(path):
+                return 0
+            with open(path, encoding="utf-8") as f:
+                return len(f.read().splitlines())
+
+        def poison():
+            return self._post_form(
+                {"image": ("poison.jpg", _jpeg_like(POISON), "image/jpeg")},
+                data={"model": MODEL},
+            )
+
+        response = None
+        for _ in range(4):
+            response = poison()
+            if response.status_code != 502:
+                break
+        self._assert_status(response, 503, "poison after repeated crashes")
+        self.assertEqual(response.json()["error"]["code"], "backend_crash_cooldown")
+        retry_after = int(response.headers["Retry-After"])
+        self.assertTrue(1 <= retry_after <= 60, retry_after)
+
+        crashes_before, starts_before = lines(crashes), lines(starts)
+        response = self._post_form(
+            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+            data={"model": MODEL, "top_k": "1"},
+        )
+        self._assert_status(response, 503, "good image while paused")
+        self.assertEqual(lines(crashes), crashes_before, "paused model crashed again")
+        self.assertEqual(lines(starts), starts_before, "paused model was reloaded")
+
+        time.sleep(int(response.headers["Retry-After"]) + 1)
         response = self._post_form(
             {"image": ("g.jpg", self._fixture(), "image/jpeg")},
             data={"model": MODEL, "top_k": "1"},
         )
         self._assert_reference(response, 1)
         self.assertEqual(
-            lines(starts) - starts_before, 1, "expected exactly one reload"
+            lines(starts) - starts_before, 1, "expected one reload after the pause"
         )
 
 

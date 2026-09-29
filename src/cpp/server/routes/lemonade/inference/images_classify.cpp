@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -24,13 +25,26 @@ const RouteError kBadImageRequest{
     "Malformed request: zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG "
     "image, a bad `top_k`, or an image the backend cannot decode"};
 const RouteError kImageTooLarge{413, "payload_too_large", "The decoded image exceeds 16 MiB, or the body exceeds 23 MiB"};
-const RouteError kLengthRequired{411, "length_required", "The request carries no `Content-Length` (a chunked upload)"};
+const RouteError kLengthRequired{
+    411, "length_required",
+    "No `Content-Length`, or any `Transfer-Encoding` header, even alongside a `Content-Length`; "
+    "refused before the body is read"};
+const RouteError kContentEncoding{
+    415, "unsupported_content_encoding",
+    "Any `Content-Encoding` header, such as a gzip-compressed body; refused before the body is read"};
+const RouteError kServerBusy{
+    503, "server_busy",
+    "Two image-classification requests are already in progress (`Retry-After: 1`)"};
+const RouteError kCrashCooldown{
+    503, "backend_crash_cooldown",
+    "The model's backend crashed on 3 inputs within 60 seconds, which pauses image classification "
+    "for that model for 60 seconds (with `Retry-After`)"};
 const RouteError kNotImageClassifier{400, "model_not_applicable", "`model` is not an image-classification model"};
 const RouteError kNoSoleImageClassifier{
     400, "", "`model` is omitted and not exactly one image-classification model is loaded"};
 const RouteError kCrashedOnInput{
     502, "backend_crashed_on_input",
-    "The backend crashed on this input; it is reloaded and the request is not retried"};
+    "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
 
 const RouteArg kModel{"model", ArgIn::Form, {{"type", "string"}}, false, Support::Available,
                       "The image-classification model to use. Optional when exactly one is loaded."};
@@ -89,11 +103,12 @@ public:
             "as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` "
             "classes), so a repeated name keeps only its highest score there; use `data[].index` "
             "to tell classes apart.",
-            "The body is capped before it is read: a request without `Content-Length` (a chunked "
-            "upload) gets `411`, and one whose `Content-Length` is over 23 MiB gets `413`.",
+            "The body is capped before it is read: a request without `Content-Length`, or with any "
+            "`Transfer-Encoding`, gets `411`; any `Content-Encoding` gets `415`; and a "
+            "`Content-Length` over 23 MiB gets `413`. At most two requests run at once.",
             "An image that crashes the backend is never replayed, because replaying it would crash "
-            "the restarted backend too: the backend is restarted for the next request and this one "
-            "fails with `502` `backend_crashed_on_input`.",
+            "the restarted backend too: this request fails with `502` `backend_crashed_on_input` "
+            "and the next request restarts the backend.",
             "### Model Directory\n\n"
             "An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 "
             "output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the "
@@ -151,7 +166,8 @@ public:
             }
         })");
         s.responses = {response};
-        s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired,
+        s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired, kContentEncoding,
+                                 kServerBusy, kCrashCooldown,
                                  kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput,
                                  kModelUnloaded, kBackendError, kMalformedBackendResponse,
                                  kUnexpectedException},
@@ -164,6 +180,17 @@ public:
     void handle(RouteRequest& req, httplib::Response& res) override {
         const httplib::Request& http = req.http;
         try {
+            std::uint64_t received = http.body.size();
+            for (const auto& [name, field] : http.form.fields) received += name.size() + field.content.size();
+            for (const auto& [name, file] : http.form.files) received += name.size() + file.content.size();
+            if (received > image_classify::kMaxImageClassifyRequestBytes) {
+                write_openai_error(res, kImageTooLarge,
+                                   "Request body exceeds " +
+                                       std::to_string(image_classify::kMaxImageClassifyRequestBytes /
+                                                      (1024 * 1024)) + " MiB");
+                return;
+            }
+
             image_classify::ParsedRequest parsed;
             if (http.is_multipart_form_data()) {
                 std::optional<std::string> model;
@@ -216,7 +243,8 @@ public:
                     return;
                 }
             } else {
-                model = ctx_.router->get_sole_loaded_model_of_type(ModelType::IMAGE_CLASSIFICATION);
+                model = ctx_.router->get_sole_loaded_model_of_type(
+                    ModelType::IMAGE_CLASSIFICATION, /*include_dead_backends=*/true);
                 if (model.empty()) {
                     write_openai_error(res, kNoSoleImageClassifier,
                         "No 'model' specified and no single image-classification model "
@@ -229,6 +257,11 @@ public:
             auto response = ctx_.router->classify_image(params, std::move(parsed.bytes));
             if (response.contains("error") && response["error"].is_object()) {
                 res.status = status_for_backend_error(response["error"]);
+                if (response["error"].contains("retry_after") &&
+                    response["error"]["retry_after"].is_number_integer()) {
+                    res.set_header("Retry-After",
+                                   std::to_string(response["error"]["retry_after"].get<long long>()));
+                }
                 res.set_content(response.dump(), "application/json");
                 return;
             }

@@ -6,7 +6,7 @@
 #include "lemon/backends/backend_utils.h"
 #include "lemon/backends/hf_cache_util.h"
 #include "lemon/backend_manager.h"
-#include "lemon/error_types.h"
+#include "lemon/image_classify_request.h"
 #include "lemon/utils/path_utils.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
@@ -84,16 +84,6 @@ std::string capture_startup_error(const std::string& executable,
 const char* task_for_type(ModelType type) {
     return type == ModelType::IMAGE_CLASSIFICATION ? "image-classification"
                                                    : "text-classification";
-}
-
-// JPEG and PNG are the only formats the route accepts; the handler has already
-// sniffed the magic, so this just names it for the multipart part.
-std::string image_mime(const std::string& bytes) {
-    if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xFF &&
-        static_cast<unsigned char>(bytes[1]) == 0xD8) {
-        return "image/jpeg";
-    }
-    return "image/png";
 }
 
 // forward_multipart_request nests the backend's status and body under
@@ -342,7 +332,8 @@ json TfliteServer::classify_image(const json& params, std::string image_bytes) {
         top_k = params["top_k"].get<int>();
     }
     std::vector<utils::MultipartField> fields;
-    std::string mime = image_mime(image_bytes);
+    std::string mime = image_classify::sniff_image_mime(image_bytes);
+    if (mime.empty()) mime = "application/octet-stream";
     fields.push_back({"image", std::move(image_bytes), "image", std::move(mime)});
     fields.push_back({"top_k", std::to_string(top_k), "", ""});
     return normalize_backend_error(forward_multipart_request("/classify/image", fields, 60));
