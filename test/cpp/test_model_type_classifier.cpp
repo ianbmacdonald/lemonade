@@ -72,6 +72,12 @@ int main() {
          {"chat", "vision", "reasoning", "tool-calling", "transcription"},
          ModelType::LLM},
 
+        // Image classification is its own mode, never the text CLASSIFICATION
+        // pool, and "image" alone still means image generation.
+        {"image-classification", {"image-classification"}, ModelType::IMAGE_CLASSIFICATION},
+        {"image stays generation", {"image"}, ModelType::IMAGE},
+        {"chat + image-classification → LLM", {"chat", "image-classification"}, ModelType::LLM},
+
         // Fallbacks.
         {"empty labels → LLM", {}, ModelType::LLM},
         {"unknown label → LLM", {"some-future-label"}, ModelType::LLM},
@@ -123,7 +129,12 @@ int main() {
         if (!ok) ++failures;
     }
 
-    const size_t total = cases.size() + declared_cases.size();
+    const bool round_trip =
+        model_type_to_string(ModelType::IMAGE_CLASSIFICATION) == "image-classification";
+    std::printf("[%s] image-classification string round-trips\n", round_trip ? "PASS" : "FAIL");
+    if (!round_trip) ++failures;
+
+    const size_t total = cases.size() + declared_cases.size() + 1;
     std::printf("\n%d/%zu cases passed\n", static_cast<int>(total - failures), total);
     return failures == 0 ? 0 : 1;
 }

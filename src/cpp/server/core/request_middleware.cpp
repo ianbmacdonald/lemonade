@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "../telemetry.h"
+#include "lemon/image_classify_request.h"
 #include "lemon/runtime_config.h"
 #include "lemon/server/route_registry.h"
 #include "lemon/utils/origin_utils.h"
@@ -177,7 +178,33 @@ httplib::Server::HandlerResponse RequestMiddleware::pre_route(const httplib::Req
         }
     }
 
-    return authenticate(req, res);
+    const auto auth = authenticate(req, res);
+    if (auth == httplib::Server::HandlerResponse::Handled) {
+        return auth;
+    }
+
+    // Runs before httplib reads the body, so an oversized upload is refused
+    // without lemond ever buffering it (httplib's own cap is 100 MB).
+    if (req.method == "POST" && image_classify::is_image_classify_path(req.path)) {
+        const bool has_length = req.has_header("Content-Length");
+        const int status = image_classify::precheck_content_length(
+            has_length, has_length ? req.get_header_value_u64("Content-Length") : 0);
+        if (status != 0) {
+            res.status = status;
+            const bool too_large = status == 413;
+            nlohmann::json error = {{"error", {
+                {"message", too_large
+                    ? "Request body exceeds " +
+                          std::to_string(image_classify::kMaxImageClassifyRequestBytes /
+                                         (1024 * 1024)) + " MiB"
+                    : std::string("Content-Length required")},
+                {"type", "invalid_request_error"},
+                {"code", too_large ? "payload_too_large" : "length_required"}}}};
+            res.set_content(error.dump(), "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+    }
+    return auth;
 }
 
 httplib::Server::HandlerResponse RequestMiddleware::authenticate(const httplib::Request& req,

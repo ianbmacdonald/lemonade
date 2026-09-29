@@ -10,11 +10,12 @@
 namespace lemon {
 namespace backends {
 
-// Runs an exported TFLite model as a tflite-server subprocess. v1 serves text
-// classification (/v1/classify): input text -> {label: score}, CPU EP. The
-// server is generic; embeddings/reranking are future capabilities on the same
-// backend (issue #2592).
-class TfliteServer : public WrappedServer, public IClassificationServer {
+// Runs an exported TFLite model as a tflite-server subprocess on the CPU. A text
+// model serves /v1/classify (text -> {label: score}); an image model serves
+// /v1/images/classify (image -> ranked labels), which needs tflite-server >= 0.2.0.
+class TfliteServer : public WrappedServer,
+                     public IClassificationServer,
+                     public IImageClassificationServer {
 public:
     static InstallParams get_install_params(const std::string& backend, const std::string& version);
 
@@ -34,7 +35,13 @@ public:
     // IClassificationServer
     json classify(const json& request) override;
 
+    // IImageClassificationServer
+    json classify_image(const json& params, std::string image_bytes) override;
+
 private:
+    // The /health "task" the loaded subprocess must report.
+    std::string expected_task_;
+
     // Forward a classify request to the subprocess and normalize its response.
     json forward_classify(const std::string& text, const json& params);
 };
