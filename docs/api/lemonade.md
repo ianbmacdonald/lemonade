@@ -1611,8 +1611,8 @@ curl http://localhost:13305/v1/health
   - `enabled` - `true`
   - `supported` - `false` on Windows, where the listener is not available in this release
   - `listening` - Whether at least one UDP socket is bound
-  - `error` - Platform-level error string, or `null`
-  - `sockets` - One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each local RFC1918 interface's directed-broadcast address plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on.
+  - `error` - Platform-level error string, or `null`. If the listener thread could not be started, `listening` is `false`, `sockets` is empty and `error` says why; toggling `beacon_listen` retries.
+  - `sockets` - One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each local RFC1918 interface's directed-broadcast address plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on. It is not scoped to an interface: on a gateway whose WAN side is also RFC1918, block inbound UDP 13305 on the WAN zone or WAN-side hosts are listed too.
   - `self_instance_id`, `self_port` - This server's beacon `instance_id` and HTTP port, used to drop its own beacons
   - `ttl_seconds` - Seconds a host stays listed after its last beacon (15)
   - `max_hosts` - Maximum listed hosts (32)

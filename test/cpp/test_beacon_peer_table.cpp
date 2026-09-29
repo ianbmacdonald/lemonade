@@ -4,9 +4,9 @@
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
 #include <lemon/utils/beacon_listener.h>
 #include <lemon/utils/network_beacon.h>
+#include <nlohmann/json.hpp>
 
 #include "test_config_helpers.h"
 
@@ -375,6 +375,38 @@ void test_flood_survival(Clock::time_point t0) {
     check(t.evicted() == 0, "flood: evicted stays 0");
 }
 
+
+void test_pinned_junk_flood(Clock::time_point t0) {
+    BeaconPeerTable t;
+    uint32_t peer = ip(192, 168, 1, 40);
+    std::string good = beacon(url_for(peer), "legit");
+    check(feed(t, good, peer, t0) == IngestResult::Accepted, "pinned junk: peer accepted");
+
+    std::vector<std::string> junk = {"not json at all", "[]", beacon(url_for(ip(192, 168, 1, 41)), "x"),
+                                     beacon("https://192.168.1.40:13305/api/v1/", "x")};
+    bool refreshes_ok = true;
+    for (int ms = 1; ms <= 20000; ++ms) {
+        auto now = t0 + std::chrono::milliseconds(ms);
+        feed(t, junk[ms % junk.size()], peer, now);
+        if (ms % 2000 == 0 && feed(t, good, peer, now) != IngestResult::Refreshed) refreshes_ok = false;
+    }
+    t.expire(t0 + std::chrono::milliseconds(20000));
+    check(refreshes_ok, "pinned junk: every real refresh admitted during a 1000 pps junk flood");
+    check(t.size() == 1, "pinned junk: legitimate row survives the flood");
+}
+
+void test_single_source_flood(Clock::time_point t0) {
+    BeaconPeerTable t;
+    uint32_t noisy = ip(10, 0, 0, 7);
+    for (int i = 0; i < 5000; ++i) {
+        feed(t, "garbage", noisy, t0);
+    }
+    check(t.stat(IngestResult::RateLimited) >= 5000 - static_cast<uint64_t>(lemon::kPerSourceBurst),
+          "single source: the noisy host is limited to its own bucket");
+    uint32_t fresh = ip(10, 0, 0, 8);
+    check(feed(t, beacon(url_for(fresh)), fresh, t0) == IngestResult::Accepted,
+          "single source: a new peer is still accepted during the flood");
+}
 } // namespace
 
 int main() {
@@ -393,6 +425,8 @@ int main() {
     test_rate_limit_global(t0);
     test_rate_limit_per_source(t0);
     test_flood_survival(t0);
+    test_pinned_junk_flood(t0);
+    test_single_source_flood(t0);
 
     return test_helpers::report_results("beacon peer table");
 }

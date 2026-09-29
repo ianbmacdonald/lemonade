@@ -846,6 +846,42 @@ sys.exit(0)
             # Restore default
             run_cli_command(["--port", str(PORT), "config", "set", "broadcast=true"])
 
+    def test_045a_scan_with_beacon_listen(self):
+        """With beacon_listen on, scan still receives the server's loopback beacon."""
+        if platform.system() != "Linux":
+            self.skipTest("beacon listener coexistence is only validated on Linux")
+        response = requests.get(
+            f"http://localhost:{PORT}/internal/config",
+            headers=_auth_headers(),
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        if response.json().get("broadcast") is False:
+            self.skipTest("server broadcasting is disabled, so there is no beacon")
+
+        loopback_url = f"http://127.0.0.1:{PORT}/api/v1/"
+        try:
+            set_server_config({"beacon_listen": True})
+            health = requests.get(
+                f"http://localhost:{PORT}/api/v1/health",
+                headers=_auth_headers(),
+                timeout=10,
+            ).json()
+            self.assertTrue(health["beacon_listener"]["enabled"])
+
+            result = self.assertCommandSucceeds(["scan", "--duration", "3"], timeout=30)
+            if "Found 0 beacon(s)" in result.stdout:
+                self.skipTest(
+                    "server is not broadcasting (no RFC1918 interface on this host)"
+                )
+            self.assertIn(
+                loopback_url,
+                result.stdout,
+                "the listener must not keep the loopback beacon from the CLI",
+            )
+        finally:
+            set_server_config({"beacon_listen": False})
+
     # =============================================================================
     # Pull Tests
     # =============================================================================

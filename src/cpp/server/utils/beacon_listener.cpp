@@ -160,30 +160,9 @@ bool BeaconPeerTable::is_pinned_locked(uint32_t src_ip) const {
     return false;
 }
 
-// Pinned sources (those owning a live row) skip the global bucket so a flood
-// from other addresses cannot starve refreshes from already-known peers.
-bool BeaconPeerTable::admit_locked(uint32_t src_ip, steady_clock::time_point now) {
+BeaconPeerTable::SourceState& BeaconPeerTable::source_state_locked(uint32_t src_ip,
+                                                                   steady_clock::time_point now) {
     auto it = sources_.find(src_ip);
-    if (is_pinned_locked(src_ip)) {
-        if (it == sources_.end()) {
-            it = sources_.emplace(src_ip, SourceState{{kPerSourceBurst, now}, now}).first;
-        }
-        auto& st = it->second;
-        refill(st.bucket.tokens, st.bucket.last, now, kPerSourceRate, kPerSourceBurst);
-        st.last_seen = now;
-        if (st.bucket.tokens < 1.0) return false;
-        st.bucket.tokens -= 1.0;
-        return true;
-    }
-
-    if (!global_bucket_primed_) {
-        global_bucket_ = {kGlobalBurst, now};
-        global_bucket_primed_ = true;
-    }
-    refill(global_bucket_.tokens, global_bucket_.last, now, kGlobalRate, kGlobalBurst);
-    if (global_bucket_.tokens < 1.0) return false;
-    global_bucket_.tokens -= 1.0;
-
     if (it == sources_.end()) {
         size_t unpinned = 0;
         auto oldest = sources_.end();
@@ -202,8 +181,17 @@ bool BeaconPeerTable::admit_locked(uint32_t src_ip, steady_clock::time_point now
     auto& st = it->second;
     refill(st.bucket.tokens, st.bucket.last, now, kPerSourceRate, kPerSourceBurst);
     st.last_seen = now;
-    if (st.bucket.tokens < 1.0) return false;
-    st.bucket.tokens -= 1.0;
+    return st;
+}
+
+bool BeaconPeerTable::take_global_token_locked(steady_clock::time_point now) {
+    if (!global_bucket_primed_) {
+        global_bucket_ = {kGlobalBurst, now};
+        global_bucket_primed_ = true;
+    }
+    refill(global_bucket_.tokens, global_bucket_.last, now, kGlobalRate, kGlobalBurst);
+    if (global_bucket_.tokens < 1.0) return false;
+    global_bucket_.tokens -= 1.0;
     return true;
 }
 
@@ -218,7 +206,37 @@ IngestResult BeaconPeerTable::ingest(const char* buf, std::size_t len, bool trun
 
     if (!utils::is_rfc1918_ipv4(src_ip)) return record_locked(IngestResult::BadSource);
     expire_locked(now);
-    if (!admit_locked(src_ip, now)) return record_locked(IngestResult::RateLimited);
+
+    // Pinned sources (those owning a live row) skip the global bucket so a
+    // flood from other addresses cannot starve refreshes from known peers.
+    // Their per-source token is only spent on a structurally valid beacon:
+    // junk forged with a known peer's source IP must not drain the budget of
+    // that peer's real refreshes, so it is charged to the global bucket.
+    if (is_pinned_locked(src_ip)) {
+        if (source_state_locked(src_ip, now).bucket.tokens < 1.0) {
+            return record_locked(IngestResult::RateLimited);
+        }
+        IngestResult result = ingest_admitted_locked(buf, len, truncated, src_ip, now);
+        if (result == IngestResult::BadPayload || result == IngestResult::UrlMismatch) {
+            take_global_token_locked(now);
+        } else {
+            auto it = sources_.find(src_ip);
+            if (it != sources_.end()) it->second.bucket.tokens -= 1.0;
+        }
+        return result;
+    }
+
+    // The per-source check comes first so one noisy host only ever spends its
+    // own small bucket, never the global budget that admits new peers.
+    SourceState& st = source_state_locked(src_ip, now);
+    if (st.bucket.tokens < 1.0) return record_locked(IngestResult::RateLimited);
+    if (!take_global_token_locked(now)) return record_locked(IngestResult::RateLimited);
+    st.bucket.tokens -= 1.0;
+    return ingest_admitted_locked(buf, len, truncated, src_ip, now);
+}
+
+IngestResult BeaconPeerTable::ingest_admitted_locked(const char* buf, std::size_t len, bool truncated,
+                                                     uint32_t src_ip, steady_clock::time_point now) {
     if (buf == nullptr || len == 0 || len >= kMaxDatagram || truncated) {
         return record_locked(IngestResult::BadPayload);
     }
@@ -441,20 +459,41 @@ void BeaconListener::start(const std::string& instance_id, int self_port) {
         std::lock_guard<std::mutex> status_lock(status_mtx_);
         supported_ = true;
         error_.clear();
+        start_failed_ = false;
         sockets_status_ = nlohmann::json::array();
     }
     {
         std::lock_guard<std::mutex> cv_lock(cv_mtx_);
         stop_ = false;
     }
+    // running_ is only set once the worker exists: a std::system_error from
+    // thread creation (EAGAIN on a constrained gateway) must leave the
+    // listener cleanly stopped, and must not escape into Server::run().
+    try {
+        worker_ = std::thread(&BeaconListener::thread_loop, this);
+    } catch (const std::exception& e) {
+        {
+            std::lock_guard<std::mutex> status_lock(status_mtx_);
+            error_ = std::string("failed to start beacon listener thread: ") + e.what();
+            start_failed_ = true;
+        }
+        LOG(ERROR, "BeaconListener") << "Failed to start beacon listener thread: " << e.what() << std::endl;
+        return;
+    }
     running_ = true;
-    worker_ = std::thread(&BeaconListener::thread_loop, this);
     LOG(INFO, "BeaconListener") << "Listening for LAN beacons on UDP " << kBeaconPort << std::endl;
 #endif
 }
 
 void BeaconListener::stop() {
     std::lock_guard<std::mutex> lock(lifecycle_mtx_);
+    {
+        std::lock_guard<std::mutex> status_lock(status_mtx_);
+        if (start_failed_) {
+            start_failed_ = false;
+            error_.clear();
+        }
+    }
     if (!running_.load()) return;
     {
         std::lock_guard<std::mutex> cv_lock(cv_mtx_);
@@ -475,6 +514,11 @@ void BeaconListener::stop() {
 
 nlohmann::json BeaconListener::status_json() const {
     if (!running_.load()) {
+        std::lock_guard<std::mutex> status_lock(status_mtx_);
+        if (start_failed_) {
+            return {{"enabled", true}, {"supported", supported_}, {"listening", false},
+                    {"error", error_}, {"sockets", nlohmann::json::array()}};
+        }
         return {{"enabled", false}};
     }
     auto now = std::chrono::steady_clock::now();

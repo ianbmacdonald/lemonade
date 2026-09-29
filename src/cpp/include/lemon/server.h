@@ -98,7 +98,7 @@ private:
     // mirroring the input shape, containing only entries that actually changed.
     void apply_config_side_effects(const json& applied_changes);
 
-    // Start or stop the LAN beacon listener to match config; safe to call repeatedly.
+    // Idempotent: run(), stop() and the config side-effect path all converge on config.
     void sync_beacon_listener();
 
     // Hot-swap a backend binary when its *_bin config value changes. Unloads
