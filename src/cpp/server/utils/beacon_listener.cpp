@@ -138,6 +138,13 @@ const char* ingest_result_name(IngestResult result) {
     return "unknown";
 }
 
+bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
+                             const std::vector<unsigned>& listened_ifindexes) {
+    (void)allowlist_active;
+    if (ifindex == 0) return true;
+    return std::find(listened_ifindexes.begin(), listened_ifindexes.end(), ifindex) != listened_ifindexes.end();
+}
+
 BeaconPeerTable::BeaconPeerTable() = default;
 
 void BeaconPeerTable::set_self(const std::string& instance_id, int self_port) {
@@ -699,13 +706,12 @@ void BeaconListener::refresh_sockets() {
 }
 
 bool BeaconListener::arrived_on_listened_interface(const SocketState& sock, unsigned ifindex) const {
-    if (ifindex == 0) {
-        // Without the arrival interface, only a directed-broadcast socket is
-        // tied to a listened interface; 255.255.255.255 arrives on any of them.
-        return !(allowlist_active_ && sock.bind_ip == 0xFFFFFFFFu);
-    }
-    return std::any_of(interfaces_.begin(), interfaces_.end(),
-                       [ifindex](const ListenedInterface& i) { return i.index == ifindex; });
+    // Without the arrival interface, only a directed-broadcast socket is
+    // tied to a listened interface; 255.255.255.255 arrives on any of them.
+    if (ifindex == 0 && allowlist_active_ && sock.bind_ip == 0xFFFFFFFFu) return false;
+    std::vector<unsigned> listened;
+    for (const auto& i : interfaces_) listened.push_back(i.index);
+    return beacon_arrival_accepted(allowlist_active_, ifindex, listened);
 }
 
 void BeaconListener::thread_loop() {
