@@ -239,6 +239,16 @@ int main() {
         res.set_content(payload, "application/octet-stream");
     });
 
+    // The next ranged request stays silent long enough to trip a 1 s stall.
+    std::atomic<bool> stall_next_range{false};
+    server.Get("/stall-first.bin", [&](const httplib::Request& req, httplib::Response& res) {
+        log.add(req);
+        if (!req.get_header_value("Range").empty() && stall_next_range.exchange(false)) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        res.set_content(payload, "application/octet-stream");
+    });
+
     const int port = server.bind_to_any_port("127.0.0.1");
     std::thread server_thread([&server]() { server.listen_after_bind(); });
     server.wait_until_ready();
@@ -549,6 +559,69 @@ int main() {
         log.take();
         r.check(result.cancelled, "cancelling during the range probe reports a cancellation");
         r.check(elapsed_ms < 2500, "the range probe honours cancellation before the server answers");
+    }
+
+    {
+        // A partial that shrinks between attempts must be resumed from its
+        // real size, not the larger offset of the previous attempt.
+        const fs::path f = dir / "shrunk.bin";
+        const size_t initial = 400000;
+        const size_t shrunk = 100000;
+        write_all(partial_of(f), payload.substr(0, initial));
+        stall_next_range = true;
+        bool truncated = false;
+        auto shrink_once = [&](size_t, size_t) {
+            if (!truncated) {
+                fs::resize_file(partial_of(f), shrunk);
+                truncated = true;
+            }
+            return true;
+        };
+        DownloadOptions options = parallel_options();
+        options.allow_parallel = false;
+        options.no_progress_timeout = 1;
+        options.max_retries = 1;
+        log.take();
+        auto result = HttpClient::download_file(base + "/stall-first.bin", f.string(), shrink_once,
+                                                {}, options, policy);
+        const auto ranges = log.take();
+        bool resumed_at_shrunk = false;
+        for (const auto& range : ranges) {
+            if (range == "bytes=" + std::to_string(shrunk) + "-") {
+                resumed_at_shrunk = true;
+            }
+        }
+        r.check(truncated, "the partial was shrunk during the first attempt");
+        r.check(result.success && read_all(f) == payload,
+                "a partial that shrank between attempts still completes byte-identical");
+        r.check(resumed_at_shrunk, "the retry resumes from the shrunk partial size");
+    }
+
+    {
+        // A single-stream resume answered with 200 (Range ignored) must not
+        // append the whole body after the kept prefix.
+        const fs::path f = dir / "resume-200.bin";
+        const size_t kept = 400000;
+        write_all(partial_of(f), payload.substr(0, kept));
+        DownloadOptions options = parallel_options();
+        options.allow_parallel = false;
+        log.take();
+        auto result = HttpClient::download_file(base + "/norange.bin", f.string(), nullptr, {},
+                                                options, policy);
+        log.take();
+        const std::string partial = read_all(partial_of(f));
+        printf("  resume-200: curl_code=%d http_code=%ld partial=%zu\n", result.curl_code,
+               result.http_code, partial.size());
+        r.check(!result.success, "a resume answered with 200 is not accepted");
+        r.check(partial.size() == kept && partial == payload.substr(0, kept),
+                "a resume answered with 200 leaves the partial untouched");
+
+        options.max_retries = 1;
+        auto retried = HttpClient::download_file(base + "/norange.bin", f.string(), nullptr, {},
+                                                 options, policy);
+        log.take();
+        r.check(retried.success && read_all(f) == payload,
+                "after a refused resume the retry restarts and completes byte-identical");
     }
 
     server.stop();
