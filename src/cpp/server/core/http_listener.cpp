@@ -407,6 +407,13 @@ void HttpListener::start() {
 void HttpListener::sync_beacon_listener() {
     std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
     beacon_listener_.set_interface_allowlist(config_->beacon_listen_interfaces());
+    try {
+        beacon_listener_.set_trusted_relays(
+            parse_beacon_trusted_relays(config_->beacon_trusted_relays()));
+    } catch (const std::exception& e) {
+        LOG(ERROR, "Server") << "Ignoring beacon_trusted_relays: " << e.what() << std::endl;
+        beacon_listener_.set_trusted_relays({});
+    }
     if (!beacon_listener_shutdown_ && config_->beacon_listen()) {
         beacon_listener_.start(instance_id_, port_.load());
     } else {
