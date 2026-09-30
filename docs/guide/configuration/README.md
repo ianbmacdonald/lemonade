@@ -51,6 +51,7 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
   "auto_update_models": false,
   "beacon_listen": false,
   "beacon_listen_interfaces": [],
+  "beacon_trusted_relays": [],
   "broadcast": true,
   "cloud_providers": [],
   "config_version": 2,
