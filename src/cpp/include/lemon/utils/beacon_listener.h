@@ -130,6 +130,8 @@ private:
     IngestResult ingest_admitted_locked(const char* buf, std::size_t len, bool truncated, uint32_t src_ip,
                                         std::chrono::steady_clock::time_point now);
     SourceState& source_state_locked(uint32_t src_ip, std::chrono::steady_clock::time_point now);
+    SourceState& relayed_host_state_locked(uint32_t url_host, std::chrono::steady_clock::time_point now);
+    const BeaconTrustedRelay* relay_for_locked(uint32_t src_ip) const;
     bool take_global_token_locked(std::chrono::steady_clock::time_point now);
     bool is_pinned_locked(uint32_t src_ip) const;
     void expire_locked(std::chrono::steady_clock::time_point now);
@@ -143,6 +145,10 @@ private:
     Bucket global_bucket_;
     bool global_bucket_primed_ = false;
     std::map<uint32_t, SourceState> sources_;
+    std::vector<BeaconTrustedRelay> relays_;
+    // Per advertised host, so one relay cannot refresh any single host faster
+    // than that host could by beaconing directly.
+    std::map<uint32_t, SourceState> relayed_hosts_;
     std::map<IngestResult, uint64_t> stats_;
     uint64_t evicted_ = 0;
 };
