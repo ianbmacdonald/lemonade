@@ -135,6 +135,9 @@ const char* ingest_result_name(IngestResult result) {
         case IngestResult::TableFull: return "table_full";
         case IngestResult::WrongInterface: return "wrong_interface";
         case IngestResult::UnknownInterface: return "unknown_interface";
+        case IngestResult::RelayedAccepted: return "relayed_accepted";
+        case IngestResult::RelayedRefreshed: return "relayed_refreshed";
+        case IngestResult::RelayHostRefused: return "relay_host_refused";
     }
     return "unknown";
 }
@@ -145,7 +148,25 @@ bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
     return std::find(listened_ifindexes.begin(), listened_ifindexes.end(), ifindex) != listened_ifindexes.end();
 }
 
+bool BeaconHostRange::contains(uint32_t) const {
+    return false;
+}
+
+std::string BeaconHostRange::to_string() const {
+    return utils::ipv4_to_string(network) + "/" + std::to_string(prefix);
+}
+
+std::vector<BeaconTrustedRelay> parse_beacon_trusted_relays(const nlohmann::json&) {
+    return {};
+}
+
+nlohmann::json beacon_trusted_relays_to_json(const std::vector<BeaconTrustedRelay>&) {
+    return nlohmann::json::array();
+}
+
 BeaconPeerTable::BeaconPeerTable() = default;
+
+void BeaconPeerTable::set_trusted_relays(std::vector<BeaconTrustedRelay>) {}
 
 void BeaconPeerTable::set_self(const std::string& instance_id, int self_port) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -445,6 +466,10 @@ BeaconListener::BeaconListener() = default;
 
 BeaconListener::~BeaconListener() {
     stop();
+}
+
+void BeaconListener::set_trusted_relays(std::vector<BeaconTrustedRelay> relays) {
+    table_.set_trusted_relays(std::move(relays));
 }
 
 bool BeaconListener::is_running() const {
