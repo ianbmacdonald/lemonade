@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <set>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 
@@ -117,6 +118,63 @@ void refill(double& tokens, steady_clock::time_point& last, steady_clock::time_p
     }
 }
 
+uint32_t prefix_mask(int prefix) {
+    return prefix <= 0 ? 0u : 0xFFFFFFFFu << (32 - prefix);
+}
+
+bool parse_ipv4_literal(const std::string& s, uint32_t& out) {
+    size_t pos = 0;
+    uint32_t addr = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint32_t octet = 0;
+        if (!parse_decimal(s, pos, 3, octet) || octet > 255) return false;
+        addr = (addr << 8) | octet;
+        if (i < 3) {
+            if (pos >= s.size() || s[pos] != '.') return false;
+            ++pos;
+        }
+    }
+    if (pos != s.size()) return false;
+    out = addr;
+    return true;
+}
+
+// A relay may only vouch for RFC1918 hosts, so a range must sit wholly
+// inside one RFC1918 block.
+bool parse_host_range(const std::string& text, BeaconHostRange& range, std::string& why) {
+    auto slash = text.find('/');
+    uint32_t addr = 0;
+    if (!parse_ipv4_literal(text.substr(0, slash), addr)) {
+        why = "is not an IPv4 address or CIDR like 192.168.79.20 or 192.168.79.0/24";
+        return false;
+    }
+    int prefix = 32;
+    if (slash != std::string::npos) {
+        size_t pos = slash + 1;
+        uint32_t p = 0;
+        if (!parse_decimal(text, pos, 2, p) || pos != text.size() || p > 32) {
+            why = "has an invalid prefix length (0-32)";
+            return false;
+        }
+        prefix = static_cast<int>(p);
+    }
+    if ((addr & ~prefix_mask(prefix)) != 0) {
+        why = "has host bits set; use " + utils::ipv4_to_string(addr & prefix_mask(prefix)) + "/" +
+              std::to_string(prefix);
+        return false;
+    }
+    static const std::pair<uint32_t, int> kBlocks[] = {{0x0A000000u, 8}, {0xAC100000u, 12}, {0xC0A80000u, 16}};
+    for (const auto& [net, len] : kBlocks) {
+        if (prefix >= len && (addr & prefix_mask(len)) == net) {
+            range.network = addr;
+            range.prefix = prefix;
+            return true;
+        }
+    }
+    why = "is not inside 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16";
+    return false;
+}
+
 int64_t epoch_seconds(std::chrono::system_clock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
 }
@@ -148,25 +206,104 @@ bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
     return std::find(listened_ifindexes.begin(), listened_ifindexes.end(), ifindex) != listened_ifindexes.end();
 }
 
-bool BeaconHostRange::contains(uint32_t) const {
-    return false;
+bool BeaconHostRange::contains(uint32_t ip) const {
+    return (ip & prefix_mask(prefix)) == network;
 }
 
 std::string BeaconHostRange::to_string() const {
     return utils::ipv4_to_string(network) + "/" + std::to_string(prefix);
 }
 
-std::vector<BeaconTrustedRelay> parse_beacon_trusted_relays(const nlohmann::json&) {
-    return {};
+std::vector<BeaconTrustedRelay> parse_beacon_trusted_relays(const nlohmann::json& value) {
+    auto fail = [](const std::string& why) {
+        throw std::invalid_argument("'beacon_trusted_relays' " + why);
+    };
+    if (!value.is_array()) fail("must be an array of {\"source\", \"allow_hosts\"} objects");
+    if (value.size() > kMaxTrustedRelays) {
+        fail("may list at most " + std::to_string(kMaxTrustedRelays) + " relays");
+    }
+    std::vector<BeaconTrustedRelay> relays;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const auto& entry = value[i];
+        const std::string where = "entry " + std::to_string(i);
+        if (!entry.is_object()) fail(where + " must be an object");
+        for (const auto& item : entry.items()) {
+            if (item.key() != "source" && item.key() != "allow_hosts") {
+                fail(where + " has unknown field '" + item.key() + "'");
+            }
+        }
+        auto src_it = entry.find("source");
+        if (src_it == entry.end() || !src_it->is_string()) fail(where + " needs \"source\": an IPv4 address");
+        BeaconTrustedRelay relay;
+        const std::string src = src_it->get<std::string>();
+        if (!parse_ipv4_literal(src, relay.source)) {
+            fail(where + " source '" + src + "' is not an IPv4 address like 192.168.60.10");
+        }
+        if (!utils::is_rfc1918_ipv4(relay.source)) {
+            fail(where + " source '" + src + "' is not an RFC1918 address");
+        }
+        for (const auto& other : relays) {
+            if (other.source == relay.source) fail(where + " repeats source '" + src + "'");
+        }
+        auto hosts_it = entry.find("allow_hosts");
+        if (hosts_it == entry.end() || !hosts_it->is_array() || hosts_it->empty()) {
+            fail(where + " needs \"allow_hosts\": a non-empty array of IPv4 addresses or CIDRs");
+        }
+        if (hosts_it->size() > kMaxRelayAllowHosts) {
+            fail(where + " allow_hosts may list at most " + std::to_string(kMaxRelayAllowHosts) + " entries");
+        }
+        for (const auto& h : *hosts_it) {
+            if (!h.is_string()) fail(where + " allow_hosts entries must be strings");
+            const std::string text = h.get<std::string>();
+            BeaconHostRange range;
+            std::string why;
+            if (!parse_host_range(text, range, why)) fail(where + " allow_hosts '" + text + "' " + why);
+            relay.allow_hosts.push_back(range);
+        }
+        relays.push_back(std::move(relay));
+    }
+    return relays;
 }
 
-nlohmann::json beacon_trusted_relays_to_json(const std::vector<BeaconTrustedRelay>&) {
-    return nlohmann::json::array();
+nlohmann::json beacon_trusted_relays_to_json(const std::vector<BeaconTrustedRelay>& relays) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& relay : relays) {
+        nlohmann::json hosts = nlohmann::json::array();
+        for (const auto& range : relay.allow_hosts) hosts.push_back(range.to_string());
+        out.push_back({{"source", utils::ipv4_to_string(relay.source)}, {"allow_hosts", hosts}});
+    }
+    return out;
 }
 
 BeaconPeerTable::BeaconPeerTable() = default;
 
-void BeaconPeerTable::set_trusted_relays(std::vector<BeaconTrustedRelay>) {}
+namespace {
+bool relay_allows(const BeaconTrustedRelay& relay, uint32_t url_host) {
+    if (!utils::is_rfc1918_ipv4(url_host)) return false;
+    return std::any_of(relay.allow_hosts.begin(), relay.allow_hosts.end(),
+                       [url_host](const BeaconHostRange& r) { return r.contains(url_host); });
+}
+} // namespace
+
+void BeaconPeerTable::set_trusted_relays(std::vector<BeaconTrustedRelay> relays) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    relays_ = std::move(relays);
+    for (auto it = rows_.begin(); it != rows_.end();) {
+        const auto* relay = it->second.via == 0 ? nullptr : relay_for_locked(it->second.via);
+        if (it->second.via != 0 && (relay == nullptr || !relay_allows(*relay, it->second.url_host))) {
+            it = rows_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+const BeaconTrustedRelay* BeaconPeerTable::relay_for_locked(uint32_t src_ip) const {
+    for (const auto& relay : relays_) {
+        if (relay.source == src_ip) return &relay;
+    }
+    return nullptr;
+}
 
 void BeaconPeerTable::set_self(const std::string& instance_id, int self_port) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -207,7 +344,32 @@ BeaconPeerTable::SourceState& BeaconPeerTable::source_state_locked(uint32_t src_
         if (unpinned >= kMaxSources && oldest != sources_.end()) {
             sources_.erase(oldest);
         }
-        it = sources_.emplace(src_ip, SourceState{{kPerSourceBurst, now}, now}).first;
+        it = sources_.emplace(src_ip, SourceState{{0.0, now}, now}).first;
+        it->second.bucket.tokens = relay_for_locked(src_ip) != nullptr ? kRelayBurst : kPerSourceBurst;
+    }
+    auto& st = it->second;
+    if (relay_for_locked(src_ip) != nullptr) {
+        refill(st.bucket.tokens, st.bucket.last, now, kRelayRate, kRelayBurst);
+    } else {
+        // A source dropped from beacon_trusted_relays must not keep its larger relay burst.
+        st.bucket.tokens = std::min(st.bucket.tokens, kPerSourceBurst);
+        refill(st.bucket.tokens, st.bucket.last, now, kPerSourceRate, kPerSourceBurst);
+    }
+    st.last_seen = now;
+    return st;
+}
+
+BeaconPeerTable::SourceState& BeaconPeerTable::relayed_host_state_locked(uint32_t url_host,
+                                                                         steady_clock::time_point now) {
+    auto it = relayed_hosts_.find(url_host);
+    if (it == relayed_hosts_.end()) {
+        if (relayed_hosts_.size() >= kMaxSources) {
+            auto oldest = std::min_element(relayed_hosts_.begin(), relayed_hosts_.end(), [](const auto& a, const auto& b) {
+                return a.second.last_seen < b.second.last_seen;
+            });
+            relayed_hosts_.erase(oldest);
+        }
+        it = relayed_hosts_.emplace(url_host, SourceState{{kPerSourceBurst, now}, now}).first;
     }
     auto& st = it->second;
     refill(st.bucket.tokens, st.bucket.last, now, kPerSourceRate, kPerSourceBurst);
@@ -248,7 +410,8 @@ IngestResult BeaconPeerTable::ingest(const char* buf, std::size_t len, bool trun
             return record_locked(IngestResult::RateLimited);
         }
         IngestResult result = ingest_admitted_locked(buf, len, truncated, src_ip, now);
-        if (result == IngestResult::BadPayload || result == IngestResult::UrlMismatch) {
+        if (result == IngestResult::BadPayload || result == IngestResult::UrlMismatch ||
+            result == IngestResult::RelayHostRefused) {
             take_global_token_locked(now);
         } else {
             auto it = sources_.find(src_ip);
@@ -300,16 +463,28 @@ IngestResult BeaconPeerTable::ingest_admitted_locked(const char* buf, std::size_
     uint32_t url_host = 0;
     uint32_t url_port = 0;
     if (!parse_beacon_url(url, url_host, url_port)) return record_locked(IngestResult::BadPayload);
-    if (url_host != src_ip) return record_locked(IngestResult::UrlMismatch);
+    const BeaconTrustedRelay* relay = nullptr;
+    if (url_host != src_ip) {
+        relay = relay_for_locked(src_ip);
+        if (relay == nullptr) return record_locked(IngestResult::UrlMismatch);
+        if (!relay_allows(*relay, url_host)) return record_locked(IngestResult::RelayHostRefused);
+    }
+    const uint32_t via = relay != nullptr ? src_ip : 0;
 
     std::string hostname = sanitize_hostname(host_it->get<std::string>());
 
     if (!instance_id.empty()) {
         if (instance_id == self_instance_id_) return record_locked(IngestResult::Self);
     } else if (static_cast<int>(url_port) == self_port_ &&
-               std::find(local_addresses_.begin(), local_addresses_.end(), src_ip) !=
+               std::find(local_addresses_.begin(), local_addresses_.end(), url_host) !=
                    local_addresses_.end()) {
         return record_locked(IngestResult::Self);
+    }
+
+    if (relay != nullptr) {
+        SourceState& host_state = relayed_host_state_locked(url_host, now);
+        if (host_state.bucket.tokens < 1.0) return record_locked(IngestResult::RateLimited);
+        host_state.bucket.tokens -= 1.0;
     }
 
     auto wall = std::chrono::system_clock::now();
@@ -320,9 +495,20 @@ IngestResult BeaconPeerTable::ingest_admitted_locked(const char* buf, std::size_
         row.instance_id = instance_id;
         row.source_ip = utils::ipv4_to_string(src_ip);
         row.source_ip_host_order = src_ip;
+        row.url_host = url_host;
+        row.via = via;
         row.last_seen = now;
         row.last_seen_wall = wall;
-        return record_locked(IngestResult::Refreshed);
+        return record_locked(relay != nullptr ? IngestResult::RelayedRefreshed : IngestResult::Refreshed);
+    }
+
+    if (relay != nullptr) {
+        auto vouched = std::count_if(rows_.begin(), rows_.end(), [&](const auto& r) {
+            return r.second.via == src_ip && now - r.second.last_seen <= kPeerTtl;
+        });
+        if (static_cast<std::size_t>(vouched) >= kMaxRelayedHostsPerRelay) {
+            return record_locked(IngestResult::TableFull);
+        }
     }
 
     if (rows_.size() >= kMaxHosts) {
@@ -346,12 +532,14 @@ IngestResult BeaconPeerTable::ingest_admitted_locked(const char* buf, std::size_
     row.url = url;
     row.source_ip = utils::ipv4_to_string(src_ip);
     row.source_ip_host_order = src_ip;
+    row.url_host = url_host;
+    row.via = via;
     row.instance_id = instance_id;
     row.first_seen_wall = wall;
     row.last_seen_wall = wall;
     row.last_seen = now;
     rows_.emplace(url, std::move(row));
-    return record_locked(IngestResult::Accepted);
+    return record_locked(relay != nullptr ? IngestResult::RelayedAccepted : IngestResult::Accepted);
 }
 
 void BeaconPeerTable::expire_locked(steady_clock::time_point now) {
@@ -397,6 +585,7 @@ nlohmann::json BeaconPeerTable::to_json(steady_clock::time_point now) const {
             {"hostname", row->hostname},
             {"url", row->url},
             {"source_ip", row->source_ip},
+            {"via", row->via == 0 ? nlohmann::json(nullptr) : nlohmann::json(utils::ipv4_to_string(row->via))},
             {"instance_id", row->instance_id.empty() ? nlohmann::json(nullptr) : nlohmann::json(row->instance_id)},
             {"first_seen", epoch_seconds(row->first_seen_wall)},
             {"last_seen", epoch_seconds(row->last_seen_wall)},
@@ -408,7 +597,8 @@ nlohmann::json BeaconPeerTable::to_json(steady_clock::time_point now) const {
     for (auto r : {IngestResult::Accepted, IngestResult::Refreshed, IngestResult::Self,
                    IngestResult::BadSource, IngestResult::BadPayload, IngestResult::UrlMismatch,
                    IngestResult::RateLimited, IngestResult::TableFull, IngestResult::WrongInterface,
-                   IngestResult::UnknownInterface}) {
+                   IngestResult::UnknownInterface, IngestResult::RelayedAccepted,
+                   IngestResult::RelayedRefreshed, IngestResult::RelayHostRefused}) {
         auto it = stats_.find(r);
         stats[ingest_result_name(r)] = it == stats_.end() ? 0 : it->second;
     }
@@ -420,6 +610,7 @@ nlohmann::json BeaconPeerTable::to_json(steady_clock::time_point now) const {
         {"ttl_seconds", kPeerTtl.count()},
         {"max_hosts", kMaxHosts},
         {"distinct_instances", ids.size() + without_id},
+        {"trusted_relays", beacon_trusted_relays_to_json(relays_)},
         {"hosts", hosts},
         {"stats", stats},
     };
@@ -457,6 +648,7 @@ void BeaconPeerTable::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     rows_.clear();
     sources_.clear();
+    relayed_hosts_.clear();
     stats_.clear();
     evicted_ = 0;
     global_bucket_primed_ = false;
@@ -611,6 +803,8 @@ void BeaconListener::log_rejection(IngestResult result, uint32_t src_ip) {
     switch (result) {
         case IngestResult::Accepted:
         case IngestResult::Refreshed:
+        case IngestResult::RelayedAccepted:
+        case IngestResult::RelayedRefreshed:
         case IngestResult::Self:
             return;
         default:
