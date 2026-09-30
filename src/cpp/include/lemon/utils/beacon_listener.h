@@ -24,6 +24,11 @@ constexpr double kGlobalBurst = 1000.0;
 constexpr double kPerSourceRate = 2.0;
 constexpr double kPerSourceBurst = 4.0;
 constexpr std::size_t kMaxSources = 64;
+constexpr double kRelayRate = 8.0;
+constexpr double kRelayBurst = 16.0;
+constexpr std::size_t kMaxRelayedHostsPerRelay = kMaxHosts / 2;
+constexpr std::size_t kMaxTrustedRelays = 16;
+constexpr std::size_t kMaxRelayAllowHosts = 32;
 constexpr std::size_t kMaxDatagram = 1024;
 constexpr std::chrono::seconds kIfaceRefresh{10};
 constexpr std::chrono::milliseconds kPollSlice{500};
@@ -43,7 +48,10 @@ enum class IngestResult {
     RateLimited,
     TableFull,
     WrongInterface,
-    UnknownInterface
+    UnknownInterface,
+    RelayedAccepted,
+    RelayedRefreshed,
+    RelayHostRefused
 };
 
 const char* ingest_result_name(IngestResult result);
@@ -52,12 +60,34 @@ const char* ingest_result_name(IngestResult result);
 bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
                              const std::vector<unsigned>& listened_ifindexes);
 
+struct BeaconHostRange {
+    uint32_t network = 0;
+    int prefix = 32;
+    bool contains(uint32_t ip) const;
+    std::string to_string() const;
+};
+
+// A datagram whose source is `source` may advertise a URL on any host in
+// `allow_hosts`, which must lie inside RFC1918.
+struct BeaconTrustedRelay {
+    uint32_t source = 0;
+    std::vector<BeaconHostRange> allow_hosts;
+};
+
+// Parses the beacon_trusted_relays config value; throws std::invalid_argument
+// naming the offending entry.
+std::vector<BeaconTrustedRelay> parse_beacon_trusted_relays(const nlohmann::json& value);
+nlohmann::json beacon_trusted_relays_to_json(const std::vector<BeaconTrustedRelay>& relays);
+
 struct HeardHost {
     std::string hostname;
     std::string url;
     std::string source_ip;
     std::string instance_id;
     uint32_t source_ip_host_order = 0;
+    uint32_t url_host = 0;
+    // Datagram source when the host was heard through a trusted relay, else 0.
+    uint32_t via = 0;
     std::chrono::system_clock::time_point first_seen_wall;
     std::chrono::system_clock::time_point last_seen_wall;
     std::chrono::steady_clock::time_point last_seen;
@@ -72,6 +102,7 @@ public:
     void set_self(const std::string& instance_id, int self_port);
     void set_self_port(int port);
     void set_local_addresses(std::vector<uint32_t> addrs);
+    void set_trusted_relays(std::vector<BeaconTrustedRelay> relays);
 
     IngestResult ingest(const char* buf, std::size_t len, bool truncated, uint32_t src_ip,
                         std::chrono::steady_clock::time_point now);
@@ -133,6 +164,7 @@ public:
     void set_self_port(int port);
     // Interface names to listen on; empty means every RFC1918 interface.
     void set_interface_allowlist(std::vector<std::string> names);
+    void set_trusted_relays(std::vector<BeaconTrustedRelay> relays);
     bool is_running() const;
     nlohmann::json status_json() const;
 

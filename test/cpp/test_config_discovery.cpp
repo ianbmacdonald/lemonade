@@ -4,12 +4,14 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 #include <lemon/cli_parser.h>
 #include <lemon/config_file.h>
 #include <lemon/runtime_config.h>
+#include <lemon/utils/beacon_listener.h>
 
 #include "test_config_helpers.h"
 
@@ -309,6 +311,94 @@ int main() {
         json defaults = ConfigFile::get_defaults();
         check(defaults.contains("beacon_listen_interfaces") && defaults["beacon_listen_interfaces"] == json::array(),
               "ConfigFile defaults include beacon_listen_interfaces: []");
+    }
+
+    // 13. beacon_trusted_relays: default, round-trip, and rejection of bad shapes
+    {
+        RuntimeConfig relay_cfg(base_cfg);
+        check(relay_cfg.beacon_trusted_relays() == json::array(), "beacon_trusted_relays defaults to []");
+        json good = json::array({{{"source", "192.168.60.10"},
+                                  {"allow_hosts", json::array({"192.168.79.20", "10.20.0.0/16"})}}});
+        relay_cfg.set({{"beacon_trusted_relays", good}});
+        check(relay_cfg.beacon_trusted_relays() == good, "beacon_trusted_relays round-trips");
+        check(relay_cfg.snapshot()["beacon_trusted_relays"] == good, "snapshot reflects beacon_trusted_relays");
+        auto parsed = lemon::parse_beacon_trusted_relays(good);
+        check(parsed.size() == 1 && parsed[0].source == 0xC0A83C0Au && parsed[0].allow_hosts.size() == 2 &&
+                  parsed[0].allow_hosts[0].prefix == 32 && parsed[0].allow_hosts[1].network == 0x0A140000u &&
+                  parsed[0].allow_hosts[1].prefix == 16,
+              "parse_beacon_trusted_relays decodes source, a bare host and a CIDR");
+        check(lemon::beacon_trusted_relays_to_json(parsed) ==
+                  json::array({{{"source", "192.168.60.10"},
+                                {"allow_hosts", json::array({"192.168.79.20/32", "10.20.0.0/16"})}}}),
+              "trusted relays serialise with canonical CIDRs");
+        relay_cfg.set({{"beacon_trusted_relays", json::array()}});
+        check(relay_cfg.beacon_trusted_relays() == json::array(), "beacon_trusted_relays cleared");
+
+        auto relay = [](const json& source, const json& hosts) {
+            return json::array({{{"source", source}, {"allow_hosts", hosts}}});
+        };
+        json too_many = json::array();
+        for (int i = 0; i < 17; ++i) {
+            too_many.push_back({{"source", "10.0.0." + std::to_string(i + 1)},
+                                {"allow_hosts", json::array({"10.1.0.1"})}});
+        }
+        json duplicate = relay("10.0.0.1", json::array({"10.1.0.1"}));
+        duplicate.push_back(duplicate[0]);
+        std::vector<std::pair<std::string, json>> bad_values = {
+            {"not an array", json({{"source", "10.0.0.1"}})},
+            {"entry not an object", json::array({"10.0.0.1"})},
+            {"missing source", json::array({{{"allow_hosts", json::array({"10.1.0.1"})}}})},
+            {"missing allow_hosts", json::array({{{"source", "10.0.0.1"}}})},
+            {"unknown field", json::array({{{"source", "10.0.0.1"},
+                                            {"allow_hosts", json::array({"10.1.0.1"})},
+                                            {"trust", true}}})},
+            {"source not a string", relay(42, json::array({"10.1.0.1"}))},
+            {"source hostname", relay("relay.lan", json::array({"10.1.0.1"}))},
+            {"source leading zero", relay("192.168.060.10", json::array({"10.1.0.1"}))},
+            {"source with prefix", relay("192.168.60.10/32", json::array({"10.1.0.1"}))},
+            {"source public", relay("8.8.8.8", json::array({"10.1.0.1"}))},
+            {"allow_hosts empty", relay("10.0.0.1", json::array())},
+            {"allow_hosts not array", relay("10.0.0.1", "10.1.0.1")},
+            {"allow_hosts entry not string", relay("10.0.0.1", json::array({1}))},
+            {"allow_hosts garbage", relay("10.0.0.1", json::array({"ai4"}))},
+            {"allow_hosts public host", relay("10.0.0.1", json::array({"8.8.8.8"}))},
+            {"allow_hosts public cidr", relay("10.0.0.1", json::array({"0.0.0.0/0"}))},
+            {"allow_hosts cidr wider than rfc1918", relay("10.0.0.1", json::array({"192.168.0.0/15"}))},
+            {"allow_hosts cidr straddles rfc1918", relay("10.0.0.1", json::array({"172.0.0.0/8"}))},
+            {"allow_hosts prefix out of range", relay("10.0.0.1", json::array({"10.1.0.0/33"}))},
+            {"allow_hosts empty prefix", relay("10.0.0.1", json::array({"10.1.0.0/"}))},
+            {"allow_hosts host bits set", relay("10.0.0.1", json::array({"10.1.0.5/24"}))},
+            {"allow_hosts too many", relay("10.0.0.1", json(std::vector<std::string>(33, "10.1.0.1")))},
+            {"too many relays", too_many},
+            {"duplicate source", duplicate},
+        };
+        for (const auto& [label, bad] : bad_values) {
+            bool threw = false;
+            std::string message;
+            try {
+                relay_cfg.set({{"beacon_trusted_relays", bad}});
+            } catch (const std::invalid_argument& e) {
+                threw = true;
+                message = e.what();
+            }
+            check(threw && message.find("beacon_trusted_relays") != std::string::npos,
+                  ("set() rejects beacon_trusted_relays: " + label).c_str());
+        }
+        check(relay_cfg.beacon_trusted_relays() == json::array(), "a rejected set() leaves the relays unchanged");
+
+        bool threw_ctor = false;
+        try {
+            json bad = base_cfg;
+            bad["beacon_trusted_relays"] = relay("8.8.8.8", json::array({"10.1.0.1"}));
+            RuntimeConfig bad_cfg(bad);
+        } catch (const std::invalid_argument&) {
+            threw_ctor = true;
+        }
+        check(threw_ctor, "constructor rejects a malformed beacon_trusted_relays");
+
+        json defaults = ConfigFile::get_defaults();
+        check(defaults.contains("beacon_trusted_relays") && defaults["beacon_trusted_relays"] == json::array(),
+              "ConfigFile defaults include beacon_trusted_relays: []");
     }
 
     return test_helpers::report_results("C++ config/discovery");

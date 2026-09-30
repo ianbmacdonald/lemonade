@@ -407,6 +407,154 @@ void test_single_source_flood(Clock::time_point t0) {
     check(feed(t, beacon(url_for(fresh)), fresh, t0) == IngestResult::Accepted,
           "single source: a new peer is still accepted during the flood");
 }
+
+std::vector<lemon::BeaconTrustedRelay> relays_from(const json& j) {
+    return lemon::parse_beacon_trusted_relays(j);
+}
+
+void test_trusted_relay(Clock::time_point t0) {
+    uint32_t relay = ip(192, 168, 60, 10);
+    uint32_t ai4 = ip(192, 168, 79, 20);
+    std::string p = beacon(url_for(ai4), "ai4-resolute", "0a1b2c3d4e5f6071");
+    json config = json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.20"})}}});
+
+    {
+        BeaconPeerTable t;
+        check(feed(t, p, relay, t0) == IngestResult::UrlMismatch, "relay: default [] keeps url_mismatch");
+        check(t.size() == 0, "relay: default [] lists nothing");
+    }
+    {
+        BeaconPeerTable t;
+        t.set_trusted_relays(relays_from(config));
+        check(feed(t, p, relay, t0) == IngestResult::RelayedAccepted, "relay: listed source + allowed host accepted");
+        check(feed(t, p, relay, t0 + std::chrono::seconds(2)) == IngestResult::RelayedRefreshed,
+              "relay: repeat is RelayedRefreshed");
+        json j = t.to_json(t0 + std::chrono::seconds(2));
+        check(j["hosts"].size() == 1 && j["hosts"][0]["url"] == url_for(ai4) &&
+                  j["hosts"][0]["via"] == "192.168.60.10" && j["hosts"][0]["source_ip"] == "192.168.60.10",
+              "relay: host listed with via = relay source");
+        check(j["stats"]["relayed_accepted"] == 1 && j["stats"]["accepted"] == 0 &&
+                  j["stats"]["relayed_refreshed"] == 1 && j["stats"]["refreshed"] == 0,
+              "relay: relayed_accepted counted separately from accepted");
+
+        uint32_t direct = ip(192, 168, 60, 11);
+        check(feed(t, beacon(url_for(direct)), direct, t0) == IngestResult::Accepted,
+              "relay: a direct peer alongside is Accepted");
+        json k = t.to_json(t0 + std::chrono::seconds(2));
+        bool direct_via_null = false;
+        for (const auto& h : k["hosts"]) {
+            if (h["url"] == url_for(direct)) direct_via_null = h["via"].is_null();
+        }
+        check(direct_via_null, "relay: a direct host has via null");
+
+        check(feed(t, p, ai4, t0 + std::chrono::seconds(3)) == IngestResult::Refreshed,
+              "relay: the same URL heard directly refreshes the row");
+        json d = t.to_json(t0 + std::chrono::seconds(3));
+        bool cleared = false;
+        for (const auto& h : d["hosts"]) {
+            if (h["url"] == url_for(ai4)) cleared = h["via"].is_null() && h["source_ip"] == "192.168.79.20";
+        }
+        check(cleared, "relay: a direct refresh clears via");
+    }
+    {
+        BeaconPeerTable t;
+        t.set_trusted_relays(relays_from(config));
+        uint32_t other = ip(192, 168, 79, 21);
+        check(feed(t, beacon(url_for(other)), relay, t0) == IngestResult::RelayHostRefused,
+              "relay: URL host outside allow_hosts refused");
+        check(t.size() == 0 && t.stat(IngestResult::RelayHostRefused) == 1 &&
+                  t.stat(IngestResult::UrlMismatch) == 0,
+              "relay: refusal counted as relay_host_refused, nothing listed");
+    }
+    {
+        BeaconPeerTable t;
+        t.set_trusted_relays(relays_from(config));
+        uint32_t stranger = ip(192, 168, 60, 12);
+        check(feed(t, p, stranger, t0) == IngestResult::UrlMismatch, "relay: unlisted source stays url_mismatch");
+        check(t.size() == 0, "relay: unlisted source lists nothing");
+    }
+    {
+        BeaconPeerTable t;
+        lemon::BeaconTrustedRelay wide;
+        wide.source = relay;
+        wide.allow_hosts.push_back({0, 0});
+        t.set_trusted_relays({wide});
+        check(feed(t, beacon(url_for(ip(8, 8, 8, 8))), relay, t0) == IngestResult::RelayHostRefused,
+              "relay: public URL host refused even when allow_hosts would cover it");
+        check(feed(t, beacon(url_for(ip(100, 64, 0, 1))), relay, t0 + std::chrono::seconds(1)) ==
+                  IngestResult::RelayHostRefused,
+              "relay: CGNAT URL host refused");
+        check(feed(t, beacon(url_for(ai4)), ip(8, 8, 8, 8), t0) == IngestResult::BadSource,
+              "relay: public datagram source is still BadSource");
+    }
+    {
+        BeaconPeerTable t;
+        t.set_self("ffffffffffffffff", 13305);
+        t.set_trusted_relays(relays_from(config));
+        check(feed(t, beacon(url_for(ai4), "me", "ffffffffffffffff"), relay, t0) == IngestResult::Self,
+              "relay: our own beacon relayed back is Self");
+        BeaconPeerTable u;
+        u.set_self("ffffffffffffffff", 13305);
+        u.set_local_addresses({ai4});
+        u.set_trusted_relays(relays_from(config));
+        check(feed(u, beacon(url_for(ai4), "me"), relay, t0) == IngestResult::Self,
+              "relay: our own id-less beacon relayed back is Self");
+    }
+    {
+        BeaconPeerTable t;
+        t.set_trusted_relays(relays_from(config));
+        feed(t, p, relay, t0);
+        t.set_trusted_relays({});
+        check(t.size() == 0, "relay: removing the relay drops the rows it vouched for");
+        check(feed(t, p, relay, t0 + std::chrono::seconds(1)) == IngestResult::UrlMismatch,
+              "relay: removal takes effect for the next datagram");
+    }
+    {
+        BeaconPeerTable t;
+        t.set_trusted_relays(relays_from(
+            json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.0/24"})}}})));
+        int admitted = 0;
+        for (int i = 0; i < 20; ++i) {
+            IngestResult r = feed(t, p, relay, t0);
+            if (r == IngestResult::RelayedAccepted || r == IngestResult::RelayedRefreshed) ++admitted;
+        }
+        check(admitted == static_cast<int>(lemon::kPerSourceBurst),
+              "relay: one relayed host is held to the per-source burst");
+
+        int accepted = 0;
+        for (int h = 1; h <= 40; ++h) {
+            auto now = t0 + std::chrono::seconds(10) + std::chrono::milliseconds(h * 200);
+            if (feed(t, beacon(url_for(ip(192, 168, 79, 100 + h))), relay, now) == IngestResult::RelayedAccepted) {
+                ++accepted;
+            }
+        }
+        check(accepted == static_cast<int>(lemon::kMaxRelayedHostsPerRelay),
+              "relay: one relay lists at most kMaxRelayedHostsPerRelay hosts");
+
+        int burst = 0;
+        auto later = t0 + std::chrono::milliseconds(18200);
+        for (int i = 0; i < 100; ++i) {
+            uint32_t host = ip(192, 168, 79, 101 + (i % 16));
+            IngestResult r = feed(t, beacon(url_for(host)), relay, later);
+            if (r != IngestResult::RateLimited) ++burst;
+        }
+        check(burst <= static_cast<int>(lemon::kRelayBurst), "relay: a relay's total burst is bounded");
+    }
+    {
+        BeaconPeerTable t;
+        t.set_trusted_relays(relays_from(
+            json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.0/24"})}}})));
+        int admitted = 0;
+        for (int i = 0; i < 10; ++i) {
+            for (uint32_t host : {ip(192, 168, 79, 20), ip(192, 168, 79, 21)}) {
+                IngestResult r = feed(t, beacon(url_for(host)), relay, t0);
+                if (r == IngestResult::RelayedAccepted || r == IngestResult::RelayedRefreshed) ++admitted;
+            }
+        }
+        check(admitted == 2 * static_cast<int>(lemon::kPerSourceBurst),
+              "relay: each relayed host gets its own per-source burst");
+    }
+}
 } // namespace
 
 int main() {
@@ -427,6 +575,7 @@ int main() {
     test_flood_survival(t0);
     test_pinned_junk_flood(t0);
     test_single_source_flood(t0);
+    test_trusted_relay(t0);
 
     return test_helpers::report_results("beacon peer table");
 }
