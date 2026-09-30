@@ -228,6 +228,49 @@ int run_netns_tests() {
         listener.stop();
     }
 
+    {
+        BeaconListener listener;
+        listener.start("6666666666666666", 18999);
+        check(wait_for([&] { return listener.status_json().value("listening", false); },
+                       std::chrono::milliseconds(2000)),
+              "relay listener is listening");
+        const std::string relayed_url = "http://10.99.0.20:65005/api/v1/";
+        check(send_beacon("10.213.0.1", "10.213.0.255", relayed_url, "0123456789abcdef"),
+              "relay sent a beacon advertising another host's URL");
+        check(wait_for([&] { return listener.status_json()["stats"]["url_mismatch"].get<int>() >= 1; },
+                       std::chrono::milliseconds(3000)),
+              "without a trusted relay the relayed beacon is a url_mismatch");
+        check(!host_listed(listener, relayed_url), "without a trusted relay the relayed host is not listed");
+
+        listener.set_trusted_relays(lemon::parse_beacon_trusted_relays(
+            json::array({{{"source", "10.213.0.1"}, {"allow_hosts", json::array({"10.99.0.0/24"})}}})));
+        check(listener.status_json()["trusted_relays"] ==
+                  json::array({{{"source", "10.213.0.1"}, {"allow_hosts", json::array({"10.99.0.0/24"})}}}),
+              "status echoes the trusted relays");
+        send_beacon("10.214.0.1", "10.214.0.255", relayed_url, "0123456789abcdef");
+        send_beacon("10.213.0.1", "10.213.0.255", "http://10.98.0.20:65006/api/v1/", "123456789abcdef0");
+        check(send_beacon("10.213.0.1", "10.213.0.255", relayed_url, "0123456789abcdef"),
+              "trusted relay re-sent the beacon");
+        check(wait_for([&] { return host_listed(listener, relayed_url); }, std::chrono::milliseconds(3000)),
+              "relayed beacon from a trusted relay is listed");
+        json st = listener.status_json();
+        bool via_ok = false;
+        for (const auto& h : st["hosts"]) {
+            if (h["url"] == relayed_url) via_ok = h["via"] == "10.213.0.1" && h["source_ip"] == "10.213.0.1";
+        }
+        check(via_ok, "relayed host shows via = the relay's address");
+        check(st["stats"].value("relayed_accepted", -1) == 1 && st["stats"].value("accepted", -1) == 0,
+              "relayed host counted in relayed_accepted, not accepted");
+        check(st["stats"].value("relay_host_refused", -1) >= 1,
+              "relayed URL outside allow_hosts counted as relay_host_refused");
+        check(st["stats"]["url_mismatch"].get<int>() >= 2, "an untrusted sender advertising the host stays url_mismatch");
+        check(!host_listed(listener, "http://10.98.0.20:65006/api/v1/"), "host outside allow_hosts is not listed");
+
+        listener.set_trusted_relays({});
+        check(!host_listed(listener, relayed_url), "clearing the trusted relays drops the relayed host");
+        listener.stop();
+    }
+
     return test_helpers::report_results("beacon listener netns broadcast");
 }
 

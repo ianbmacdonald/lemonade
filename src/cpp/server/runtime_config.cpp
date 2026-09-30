@@ -2,6 +2,7 @@
 #include "lemon/backends/backend_descriptor_registry.h"
 #include "lemon/system_info.h"
 #include "lemon/utils/aixlog.hpp"
+#include "lemon/utils/beacon_listener.h"
 #include "lemon/utils/http_client.h"
 #include "lemon/utils/path_utils.h"
 #include "lemon/utils/rate_limit_utils.h"
@@ -282,6 +283,9 @@ RuntimeConfig::RuntimeConfig(const json& config)
     if (config_.contains("beacon_listen_interfaces")) {
         validate_beacon_listen_interfaces(config_["beacon_listen_interfaces"]);
     }
+    if (config_.contains("beacon_trusted_relays")) {
+        parse_beacon_trusted_relays(config_["beacon_trusted_relays"]);
+    }
     // Migrate legacy no_broadcast if present
     if (config_.contains("no_broadcast")) {
         if (!config_["no_broadcast"].is_boolean()) {
@@ -513,6 +517,13 @@ std::vector<std::string> RuntimeConfig::beacon_listen_interfaces() const {
         if (v.is_string()) names.push_back(v.get<std::string>());
     }
     return names;
+}
+
+json RuntimeConfig::beacon_trusted_relays() const {
+    std::shared_lock lock(mutex_);
+    auto it = config_.find("beacon_trusted_relays");
+    if (it == config_.end() || !it->is_array()) return json::array();
+    return *it;
 }
 
 bool RuntimeConfig::inhibit_suspend() const {
@@ -971,6 +982,8 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
         }
     } else if (key == "beacon_listen_interfaces") {
         validate_beacon_listen_interfaces(value);
+    } else if (key == "beacon_trusted_relays") {
+        parse_beacon_trusted_relays(value);
     } else if (key == "auto_evict_threshold_pct") {
         if (!value.is_number()) {
             throw std::invalid_argument("'auto_evict_threshold_pct' must be a number");

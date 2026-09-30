@@ -7689,6 +7689,12 @@ void Server::handle_bin_change(const std::string& section,
 void Server::sync_beacon_listener() {
     std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
     beacon_listener_.set_interface_allowlist(config_->beacon_listen_interfaces());
+    try {
+        beacon_listener_.set_trusted_relays(parse_beacon_trusted_relays(config_->beacon_trusted_relays()));
+    } catch (const std::exception& e) {
+        LOG(ERROR, "Server") << "Ignoring beacon_trusted_relays: " << e.what() << std::endl;
+        beacon_listener_.set_trusted_relays({});
+    }
     if (!beacon_listener_shutdown_ && config_->beacon_listen()) {
         beacon_listener_.start(instance_id_, port_.load());
     } else {
@@ -7783,7 +7789,7 @@ void Server::apply_config_side_effects(const json& applied_changes) {
             LOG(INFO, "Server") << "Beacon listener "
                                 << (config_->beacon_listen() ? "enabled" : "disabled") << std::endl;
             sync_beacon_listener();
-        } else if (key == "beacon_listen_interfaces") {
+        } else if (key == "beacon_listen_interfaces" || key == "beacon_trusted_relays") {
             sync_beacon_listener();
         } else if (key == "extra_models_dir") {
             std::string dir = config_->extra_models_dir();
