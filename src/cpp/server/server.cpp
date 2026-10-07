@@ -6246,10 +6246,18 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
                     return name;
                 }
             };
-            if (model_manager_->model_exists(model_name)) {
+            std::optional<ModelInfo> existing_info;
+            try {
+                if (model_manager_->model_exists(model_name)) {
+                    existing_info = model_manager_->get_model_info(model_name);
+                }
+            } catch (const std::exception&) {
+                // Deleted between the two calls: check it as a new registration.
+            }
+            if (existing_info) {
                 // The download uses the existing registration, so that is what a pin
                 // must be checked against; a request that also changes it is refused.
-                const ModelInfo existing = model_manager_->get_model_info(model_name);
+                const ModelInfo& existing = *existing_info;
                 const std::string existing_registry = existing.registry_source.empty()
                     ? config_->default_model_source()
                     : existing.registry_source;
