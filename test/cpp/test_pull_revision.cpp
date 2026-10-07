@@ -77,12 +77,14 @@ static void test_pinned_snapshot_id(const fs::path& root) {
                R"({"processed_models":{
                    "pinned":{"selection":"s","snapshot_id":"bbbb","pinned_revision":"bbbb"},
                    "follow":{"selection":"s","snapshot_id":"aaaa"},
-                   "escape":{"selection":"s","snapshot_id":"x","pinned_revision":"../aaaa"}}})");
+                   "escape":{"selection":"s","snapshot_id":"x","pinned_revision":"../aaaa"},
+                   "dot":{"selection":"s","snapshot_id":"x","pinned_revision":"."}}})");
     check("a pinned entry yields its snapshot", rf::pinned_snapshot_id(cache, "pinned") == "bbbb");
     check("an unpinned entry yields no pin", rf::pinned_snapshot_id(cache, "follow").empty());
     check("an unknown model yields no pin", rf::pinned_snapshot_id(cache, "other").empty());
     check("a pin that is not a single path component is ignored",
           rf::pinned_snapshot_id(cache, "escape").empty());
+    check("a pin of '.' is ignored", rf::pinned_snapshot_id(cache, "dot").empty());
 
     write_file(cache / ".lemonade_registry.json", "{not json");
     check("malformed provenance yields no pin", rf::pinned_snapshot_id(cache, "pinned").empty());
@@ -182,6 +184,10 @@ static void test_pinnable_snapshot_id() {
     check("an empty snapshot id is refused", !rf::is_pinnable_snapshot_id("main", ""));
     check("a snapshot id that escapes snapshots/ is refused",
           !rf::is_pinnable_snapshot_id("main", "../x"));
+    for (const std::string dotted : {".", "..", ".hidden"}) {
+        check("a dot-led snapshot id '" + dotted + "' is refused",
+              !rf::is_pinnable_snapshot_id("main", dotted));
+    }
 }
 
 int main() {

@@ -5168,7 +5168,9 @@ std::string active_local_snapshot(
 }
 
 static bool is_snapshot_component(const std::string& snapshot_id) {
-    return !snapshot_id.empty() && registry_revision_error(snapshot_id).empty() &&
+    // A leading dot would name "." or a hidden entry rather than a commit.
+    return !snapshot_id.empty() && snapshot_id.front() != '.' &&
+           registry_revision_error(snapshot_id).empty() &&
            snapshot_id.find('/') == std::string::npos;
 }
 
