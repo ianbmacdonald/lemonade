@@ -128,6 +128,12 @@ static void test_pinned_model_resolution(const fs::path& root, const fs::path& h
     check("a pinned model never falls back to another snapshot",
           path_from_utf8(missing.resolved_path()).string().find(
               path_to_utf8(main_snapshot)) == std::string::npos);
+
+    fs::remove_all(pinned_snapshot);
+    manager.invalidate_models_cache();
+    const ModelInfo gone = manager.get_model_info("user.pinned");
+    check("a pinned model whose snapshot is gone is not downloaded",
+          !gone.downloaded && gone.resolved_path().empty());
 }
 
 int main() {

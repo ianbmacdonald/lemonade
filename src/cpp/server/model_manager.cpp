@@ -1538,16 +1538,26 @@ std::string ModelManager::resolve_model_path(const ModelInfo& info, const std::s
     ctx.variant = checkpoint_to_variant(checkpoint);
     ctx.registry_source = effective_registry_source(info);
     ctx.model_cache_path = hf_cache + "/" + repo_id_to_cache_dir_name(ctx.repo_id, ctx.registry_source);
-    if (!info.pinned_revision.empty() && ctx.repo_id == ctx.main_repo_id) {
+    const bool pinned = !info.pinned_revision.empty() && ctx.repo_id == ctx.main_repo_id;
+    if (pinned) {
         // Presenting the pinned snapshot as the whole repository cache keeps every
         // backend's lookup, including refs/main and whole-cache fallbacks, on the
         // pinned commit without each backend knowing about pins.
         ctx.model_cache_path += "/snapshots/" + info.pinned_revision;
+        if (!safe_exists(path_from_utf8(ctx.model_cache_path))) {
+            return "";
+        }
     }
     ctx.type = type;
     ctx.checkpoint = checkpoint;
 
-    return backends::ops_for(info.recipe)->resolve_checkpoint_path(info, ctx);
+    std::string resolved = backends::ops_for(info.recipe)->resolve_checkpoint_path(info, ctx);
+    // Backends fall back to the cache root when a named file is absent (the
+    // pre-snapshot flat layout); for a pin that root is the snapshot itself.
+    if (pinned && !ctx.variant.empty() && resolved == ctx.model_cache_path) {
+        return "";
+    }
+    return resolved;
 }
 
 void ModelManager::resolve_all_model_paths(ModelInfo& info) {
