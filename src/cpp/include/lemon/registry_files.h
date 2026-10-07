@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <filesystem>
 #include <map>
+#include <optional>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -53,6 +55,30 @@ std::string snapshot_id_from_resolved_path(
 std::string active_local_snapshot(
     const std::string& resolved_path,
     const std::filesystem::path& model_cache_path);
+
+// Snapshot a pinned pull recorded for model_name in the repository's
+// .lemonade_registry.json; empty when the model follows refs/main. A recorded
+// value that is not a single safe path component is ignored.
+std::string pinned_snapshot_id(
+    const std::filesystem::path& model_cache_path,
+    const std::string& model_name);
+
+// Every snapshot some model in the repository is pinned to; nullopt when the
+// provenance file exists but cannot be read, i.e. the pins are unknown.
+std::optional<std::set<std::string>> pinned_snapshot_ids(
+    const std::filesystem::path& model_cache_path);
+
+// The revision a download fetches: the request's own, none when the request
+// releases the pin, otherwise the pin currently recorded on disk.
+std::string download_revision(const std::string& requested_revision,
+                              bool release_pin,
+                              const std::string& current_pin);
+
+// False when a pinned pull must refuse the snapshot id the registry resolved:
+// not a single safe path component, or the requested name echoed back instead
+// of a commit id.
+bool is_pinnable_snapshot_id(const std::string& requested_revision,
+                             const std::string& snapshot_id);
 
 // content_id identifies content across commits (LFS sha256 or git blob oid),
 // so revisions compare without downloading anything.

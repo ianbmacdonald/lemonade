@@ -124,6 +124,10 @@ std::string huggingface_repository_api_url(
     const std::string& endpoint,
     const std::string& repo_id,
     const std::string& revision = "");
+// Empty when `revision` may be sent to a registry (the empty default included);
+// otherwise a message suitable for a 400 response. Checked before any network
+// call because the value becomes part of a registry URL.
+std::string registry_revision_error(const std::string& revision);
 std::optional<nlohmann::json> parse_huggingface_compatibility_response(
     int status_code,
     const std::string& body,

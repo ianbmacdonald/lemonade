@@ -210,7 +210,8 @@ std::string normalize_huggingface_checkpoint_arg(const std::string& arg) {
 int registry_pull_flow(lemonade::LemonadeClient& client,
                        const std::string& model_arg,
                        bool assume_yes,
-                       const std::string& registry_source) {
+                       const std::string& registry_source,
+                       const std::string& revision) {
     std::string source;
     std::string checkpoint;
     std::string variant;
@@ -278,6 +279,9 @@ int registry_pull_flow(lemonade::LemonadeClient& client,
         pull_body["model_name"] = model_name;
         pull_body["recipe"] = "collection.omni";
         pull_body["source"] = source;
+        if (!revision.empty()) {
+            pull_body["revision"] = revision;
+        }
         // The repo is the checkpoint pointer; /pull resolves components from the
         // manifest it downloads to disk, and a later `lemonade pull <name>`
         // refreshes them from the recorded remote registry.
@@ -363,6 +367,9 @@ int registry_pull_flow(lemonade::LemonadeClient& client,
         pull_body["checkpoint"] = checkpoint;
         pull_body["recipe"] = recipe;
         pull_body["source"] = source;
+        if (!revision.empty()) {
+            pull_body["revision"] = revision;
+        }
 
         std::cout << "Pulling " << checkpoint
                   << " as " << suggested_name << std::endl;
@@ -414,6 +421,9 @@ int registry_pull_flow(lemonade::LemonadeClient& client,
     pull_body["checkpoint"] = checkpoint + ":" + variant_name;
     pull_body["recipe"] = recipe;
     pull_body["source"] = source;
+    if (!revision.empty()) {
+        pull_body["revision"] = revision;
+    }
 
     if (variants_response.contains("suggested_labels") &&
         variants_response["suggested_labels"].is_array() &&

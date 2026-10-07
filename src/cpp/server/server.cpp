@@ -3246,6 +3246,11 @@ void Server::handle_model_register(const httplib::Request& req, httplib::Respons
             return;
         }
 
+        if (request_json.contains("revision")) {
+            bad_request("`revision` applies to /pull only; /models/register does not download");
+            return;
+        }
+
         const std::string model_name = request_json["model_name"].get<std::string>();
         const std::string public_name = register_model_definition_internal(
             model_name,
@@ -3338,6 +3343,9 @@ nlohmann::json Server::model_info_to_json(const std::string& model_id, const Mod
         {"components", public_components},
         {"recipe_options", info.recipe_options.to_json()},
     };
+    if (!info.pinned_revision.empty()) {
+        model_json["pinned_revision"] = info.pinned_revision;
+    }
 
     // Surface the cloud provider on cloud entries so the Model Manager can
     // bucket each provider into its own sub-heading. Omitted on local models
@@ -6177,6 +6185,32 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         bool subscribe = request_json.value("subscribe", true);
         bool local_import = request_json.value("local_import", false);
 
+        std::string revision;
+        if (request_json.contains("revision")) {
+            if (!request_json["revision"].is_string()) {
+                bad_request("`revision` must be a string when provided");
+                return;
+            }
+            revision = request_json["revision"].get<std::string>();
+            const std::string revision_error = lemon::registry_revision_error(revision);
+            if (!revision_error.empty()) {
+                bad_request(revision_error);
+                return;
+            }
+            request_json.erase("revision");
+            if (!revision.empty() && local_import) {
+                bad_request("`revision` applies only to registry downloads, not local imports");
+                return;
+            }
+            if (!revision.empty() && config_->offline()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{
+                    {"error", "revision pinning needs network access; offline mode is on"},
+                    {"code", "lemond_offline"}}.dump(), "application/json");
+                return;
+            }
+        }
+
         // Resolve the pull's registry provenance once, up front, so download,
         // cache layout, and later refresh stay consistent. A registry-backed
         // checkpoint that names no source inherits the configured default; a
@@ -6198,6 +6232,78 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         }
         if (!recipe.empty()) {
             LOG(INFO, "Server") << "   recipe: " << recipe << std::endl;
+        }
+        if (!revision.empty()) {
+            LOG(INFO, "Server") << "   revision: " << revision << std::endl;
+            std::string pinned_recipe = recipe;
+            const std::string requested_source =
+                request_json.contains("source") && request_json["source"].is_string()
+                    ? request_json["source"].get<std::string>()
+                    : std::string();
+            std::string pinned_source =
+                requested_source.empty() || lemon::is_remote_registry_source(requested_source)
+                    ? std::string()
+                    : requested_source;
+            std::string pinned_registry =
+                request_json.contains("registry_source") && request_json["registry_source"].is_string()
+                    ? request_json["registry_source"].get<std::string>()
+                    : std::string();
+            if (pinned_registry.empty() && lemon::is_remote_registry_source(requested_source)) {
+                pinned_registry = requested_source;
+            }
+            const auto registry_name = [](const std::string& name) {
+                try {
+                    return remote_registry_source_name(parse_remote_registry_source(name));
+                } catch (const std::exception&) {
+                    return name;
+                }
+            };
+            std::optional<ModelInfo> existing_info;
+            try {
+                if (model_manager_->model_exists(model_name)) {
+                    existing_info = model_manager_->get_model_info(model_name);
+                }
+            } catch (const std::exception&) {
+                // Deleted between the two calls: check it as a new registration.
+            }
+            if (existing_info) {
+                // The download uses the existing registration, so that is what a pin
+                // must be checked against; a request that also changes it is refused.
+                const ModelInfo& existing = *existing_info;
+                const std::string existing_registry = existing.registry_source.empty()
+                    ? config_->default_model_source()
+                    : existing.registry_source;
+                if ((!pinned_recipe.empty() && pinned_recipe != existing.recipe) ||
+                    (!pinned_source.empty() && pinned_source != existing.source) ||
+                    (!pinned_registry.empty() &&
+                     registry_name(pinned_registry) != registry_name(existing_registry))) {
+                    bad_request("`revision` cannot be combined with a change to the recipe or "
+                                "source of the existing model '" + model_name + "'");
+                    return;
+                }
+                pinned_recipe = existing.recipe;
+                pinned_source = existing.source;
+                pinned_registry = existing_registry;
+            }
+            if (pinned_registry.empty()) pinned_registry = config_->default_model_source();
+            if (is_model_collection_recipe(pinned_recipe) || !pinned_source.empty() ||
+                model_manager_->backend_self_manages_downloads(pinned_recipe)) {
+                bad_request("`revision` applies only to registry downloads; '" + model_name +
+                            "' (recipe " + pinned_recipe + ") cannot be pinned");
+                return;
+            }
+            bool hugging_face = false;
+            try {
+                hugging_face = parse_remote_registry_source(pinned_registry) ==
+                               lemon::RemoteRegistrySource::HuggingFace;
+            } catch (const std::exception&) {
+                // An unrecognized registry name cannot be pinned either.
+            }
+            if (!hugging_face) {
+                bad_request("`revision` pinning is supported for Hugging Face only; '" +
+                            model_name + "' downloads from " + pinned_registry);
+                return;
+            }
         }
 
         // Both API operations always enter the same registration path.
@@ -6242,6 +6348,9 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
                 download_request[field] = request_json[field];
             }
         }
+        // Present even when empty: an explicit /pull without a revision is the one
+        // request that releases a pin; every other download keeps it.
+        download_request["revision"] = revision;
 
         if (stream) {
             auto operation = [this, model_name, download_request, do_not_upgrade](DownloadProgressCallback progress_cb) {
@@ -6272,6 +6381,13 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
             model_manager_->download_model(model_name, download_request, do_not_upgrade);
 
             nlohmann::json response = {{"status", "success"}, {"model_name", model_name}};
+            if (!revision.empty()) {
+                const std::string pinned =
+                    model_manager_->get_model_info(model_name).pinned_revision;
+                if (!pinned.empty()) {
+                    response["revision"] = pinned;
+                }
+            }
             res.set_content(response.dump(), "application/json");
         }
 

@@ -20,6 +20,7 @@
 #include <iostream>
 #include <fstream>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -263,6 +264,13 @@ static std::string repo_id_to_cache_dir_name(const std::string& repo_id,
                                              const std::string& registry_source = "huggingface") {
     return registry_repo_cache_dir_name(repo_id,
         parse_remote_registry_source(registry_source));
+}
+
+static bool is_commit_sha(const std::string& value) {
+    return value.size() == 40 &&
+           std::all_of(value.begin(), value.end(), [](unsigned char c) {
+               return std::isdigit(c) || (c >= 'a' && c <= 'f');
+           });
 }
 
 static std::string read_hf_ref_main(const fs::path& model_cache_path) {
@@ -1538,13 +1546,52 @@ std::string ModelManager::resolve_model_path(const ModelInfo& info, const std::s
     ctx.variant = checkpoint_to_variant(checkpoint);
     ctx.registry_source = effective_registry_source(info);
     ctx.model_cache_path = hf_cache + "/" + repo_id_to_cache_dir_name(ctx.repo_id, ctx.registry_source);
+    const bool pinned = !info.pinned_revision.empty() && ctx.repo_id == ctx.main_repo_id;
+    if (pinned) {
+        // Presenting the pinned snapshot as the whole repository cache keeps every
+        // backend's lookup, including refs/main and whole-cache fallbacks, on the
+        // pinned commit without each backend knowing about pins.
+        ctx.model_cache_path += "/snapshots/" + info.pinned_revision;
+        if (!safe_exists(path_from_utf8(ctx.model_cache_path))) {
+            return "";
+        }
+    }
     ctx.type = type;
     ctx.checkpoint = checkpoint;
 
-    return backends::ops_for(info.recipe)->resolve_checkpoint_path(info, ctx);
+    std::string resolved = backends::ops_for(info.recipe)->resolve_checkpoint_path(info, ctx);
+    // Backends fall back to the cache root when a named file is absent (the
+    // pre-snapshot flat layout); for a pin that root is the snapshot itself.
+    if (pinned && !ctx.variant.empty() && resolved == ctx.model_cache_path) {
+        return "";
+    }
+    if (!pinned && !resolved.empty()) {
+        // Backends that search every snapshot (no refs/main yet, or a variant
+        // missing from it) must not hand an unpinned model another model's
+        // pinned commit; it then reports not downloaded and a pull fetches main.
+        const fs::path cache_path = path_from_utf8(ctx.model_cache_path);
+        const std::string snapshot =
+            registry_files::snapshot_id_from_resolved_path(resolved, cache_path);
+        if (!snapshot.empty() && snapshot != read_hf_ref_main(cache_path)) {
+            const auto pins = registry_files::pinned_snapshot_ids(cache_path);
+            if (!pins || pins->count(snapshot) != 0) {
+                return "";
+            }
+        }
+    }
+    return resolved;
 }
 
 void ModelManager::resolve_all_model_paths(ModelInfo& info) {
+    info.pinned_revision.clear();
+    const std::string main_repo_id = checkpoint_to_repo_id(info.checkpoint("main"));
+    if (info.source.empty() && !main_repo_id.empty() &&
+        !is_model_collection_recipe(info.recipe)) {
+        info.pinned_revision = registry_files::pinned_snapshot_id(
+            path_from_utf8(get_hf_cache_dir()) /
+                repo_id_to_cache_dir_name(main_repo_id, effective_registry_source(info)),
+            info.model_name);
+    }
     for (auto const& [type, checkpoint] : info.checkpoints) {
         info.resolved_paths[type] = resolve_model_path(info, type, checkpoint);
     }
@@ -1899,6 +1946,12 @@ ModelManager::UpdateCheckResult ModelManager::check_for_model_updates(const std:
             // Local-path, local-upload and extra-directory models have no
             // remote registry to check.
             if (!info.source.empty()) {
+                continue;
+            }
+
+            // A pinned model asked for one commit; reporting the branch tip as an
+            // update would let auto-update silently undo the pin.
+            if (!info.pinned_revision.empty()) {
                 continue;
             }
 
@@ -4268,28 +4321,43 @@ bool ModelManager::backend_self_manages_downloads(const std::string& recipe) con
     return desc && desc->self_manages_downloads;
 }
 
+std::shared_ptr<std::mutex> ModelManager::repo_download_lock(const ModelInfo& info) {
+    std::lock_guard<std::mutex> guard(download_locks_mutex_);
+    auto& slot = download_locks_[
+        effective_registry_source(info) + ":" +
+        checkpoint_to_repo_id(info.checkpoint("main"))];
+    if (!slot) slot = std::make_shared<std::mutex>();
+    return slot;
+}
+
 void ModelManager::download_registered_model(const ModelInfo& info, bool do_not_upgrade, DownloadProgressCallback progress_callback) {
     // Serialize downloads per checkpoint repo. A second request for the same
     // repo (e.g. a client that timed out and retried /pull while the first
     // download is still running) must wait for the in-flight download instead
     // of writing the same .partial files concurrently, which corrupts them and
     // sends the hash verification into an endless retry-from-scratch loop.
-    std::shared_ptr<std::mutex> repo_lock;
-    {
-        std::lock_guard<std::mutex> guard(download_locks_mutex_);
-        auto& slot = download_locks_[
-            effective_registry_source(info) + ":" +
-            checkpoint_to_repo_id(info.checkpoint("main"))];
-        if (!slot) slot = std::make_shared<std::mutex>();
-        repo_lock = slot;
-    }
+    std::shared_ptr<std::mutex> repo_lock = repo_download_lock(info);
     std::lock_guard<std::mutex> download_lock(*repo_lock);
+
+    // The pin is re-read under the repo lock: `info` may predate a pinned pull
+    // that finished while this download waited, and a download that does not
+    // release the pin must restore whatever is pinned now.
+    ModelInfo download_info = info;
+    const std::string main_repo_id = checkpoint_to_repo_id(info.checkpoint("main"));
+    const std::string current_pin = main_repo_id.empty()
+        ? std::string()
+        : registry_files::pinned_snapshot_id(
+              path_from_utf8(get_hf_cache_dir()) /
+                  repo_id_to_cache_dir_name(main_repo_id, effective_registry_source(info)),
+              info.model_name);
+    download_info.requested_revision = registry_files::download_revision(
+        info.requested_revision, info.release_pin, current_pin);
 
     // The backend's ops own the download (shared registry engine by default; flm pulls
     // via the flm CLI; cloud is a no-op).
     backends::BackendOpsContext octx;
     octx.model_manager = this;
-    backends::ops_for(info.recipe)->download_model(info, do_not_upgrade, progress_callback, octx);
+    backends::ops_for(info.recipe)->download_model(download_info, do_not_upgrade, progress_callback, octx);
 
     // Update cache after successful download
     update_model_in_cache(info.model_name, true);
@@ -5033,10 +5101,17 @@ void ModelManager::download_model(const std::string& model_name,
     // The do_not_upgrade flag means:
     //   - Load/inference endpoints: Don't check the remote registry for updates (use cache if available)
     //   - Pull endpoint: Always check the recorded registry for the latest version (do_not_upgrade=false)
-    if (do_not_upgrade && is_model_downloaded(model_name)) {
+    model_info.requested_revision =
+        JsonUtils::get_or_default<std::string>(model_data, "revision", "");
+    if (do_not_upgrade && model_info.requested_revision.empty() &&
+        is_model_downloaded(model_name)) {
         LOG(INFO, "ModelManager") << "Model already downloaded and do_not_upgrade=true, using cached version" << std::endl;
         return;
     }
+    // Only /pull sets "revision" (empty included); load-time, sync, Ollama and
+    // collection-component downloads omit it and so restore the pin instead.
+    model_info.release_pin = !do_not_upgrade && model_data.contains("revision") &&
+                             model_info.requested_revision.empty();
 
     std::map<std::string, std::filesystem::path> resolved_paths_before;
     {
@@ -5100,6 +5175,87 @@ std::string active_local_snapshot(
         snapshot = read_hf_ref_main(model_cache_path);
     }
     return snapshot;
+}
+
+static bool is_snapshot_component(const std::string& snapshot_id) {
+    // A leading dot would name "." or a hidden entry rather than a commit.
+    return !snapshot_id.empty() && snapshot_id.front() != '.' &&
+           registry_revision_error(snapshot_id).empty() &&
+           snapshot_id.find('/') == std::string::npos;
+}
+
+// Every valid pin recorded in a repository's .lemonade_registry.json, by model;
+// nullopt when the file exists but cannot be read.
+static std::optional<std::map<std::string, std::string>> read_pinned_snapshot_ids(
+    const fs::path& model_cache_path) {
+    std::map<std::string, std::string> pins;
+    const fs::path provenance_path = model_cache_path / ".lemonade_registry.json";
+    if (!safe_exists(provenance_path)) {
+        return pins;
+    }
+    try {
+        const json provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
+        const auto models_it = provenance.find("processed_models");
+        if (models_it == provenance.end() || !models_it->is_object()) {
+            return pins;
+        }
+        for (const auto& [model_name, entry] : models_it->items()) {
+            if (!entry.is_object()) continue;
+            const std::string pinned =
+                JsonUtils::get_or_default<std::string>(entry, "pinned_revision", "");
+            if (is_snapshot_component(pinned)) {
+                pins[model_name] = pinned;
+            }
+        }
+    } catch (const std::exception& e) {
+        static std::mutex logged_mutex;
+        static std::set<std::string> logged;
+        std::lock_guard<std::mutex> lock(logged_mutex);
+        if (logged.insert(path_to_utf8(provenance_path)).second) {
+            LOG(ERROR, "ModelManager") << "Cannot read " << path_to_utf8(provenance_path)
+                << " (" << e.what() << "); models in this repository load only "
+                << "the refs/main snapshot until it is repaired or re-pulled" << std::endl;
+        }
+        return std::nullopt;
+    }
+    return pins;
+}
+
+std::string pinned_snapshot_id(
+    const fs::path& model_cache_path,
+    const std::string& model_name) {
+    const auto pins = read_pinned_snapshot_ids(model_cache_path);
+    if (!pins) return "";
+    const auto it = pins->find(model_name);
+    return it == pins->end() ? "" : it->second;
+}
+
+std::optional<std::set<std::string>> pinned_snapshot_ids(const fs::path& model_cache_path) {
+    const auto pins = read_pinned_snapshot_ids(model_cache_path);
+    if (!pins) return std::nullopt;
+    std::set<std::string> ids;
+    for (const auto& [model_name, pinned] : *pins) {
+        (void)model_name;
+        ids.insert(pinned);
+    }
+    return ids;
+}
+
+std::string download_revision(const std::string& requested_revision,
+                              bool release_pin,
+                              const std::string& current_pin) {
+    if (!requested_revision.empty() || release_pin) {
+        return requested_revision;
+    }
+    return current_pin;
+}
+
+bool is_pinnable_snapshot_id(const std::string& requested_revision,
+                             const std::string& snapshot_id) {
+    // A registry that omits the commit id reports the requested name instead;
+    // pinning that would persist a pin the load path cannot honour.
+    return is_snapshot_component(snapshot_id) &&
+           (snapshot_id != requested_revision || is_commit_sha(snapshot_id));
 }
 
 std::map<std::string, std::vector<std::string>> group_aux_checkpoint_variants(
@@ -5760,7 +5916,15 @@ void ModelManager::download_from_registry(const ModelInfo& info,
                                << source_display << ": " << main_repo_id << std::endl;
 
     std::map<std::string, RegistryRepository> repositories;
-    repositories.emplace(main_repo_id, registry.fetch_repository(main_repo_id));
+    const bool pinned = !info.requested_revision.empty();
+    repositories.emplace(main_repo_id,
+                         registry.fetch_repository(main_repo_id, info.requested_revision));
+    if (pinned && !registry_files::is_pinnable_snapshot_id(
+                      info.requested_revision, repositories.at(main_repo_id).snapshot_id)) {
+        throw std::runtime_error(
+            source_display + " did not report a commit for revision '" +
+            info.requested_revision + "' of " + main_repo_id + "; cannot pin it");
+    }
 
     std::map<std::string, std::vector<std::string>> files_to_download;
     std::vector<std::string> main_repo_files;
@@ -5859,6 +6023,9 @@ void ModelManager::download_from_registry(const ModelInfo& info,
     if (source == RemoteRegistrySource::HuggingFace) {
         for (const auto& [repo_id, files] : files_to_download) {
             if (files.empty()) continue;
+            // A pin must own snapshots/<sha> even when its artifacts match the
+            // snapshot refs/main names.
+            if (pinned && repo_id == main_repo_id) continue;
             const std::string current_ref = repo_snapshot_ids.at(repo_id);
             const std::string previous_ref = repo_previous_refs.at(repo_id);
             if (previous_ref.empty() || previous_ref == current_ref) continue;
@@ -5950,30 +6117,46 @@ void ModelManager::download_from_registry(const ModelInfo& info,
 
     for (const auto& [repo_id, snapshot_id] : repo_snapshot_ids) {
         const fs::path& cache_path = repo_cache_paths.at(repo_id);
+        const bool pinned_repo = pinned && repo_id == main_repo_id;
         const bool reusing_previous_snapshot =
             repos_reusing_previous_snapshot.count(repo_id) != 0;
         const std::string active_snapshot_id = reusing_previous_snapshot
             ? repo_previous_refs.at(repo_id)
             : snapshot_id;
 
-        write_hf_ref_main(cache_path, active_snapshot_id);
-        if (reusing_previous_snapshot) {
-            remove_unused_hf_snapshot(
-                cache_path, repo_snapshot_paths.at(repo_id), active_snapshot_id);
-        }
-
         const fs::path provenance_path = cache_path / ".lemonade_registry.json";
+        json previous_provenance = json::object();
         json processed_models = json::object();
         if (safe_exists(provenance_path)) {
             try {
-                const json previous_provenance =
-                    JsonUtils::load_from_file(path_to_utf8(provenance_path));
+                previous_provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
                 if (previous_provenance.contains("processed_models") &&
                     previous_provenance["processed_models"].is_object()) {
                     processed_models = previous_provenance["processed_models"];
                 }
             } catch (const std::exception&) {
                 // Replace invalid provenance after a successful download.
+                previous_provenance = json::object();
+            }
+        }
+
+        if (!pinned_repo) {
+            write_hf_ref_main(cache_path, active_snapshot_id);
+        }
+        if (reusing_previous_snapshot) {
+            // The commit refs/main skipped can be another model's pinned snapshot.
+            bool snapshot_pinned = false;
+            for (const auto& entry : processed_models) {
+                if (entry.is_object() &&
+                    JsonUtils::get_or_default<std::string>(entry, "pinned_revision", "") ==
+                        snapshot_id) {
+                    snapshot_pinned = true;
+                    break;
+                }
+            }
+            if (!snapshot_pinned) {
+                remove_unused_hf_snapshot(
+                    cache_path, repo_snapshot_paths.at(repo_id), active_snapshot_id);
             }
         }
 
@@ -5982,6 +6165,9 @@ void ModelManager::download_from_registry(const ModelInfo& info,
                 {"selection", registry_model_selection(info)},
                 {"snapshot_id", snapshot_id}
             };
+            if (pinned_repo) {
+                processed_models[info.model_name]["pinned_revision"] = snapshot_id;
+            }
         }
 
         const auto& repo = repositories.at(repo_id);
@@ -5992,7 +6178,18 @@ void ModelManager::download_from_registry(const ModelInfo& info,
             {"snapshot_id", active_snapshot_id},
             {"processed_models", std::move(processed_models)}
         };
-        JsonUtils::save_to_file(provenance, path_to_utf8(provenance_path));
+        if (pinned_repo) {
+            // The repository-level fields describe refs/main, which a pin leaves alone.
+            for (const char* field : {"revision", "snapshot_id"}) {
+                if (previous_provenance.contains(field)) {
+                    provenance[field] = previous_provenance[field];
+                } else {
+                    provenance.erase(field);
+                }
+            }
+        }
+        // Loads read the pin from this file concurrently; a torn read would drop it.
+        save_user_json(path_to_utf8(provenance_path), provenance);
     }
 
     if (progress_callback) {
@@ -6010,6 +6207,35 @@ void ModelManager::download_from_registry(const ModelInfo& info,
         << repo_download_paths.at(main_repo_id) << std::endl;
 }
 
+
+void ModelManager::forget_registry_provenance(const ModelInfo& info) {
+    const std::string main_repo_id = checkpoint_to_repo_id(info.checkpoint("main"));
+    if (main_repo_id.empty() || !info.source.empty()) {
+        return;
+    }
+    std::shared_ptr<std::mutex> repo_lock = repo_download_lock(info);
+    std::lock_guard<std::mutex> download_lock(*repo_lock);
+    const fs::path provenance_path =
+        path_from_utf8(get_hf_cache_dir()) /
+        repo_id_to_cache_dir_name(main_repo_id, effective_registry_source(info)) /
+        ".lemonade_registry.json";
+    if (!safe_exists(provenance_path)) {
+        return;
+    }
+    try {
+        json provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
+        const auto models_it = provenance.find("processed_models");
+        if (models_it == provenance.end() || !models_it->is_object() ||
+            !models_it->contains(info.model_name)) {
+            return;
+        }
+        models_it->erase(info.model_name);
+        save_user_json(path_to_utf8(provenance_path), provenance);
+    } catch (const std::exception& e) {
+        LOG(WARNING, "ModelManager") << "Could not update " << path_to_utf8(provenance_path)
+                                     << ": " << e.what() << std::endl;
+    }
+}
 
 void ModelManager::delete_model(const std::string& model_name) {
     auto info = get_model_info(model_name);
@@ -6094,6 +6320,7 @@ void ModelManager::delete_model(const std::string& model_name) {
             LOG(INFO, "ModelManager") << "✓ Removed from user_models.json" << std::endl;
         }
 
+        forget_registry_provenance(info);
         remove_model_from_cache(canonical_model_name);
         LOG(INFO, "ModelManager") << "Successfully removed model from registry: " << canonical_model_name << std::endl;
         return;
@@ -6192,6 +6419,7 @@ void ModelManager::delete_model(const std::string& model_name) {
     }
 
     // Remove from cache after successful deletion
+    forget_registry_provenance(info);
     remove_model_from_cache(canonical_model_name);
 }
 
