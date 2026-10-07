@@ -6194,6 +6194,35 @@ void ModelManager::download_from_registry(const ModelInfo& info,
 }
 
 
+void ModelManager::forget_registry_provenance(const ModelInfo& info) {
+    const std::string main_repo_id = checkpoint_to_repo_id(info.checkpoint("main"));
+    if (main_repo_id.empty() || !info.source.empty()) {
+        return;
+    }
+    std::shared_ptr<std::mutex> repo_lock = repo_download_lock(info);
+    std::lock_guard<std::mutex> download_lock(*repo_lock);
+    const fs::path provenance_path =
+        path_from_utf8(get_hf_cache_dir()) /
+        repo_id_to_cache_dir_name(main_repo_id, effective_registry_source(info)) /
+        ".lemonade_registry.json";
+    if (!safe_exists(provenance_path)) {
+        return;
+    }
+    try {
+        json provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
+        const auto models_it = provenance.find("processed_models");
+        if (models_it == provenance.end() || !models_it->is_object() ||
+            !models_it->contains(info.model_name)) {
+            return;
+        }
+        models_it->erase(info.model_name);
+        save_user_json(path_to_utf8(provenance_path), provenance);
+    } catch (const std::exception& e) {
+        LOG(WARNING, "ModelManager") << "Could not update " << path_to_utf8(provenance_path)
+                                     << ": " << e.what() << std::endl;
+    }
+}
+
 void ModelManager::delete_model(const std::string& model_name) {
     auto info = get_model_info(model_name);
     std::string canonical_model_name = info.model_name;
@@ -6277,6 +6306,7 @@ void ModelManager::delete_model(const std::string& model_name) {
             LOG(INFO, "ModelManager") << "✓ Removed from user_models.json" << std::endl;
         }
 
+        forget_registry_provenance(info);
         remove_model_from_cache(canonical_model_name);
         LOG(INFO, "ModelManager") << "Successfully removed model from registry: " << canonical_model_name << std::endl;
         return;
@@ -6375,6 +6405,7 @@ void ModelManager::delete_model(const std::string& model_name) {
     }
 
     // Remove from cache after successful deletion
+    forget_registry_provenance(info);
     remove_model_from_cache(canonical_model_name);
 }
 

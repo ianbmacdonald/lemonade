@@ -156,6 +156,14 @@ static void test_pinned_model_resolution(const fs::path& root, const fs::path& h
           !manager.get_model_info("user.firstother").downloaded &&
               manager.get_model_info("user.firstother").resolved_path().empty());
 
+    manager.delete_model("user.firstpinned");
+    manager.invalidate_models_cache();
+    check("deleting a pinned model drops its pin from the repository",
+          lemon::registry_files::pinned_snapshot_id(first, "user.firstpinned").empty());
+    check("a sibling then resolves as if the pin never existed",
+          path_from_utf8(manager.get_model_info("user.firstother").resolved_path()) ==
+              first / "snapshots" / "cccc" / "other.gguf");
+
     fs::remove(pinned_snapshot / "model.gguf");
     manager.invalidate_models_cache();
     const ModelInfo missing = manager.get_model_info("user.pinned");

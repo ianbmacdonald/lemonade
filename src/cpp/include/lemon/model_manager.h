@@ -597,6 +597,9 @@ private:
     std::mutex download_locks_mutex_;
     std::map<std::string, std::shared_ptr<std::mutex>> download_locks_;
     std::shared_ptr<std::mutex> repo_download_lock(const ModelInfo& info);
+    // Drops a deleted model's entry (and so its pin) from the repository's
+    // .lemonade_registry.json.
+    void forget_registry_provenance(const ModelInfo& info);
 
     // Prevent startup and manual update checks from running concurrently.
     std::mutex update_check_mutex_;
