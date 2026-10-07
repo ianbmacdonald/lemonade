@@ -20,6 +20,7 @@
 #include <iostream>
 #include <fstream>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -263,6 +264,13 @@ static std::string repo_id_to_cache_dir_name(const std::string& repo_id,
                                              const std::string& registry_source = "huggingface") {
     return registry_repo_cache_dir_name(repo_id,
         parse_remote_registry_source(registry_source));
+}
+
+static bool is_commit_sha(const std::string& value) {
+    return value.size() == 40 &&
+           std::all_of(value.begin(), value.end(), [](unsigned char c) {
+               return std::isdigit(c) || (c >= 'a' && c <= 'f');
+           });
 }
 
 static std::string read_hf_ref_main(const fs::path& model_cache_path) {
@@ -5136,6 +5144,11 @@ std::string active_local_snapshot(
     return snapshot;
 }
 
+static bool is_snapshot_component(const std::string& snapshot_id) {
+    return !snapshot_id.empty() && registry_revision_error(snapshot_id).empty() &&
+           snapshot_id.find('/') == std::string::npos;
+}
+
 std::string pinned_snapshot_id(
     const fs::path& model_cache_path,
     const std::string& model_name) {
@@ -5155,14 +5168,18 @@ std::string pinned_snapshot_id(
         }
         const std::string pinned =
             JsonUtils::get_or_default<std::string>(*model_it, "pinned_revision", "");
-        if (!registry_revision_error(pinned).empty() ||
-            pinned.find('/') != std::string::npos) {
-            return "";
-        }
-        return pinned;
+        return is_snapshot_component(pinned) ? pinned : "";
     } catch (const std::exception&) {
         return "";
     }
+}
+
+bool is_pinnable_snapshot_id(const std::string& requested_revision,
+                             const std::string& snapshot_id) {
+    // A registry that omits the commit id reports the requested name instead;
+    // pinning that would persist a pin the load path cannot honour.
+    return is_snapshot_component(snapshot_id) &&
+           (snapshot_id != requested_revision || is_commit_sha(snapshot_id));
 }
 
 std::map<std::string, std::vector<std::string>> group_aux_checkpoint_variants(
@@ -5826,6 +5843,12 @@ void ModelManager::download_from_registry(const ModelInfo& info,
     const bool pinned = !info.requested_revision.empty();
     repositories.emplace(main_repo_id,
                          registry.fetch_repository(main_repo_id, info.requested_revision));
+    if (pinned && !registry_files::is_pinnable_snapshot_id(
+                      info.requested_revision, repositories.at(main_repo_id).snapshot_id)) {
+        throw std::runtime_error(
+            source_display + " did not report a commit for revision '" +
+            info.requested_revision + "' of " + main_repo_id + "; cannot pin it");
+    }
 
     std::map<std::string, std::vector<std::string>> files_to_download;
     std::vector<std::string> main_repo_files;

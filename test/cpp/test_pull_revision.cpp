@@ -136,6 +136,20 @@ static void test_pinned_model_resolution(const fs::path& root, const fs::path& h
           !gone.downloaded && gone.resolved_path().empty());
 }
 
+static void test_pinnable_snapshot_id() {
+    namespace rf = lemon::registry_files;
+    const std::string sha = "6e091d820cbe8f22eeb604d136403eca290b8c1e";
+    check("a branch resolved to a commit can be pinned", rf::is_pinnable_snapshot_id("main", sha));
+    check("a commit sha echoed back can be pinned", rf::is_pinnable_snapshot_id(sha, sha));
+    check("a slashed ref echoed back for lack of a commit is refused",
+          !rf::is_pinnable_snapshot_id("refs/pr/1", "refs/pr/1"));
+    check("a tag echoed back for lack of a commit is refused",
+          !rf::is_pinnable_snapshot_id("v1.0", "v1.0"));
+    check("an empty snapshot id is refused", !rf::is_pinnable_snapshot_id("main", ""));
+    check("a snapshot id that escapes snapshots/ is refused",
+          !rf::is_pinnable_snapshot_id("main", "../x"));
+}
+
 int main() {
     fs::path temp = make_temp_dir();
     fs::path hf_root = temp / "hf";
@@ -149,6 +163,7 @@ int main() {
     test_revision_api_url();
     test_pinned_snapshot_id(temp);
     test_pinned_model_resolution(temp, hf_root);
+    test_pinnable_snapshot_id();
 
     std::error_code ec;
     fs::remove_all(temp, ec);

@@ -61,6 +61,12 @@ std::string pinned_snapshot_id(
     const std::filesystem::path& model_cache_path,
     const std::string& model_name);
 
+// False when a pinned pull must refuse the snapshot id the registry resolved:
+// not a single safe path component, or the requested name echoed back instead
+// of a commit id.
+bool is_pinnable_snapshot_id(const std::string& requested_revision,
+                             const std::string& snapshot_id);
+
 // content_id identifies content across commits (LFS sha256 or git blob oid),
 // so revisions compare without downloading anything.
 struct HfFileMetadata {
