@@ -106,6 +106,9 @@ struct ModelInfo {
     std::string pinned_revision;
     // Registry revision requested for the download in progress; never persisted.
     std::string requested_revision;
+    // Set only by an explicit /pull without a revision: that download releases
+    // the pin instead of restoring it. Never persisted.
+    bool release_pin = false;
     bool downloaded = false;     // Whether model is downloaded and available
     bool update_available = false; // Whether a newer remote-registry version exists
     std::optional<bool> auto_update = std::nullopt; // Optional per-model auto-update override
@@ -593,6 +596,7 @@ private:
     // (keyed by checkpoint repo). See download_registered_model.
     std::mutex download_locks_mutex_;
     std::map<std::string, std::shared_ptr<std::mutex>> download_locks_;
+    std::shared_ptr<std::mutex> repo_download_lock(const ModelInfo& info);
 
     // Prevent startup and manual update checks from running concurrently.
     std::mutex update_check_mutex_;

@@ -4319,29 +4319,37 @@ bool ModelManager::backend_self_manages_downloads(const std::string& recipe) con
     return desc && desc->self_manages_downloads;
 }
 
+std::shared_ptr<std::mutex> ModelManager::repo_download_lock(const ModelInfo& info) {
+    std::lock_guard<std::mutex> guard(download_locks_mutex_);
+    auto& slot = download_locks_[
+        effective_registry_source(info) + ":" +
+        checkpoint_to_repo_id(info.checkpoint("main"))];
+    if (!slot) slot = std::make_shared<std::mutex>();
+    return slot;
+}
+
 void ModelManager::download_registered_model(const ModelInfo& info, bool do_not_upgrade, DownloadProgressCallback progress_callback) {
     // Serialize downloads per checkpoint repo. A second request for the same
     // repo (e.g. a client that timed out and retried /pull while the first
     // download is still running) must wait for the in-flight download instead
     // of writing the same .partial files concurrently, which corrupts them and
     // sends the hash verification into an endless retry-from-scratch loop.
-    std::shared_ptr<std::mutex> repo_lock;
-    {
-        std::lock_guard<std::mutex> guard(download_locks_mutex_);
-        auto& slot = download_locks_[
-            effective_registry_source(info) + ":" +
-            checkpoint_to_repo_id(info.checkpoint("main"))];
-        if (!slot) slot = std::make_shared<std::mutex>();
-        repo_lock = slot;
-    }
+    std::shared_ptr<std::mutex> repo_lock = repo_download_lock(info);
     std::lock_guard<std::mutex> download_lock(*repo_lock);
 
-    // Load-time downloads pass the cached ModelInfo; when a pinned snapshot has
-    // gone missing they must restore the pinned commit, not the branch tip.
+    // The pin is re-read under the repo lock: `info` may predate a pinned pull
+    // that finished while this download waited, and a download that does not
+    // release the pin must restore whatever is pinned now.
     ModelInfo download_info = info;
-    if (download_info.requested_revision.empty()) {
-        download_info.requested_revision = download_info.pinned_revision;
-    }
+    const std::string main_repo_id = checkpoint_to_repo_id(info.checkpoint("main"));
+    const std::string current_pin = main_repo_id.empty()
+        ? std::string()
+        : registry_files::pinned_snapshot_id(
+              path_from_utf8(get_hf_cache_dir()) /
+                  repo_id_to_cache_dir_name(main_repo_id, effective_registry_source(info)),
+              info.model_name);
+    download_info.requested_revision = registry_files::download_revision(
+        info.requested_revision, info.release_pin, current_pin);
 
     // The backend's ops own the download (shared registry engine by default; flm pulls
     // via the flm CLI; cloud is a no-op).
@@ -5100,10 +5108,8 @@ void ModelManager::download_model(const std::string& model_name,
     }
     // Only /pull sets "revision" (empty included); load-time, sync, Ollama and
     // collection-component downloads omit it and so restore the pin instead.
-    if (!do_not_upgrade && model_data.contains("revision") &&
-        model_info.requested_revision.empty()) {
-        model_info.pinned_revision.clear();
-    }
+    model_info.release_pin = !do_not_upgrade && model_data.contains("revision") &&
+                             model_info.requested_revision.empty();
 
     std::map<std::string, std::filesystem::path> resolved_paths_before;
     {
@@ -5219,6 +5225,15 @@ std::set<std::string> pinned_snapshot_ids(const fs::path& model_cache_path) {
         ids.insert(pinned);
     }
     return ids;
+}
+
+std::string download_revision(const std::string& requested_revision,
+                              bool release_pin,
+                              const std::string& current_pin) {
+    if (!requested_revision.empty() || release_pin) {
+        return requested_revision;
+    }
+    return current_pin;
 }
 
 bool is_pinnable_snapshot_id(const std::string& requested_revision,

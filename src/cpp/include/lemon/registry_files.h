@@ -65,6 +65,12 @@ std::string pinned_snapshot_id(
 // Every snapshot some model in the repository is pinned to.
 std::set<std::string> pinned_snapshot_ids(const std::filesystem::path& model_cache_path);
 
+// The revision a download fetches: the request's own, none when the request
+// releases the pin, otherwise the pin currently recorded on disk.
+std::string download_revision(const std::string& requested_revision,
+                              bool release_pin,
+                              const std::string& current_pin);
+
 // False when a pinned pull must refuse the snapshot id the registry resolved:
 // not a single safe path component, or the requested name echoed back instead
 // of a commit id.

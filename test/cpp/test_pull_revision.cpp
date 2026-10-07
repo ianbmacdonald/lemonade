@@ -172,6 +172,18 @@ static void test_pinned_model_resolution(const fs::path& root, const fs::path& h
           !gone.downloaded && gone.resolved_path().empty());
 }
 
+static void test_download_revision() {
+    namespace rf = lemon::registry_files;
+    check("an explicit revision wins over the recorded pin",
+          rf::download_revision("main", false, "bbbb") == "main");
+    check("a stale request restores the pin recorded on disk",
+          rf::download_revision("", false, "bbbb") == "bbbb");
+    check("an explicit unpinned pull releases the pin",
+          rf::download_revision("", true, "bbbb").empty());
+    check("no pin and no request follows the default branch",
+          rf::download_revision("", false, "").empty());
+}
+
 static void test_pinnable_snapshot_id() {
     namespace rf = lemon::registry_files;
     const std::string sha = "6e091d820cbe8f22eeb604d136403eca290b8c1e";
@@ -204,6 +216,7 @@ int main() {
     test_pinned_snapshot_id(temp);
     test_pinned_model_resolution(temp, hf_root);
     test_pinnable_snapshot_id();
+    test_download_revision();
 
     std::error_code ec;
     fs::remove_all(temp, ec);
