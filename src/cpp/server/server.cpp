@@ -3246,6 +3246,11 @@ void Server::handle_model_register(const httplib::Request& req, httplib::Respons
             return;
         }
 
+        if (request_json.contains("revision")) {
+            bad_request("`revision` applies to /pull only; /models/register does not download");
+            return;
+        }
+
         const std::string model_name = request_json["model_name"].get<std::string>();
         const std::string public_name = register_model_definition_internal(
             model_name,

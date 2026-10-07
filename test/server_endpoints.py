@@ -1441,6 +1441,27 @@ class EndpointTests(ServerTestBase):
         self.assertEqual(model_response.status_code, 404)
         print("[OK] /pull refuses a revision in offline mode")
 
+    def test_008e_register_rejects_revision(self):
+        """/models/register never downloads, so it refuses a revision."""
+        model_name = "user.RevisionRegister-" + uuid.uuid4().hex[:8]
+        response = requests.post(
+            f"{self.base_url}/models/register",
+            json={
+                "model_name": model_name,
+                "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
+                "recipe": "llamacpp",
+                "revision": "main",
+            },
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("/pull only", response.json().get("error", ""))
+        model_response = requests.get(
+            f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
+        )
+        self.assertEqual(model_response.status_code, 404)
+        print("[OK] /models/register refuses a revision")
+
     def _hub_commits(self, repo_id):
         try:
             response = requests.get(
