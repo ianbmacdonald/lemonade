@@ -6123,7 +6123,8 @@ void ModelManager::download_from_registry(const ModelInfo& info,
                 }
             }
         }
-        JsonUtils::save_to_file(provenance, path_to_utf8(provenance_path));
+        // Loads read the pin from this file concurrently; a torn read would drop it.
+        save_user_json(path_to_utf8(provenance_path), provenance);
     }
 
     if (progress_callback) {
