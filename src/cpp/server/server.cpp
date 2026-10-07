@@ -6223,6 +6223,19 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         }
         if (!revision.empty()) {
             LOG(INFO, "Server") << "   revision: " << revision << std::endl;
+            std::string pinned_recipe = recipe;
+            std::string pinned_source;
+            if (model_manager_->model_exists(model_name)) {
+                const ModelInfo existing = model_manager_->get_model_info(model_name);
+                if (pinned_recipe.empty()) pinned_recipe = existing.recipe;
+                pinned_source = existing.source;
+            }
+            if (is_model_collection_recipe(pinned_recipe) || !pinned_source.empty() ||
+                model_manager_->backend_self_manages_downloads(pinned_recipe)) {
+                bad_request("`revision` applies only to registry downloads; '" + model_name +
+                            "' (recipe " + pinned_recipe + ") cannot be pinned");
+                return;
+            }
         }
 
         // Both API operations always enter the same registration path.
@@ -6268,13 +6281,6 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
             }
         }
         if (!revision.empty()) {
-            const ModelInfo pinned_info = model_manager_->get_model_info(model_name);
-            if (is_model_collection_recipe(pinned_info.recipe) || !pinned_info.source.empty() ||
-                model_manager_->backend_self_manages_downloads(pinned_info.recipe)) {
-                bad_request("`revision` applies only to registry downloads; '" + model_name +
-                            "' (recipe " + pinned_info.recipe + ") cannot be pinned");
-                return;
-            }
             download_request["revision"] = revision;
         }
 
