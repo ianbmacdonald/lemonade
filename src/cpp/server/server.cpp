@@ -6224,11 +6224,18 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         if (!revision.empty()) {
             LOG(INFO, "Server") << "   revision: " << revision << std::endl;
             std::string pinned_recipe = recipe;
-            std::string pinned_source;
+            const std::string requested_source =
+                request_json.contains("source") && request_json["source"].is_string()
+                    ? request_json["source"].get<std::string>()
+                    : std::string();
+            std::string pinned_source =
+                requested_source.empty() || lemon::is_remote_registry_source(requested_source)
+                    ? std::string()
+                    : requested_source;
             if (model_manager_->model_exists(model_name)) {
                 const ModelInfo existing = model_manager_->get_model_info(model_name);
                 if (pinned_recipe.empty()) pinned_recipe = existing.recipe;
-                pinned_source = existing.source;
+                if (pinned_source.empty()) pinned_source = existing.source;
             }
             if (is_model_collection_recipe(pinned_recipe) || !pinned_source.empty() ||
                 model_manager_->backend_self_manages_downloads(pinned_recipe)) {

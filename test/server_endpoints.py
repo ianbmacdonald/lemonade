@@ -1323,14 +1323,31 @@ class EndpointTests(ServerTestBase):
                 self.assertEqual(response.status_code, 400, response.text)
                 self.assertIn("revision", response.json().get("error", ""))
 
-        model_response = requests.get(
-            f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
+        local_name = "user.RevisionLocal-" + uuid.uuid4().hex[:8]
+        local_response = requests.post(
+            f"{self.base_url}/pull",
+            json={
+                "model_name": local_name,
+                "checkpoint": "/models/local.gguf",
+                "recipe": "llamacpp",
+                "source": "local_path",
+                "revision": "main",
+                "stream": False,
+            },
+            timeout=TIMEOUT_DEFAULT,
         )
-        self.assertEqual(
-            model_response.status_code,
-            404,
-            "A rejected revision must not register the model",
-        )
+        self.assertEqual(local_response.status_code, 400, local_response.text)
+        self.assertIn("revision", local_response.json().get("error", ""))
+
+        for name in (model_name, local_name):
+            model_response = requests.get(
+                f"{self.base_url}/models/{name}", timeout=TIMEOUT_DEFAULT
+            )
+            self.assertEqual(
+                model_response.status_code,
+                404,
+                "A rejected revision must not register the model",
+            )
         print("[OK] /pull rejects invalid revisions with 400")
 
     def _hub_commits(self, repo_id):
