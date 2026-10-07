@@ -6197,6 +6197,13 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
                 bad_request("`revision` applies only to registry downloads, not local imports");
                 return;
             }
+            if (!revision.empty() && config_->offline()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{
+                    {"error", "revision pinning needs network access; offline mode is on"},
+                    {"code", "lemond_offline"}}.dump(), "application/json");
+                return;
+            }
         }
 
         // Resolve the pull's registry provenance once, up front, so download,

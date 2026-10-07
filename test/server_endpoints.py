@@ -1414,6 +1414,33 @@ class EndpointTests(ServerTestBase):
                 )
         print("[OK] /pull checks a revision against the existing registration")
 
+    def test_008d_pull_revision_refused_offline(self):
+        """Offline, a pinned /pull is a clear 400 before registration."""
+        model_name = "user.RevisionOffline-" + uuid.uuid4().hex[:8]
+        set_server_config({"offline": True})
+        try:
+            response = requests.post(
+                f"{self.base_url}/pull",
+                json={
+                    "model_name": model_name,
+                    "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
+                    "recipe": "llamacpp",
+                    "revision": "main",
+                    "stream": False,
+                },
+                timeout=TIMEOUT_DEFAULT,
+            )
+        finally:
+            set_server_config({"offline": False})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("offline", response.json().get("error", ""))
+        self.assertEqual(response.json().get("code"), "lemond_offline")
+        model_response = requests.get(
+            f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
+        )
+        self.assertEqual(model_response.status_code, 404)
+        print("[OK] /pull refuses a revision in offline mode")
+
     def _hub_commits(self, repo_id):
         try:
             response = requests.get(
