@@ -1572,9 +1572,11 @@ std::string ModelManager::resolve_model_path(const ModelInfo& info, const std::s
         const fs::path cache_path = path_from_utf8(ctx.model_cache_path);
         const std::string snapshot =
             registry_files::snapshot_id_from_resolved_path(resolved, cache_path);
-        if (!snapshot.empty() && snapshot != read_hf_ref_main(cache_path) &&
-            registry_files::pinned_snapshot_ids(cache_path).count(snapshot) != 0) {
-            return "";
+        if (!snapshot.empty() && snapshot != read_hf_ref_main(cache_path)) {
+            const auto pins = registry_files::pinned_snapshot_ids(cache_path);
+            if (!pins || pins->count(snapshot) != 0) {
+                return "";
+            }
         }
     }
     return resolved;
@@ -5182,8 +5184,9 @@ static bool is_snapshot_component(const std::string& snapshot_id) {
            snapshot_id.find('/') == std::string::npos;
 }
 
-// Every valid pin recorded in a repository's .lemonade_registry.json, by model.
-static std::map<std::string, std::string> read_pinned_snapshot_ids(
+// Every valid pin recorded in a repository's .lemonade_registry.json, by model;
+// nullopt when the file exists but cannot be read.
+static std::optional<std::map<std::string, std::string>> read_pinned_snapshot_ids(
     const fs::path& model_cache_path) {
     std::map<std::string, std::string> pins;
     const fs::path provenance_path = model_cache_path / ".lemonade_registry.json";
@@ -5204,8 +5207,16 @@ static std::map<std::string, std::string> read_pinned_snapshot_ids(
                 pins[model_name] = pinned;
             }
         }
-    } catch (const std::exception&) {
-        pins.clear();
+    } catch (const std::exception& e) {
+        static std::mutex logged_mutex;
+        static std::set<std::string> logged;
+        std::lock_guard<std::mutex> lock(logged_mutex);
+        if (logged.insert(path_to_utf8(provenance_path)).second) {
+            LOG(ERROR, "ModelManager") << "Cannot read " << path_to_utf8(provenance_path)
+                << " (" << e.what() << "); models in this repository load only "
+                << "the refs/main snapshot until it is repaired or re-pulled" << std::endl;
+        }
+        return std::nullopt;
     }
     return pins;
 }
@@ -5214,13 +5225,16 @@ std::string pinned_snapshot_id(
     const fs::path& model_cache_path,
     const std::string& model_name) {
     const auto pins = read_pinned_snapshot_ids(model_cache_path);
-    const auto it = pins.find(model_name);
-    return it == pins.end() ? "" : it->second;
+    if (!pins) return "";
+    const auto it = pins->find(model_name);
+    return it == pins->end() ? "" : it->second;
 }
 
-std::set<std::string> pinned_snapshot_ids(const fs::path& model_cache_path) {
+std::optional<std::set<std::string>> pinned_snapshot_ids(const fs::path& model_cache_path) {
+    const auto pins = read_pinned_snapshot_ids(model_cache_path);
+    if (!pins) return std::nullopt;
     std::set<std::string> ids;
-    for (const auto& [model_name, pinned] : read_pinned_snapshot_ids(model_cache_path)) {
+    for (const auto& [model_name, pinned] : *pins) {
         (void)model_name;
         ids.insert(pinned);
     }

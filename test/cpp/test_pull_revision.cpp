@@ -164,6 +164,14 @@ static void test_pinned_model_resolution(const fs::path& root, const fs::path& h
           path_from_utf8(manager.get_model_info("user.firstother").resolved_path()) ==
               first / "snapshots" / "cccc" / "other.gguf");
 
+    write_file(first / ".lemonade_registry.json", "{not json");
+    manager.invalidate_models_cache();
+    check("unreadable pin state keeps models out of non-refs/main snapshots",
+          !manager.get_model_info("user.firstother").downloaded);
+    check("unreadable pin state still allows the refs/main snapshot",
+          path_from_utf8(manager.get_model_info("user.firstfollow").resolved_path()) ==
+              first / "snapshots" / "dddd" / "model.gguf");
+
     fs::remove(pinned_snapshot / "model.gguf");
     manager.invalidate_models_cache();
     const ModelInfo missing = manager.get_model_info("user.pinned");
