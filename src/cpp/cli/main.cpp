@@ -146,6 +146,7 @@ struct CliConfig {
     std::string recipe;
     std::string model_source;  // empty means defer to lemond's default_model_source
     bool model_source_explicit = false;
+    std::string revision;  // pull: exact registry revision of the main checkpoint
     std::vector<std::string> labels;
     std::vector<std::string> components;
     nlohmann::json recipe_options;
@@ -390,6 +391,10 @@ static int handle_manual_pull_command(lemonade::LemonadeClient& client, const Cl
         model_data["labels"] = config.labels;
     }
 
+    if (!config.revision.empty()) {
+        model_data["revision"] = config.revision;
+    }
+
     // Explicit `lemonade pull`: opt into the configured registry update check.
     return client.pull_model(model_data, "", /*upgrade=*/true);
 }
@@ -448,12 +453,15 @@ static int handle_pull_command(lemonade::LemonadeClient& client, const CliConfig
     int res = 0;
     if (normalized_model.find('/') != std::string::npos) {
         res = lemon_cli::registry_pull_flow(
-            client, normalized_model, false, detected_source);
+            client, normalized_model, false, detected_source, config.revision);
     } else {
         nlohmann::json model_data;
         model_data["model_name"] = config.model;
         if (config.model_source_explicit) {
             model_data["source"] = config.model_source;
+        }
+        if (!config.revision.empty()) {
+            model_data["revision"] = config.revision;
         }
         res = client.pull_model(model_data, "", /*upgrade=*/true);
     }
@@ -1414,6 +1422,10 @@ int main(int argc, char* argv[]) {
         ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
     pull_cmd->add_option("--alias", config.alias_name, "Optional alias to register for the pulled model")
         ->type_name("ALIAS");
+    pull_cmd->add_option("--revision", config.revision,
+        "Pin the pull to an exact Hugging Face commit sha, branch, or tag of the main "
+        "checkpoint repository; pulling again without it returns to the default branch")
+        ->type_name("REVISION");
     pull_cmd->footer(
         "Manual Configuration Guide:\n"
         "  https://lemonade-server.ai/docs/guide/configuration/custom-models/");

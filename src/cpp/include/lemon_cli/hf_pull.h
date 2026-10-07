@@ -21,7 +21,8 @@ std::string normalize_huggingface_checkpoint_arg(const std::string& arg);
 int registry_pull_flow(lemonade::LemonadeClient& client,
                        const std::string& model_arg,
                        bool assume_yes,
-                       const std::string& registry_source);
+                       const std::string& registry_source,
+                       const std::string& revision = "");
 
 // Backward-compatible Hugging Face entry point.
 int hf_pull_flow(lemonade::LemonadeClient& client,
