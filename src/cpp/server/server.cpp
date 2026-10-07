@@ -6308,9 +6308,9 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
                 download_request[field] = request_json[field];
             }
         }
-        if (!revision.empty()) {
-            download_request["revision"] = revision;
-        }
+        // Present even when empty: an explicit /pull without a revision is the one
+        // request that releases a pin; every other download keeps it.
+        download_request["revision"] = revision;
 
         if (stream) {
             auto operation = [this, model_name, download_request, do_not_upgrade](DownloadProgressCallback progress_cb) {

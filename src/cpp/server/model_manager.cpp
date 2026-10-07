@@ -5098,8 +5098,10 @@ void ModelManager::download_model(const std::string& model_name,
         LOG(INFO, "ModelManager") << "Model already downloaded and do_not_upgrade=true, using cached version" << std::endl;
         return;
     }
-    if (!do_not_upgrade && model_info.requested_revision.empty()) {
-        // An explicit unpinned pull is how a client releases a pin.
+    // Only /pull sets "revision" (empty included); load-time, sync, Ollama and
+    // collection-component downloads omit it and so restore the pin instead.
+    if (!do_not_upgrade && model_data.contains("revision") &&
+        model_info.requested_revision.empty()) {
         model_info.pinned_revision.clear();
     }
 

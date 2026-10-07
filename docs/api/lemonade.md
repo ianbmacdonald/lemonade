@@ -780,7 +780,7 @@ curl -X POST http://localhost:13305/v1/pull \
 - The pin applies to the main checkpoint's repository only. Auxiliary checkpoints stored in other repositories (for example an `mmproj` or `draft` file) follow their repository's default branch. Auxiliary files in the main repository come from the pinned commit.
 - Files are stored under `snapshots/<commit sha>/` in the model's cache directory. A pinned pull never moves `refs/main`, so other models that share the repository keep loading the default-branch snapshot.
 - The model records the pinned commit in the repository's `.lemonade_registry.json`, and every later load of that model uses the pinned snapshot. `GET /v1/models/{id}` reports it as `pinned_revision`. A pinned model is excluded from update checks and auto-update.
-- Pulling the model again without `revision` removes the pin and returns the model to the default branch (`refs/main`).
+- Pulling the model again with `/v1/pull` (or `lemonade pull`) without `revision` removes the pin and returns the model to the default branch (`refs/main`). Nothing else removes a pin: load-time downloads, `do_not_upgrade` pulls, model sync, Ollama pulls and collection pulls re-download the pinned commit if its files are missing.
 - The non-streaming response includes `revision`, the resolved commit sha. The streaming and server-owned download modes accept `revision` too; read the result from `pinned_revision`.
 - `revision` is rejected with `400` for collections, local imports, models from a non-Hugging Face registry (for example ModelScope), and backends that manage their own downloads (`flm`, `cloud`). Revision pinning is Hugging Face only.
 
