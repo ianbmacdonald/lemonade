@@ -6239,11 +6239,31 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
             if (pinned_registry.empty() && lemon::is_remote_registry_source(requested_source)) {
                 pinned_registry = requested_source;
             }
+            const auto registry_name = [](const std::string& name) {
+                try {
+                    return remote_registry_source_name(parse_remote_registry_source(name));
+                } catch (const std::exception&) {
+                    return name;
+                }
+            };
             if (model_manager_->model_exists(model_name)) {
+                // The download uses the existing registration, so that is what a pin
+                // must be checked against; a request that also changes it is refused.
                 const ModelInfo existing = model_manager_->get_model_info(model_name);
-                if (pinned_recipe.empty()) pinned_recipe = existing.recipe;
-                if (pinned_source.empty()) pinned_source = existing.source;
-                if (pinned_registry.empty()) pinned_registry = existing.registry_source;
+                const std::string existing_registry = existing.registry_source.empty()
+                    ? config_->default_model_source()
+                    : existing.registry_source;
+                if ((!pinned_recipe.empty() && pinned_recipe != existing.recipe) ||
+                    (!pinned_source.empty() && pinned_source != existing.source) ||
+                    (!pinned_registry.empty() &&
+                     registry_name(pinned_registry) != registry_name(existing_registry))) {
+                    bad_request("`revision` cannot be combined with a change to the recipe or "
+                                "source of the existing model '" + model_name + "'");
+                    return;
+                }
+                pinned_recipe = existing.recipe;
+                pinned_source = existing.source;
+                pinned_registry = existing_registry;
             }
             if (pinned_registry.empty()) pinned_registry = config_->default_model_source();
             if (is_model_collection_recipe(pinned_recipe) || !pinned_source.empty() ||

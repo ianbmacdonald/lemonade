@@ -1366,6 +1366,54 @@ class EndpointTests(ServerTestBase):
             )
         print("[OK] /pull rejects invalid revisions with 400")
 
+    def test_008c_pull_revision_checks_existing_registration(self):
+        """A revision is checked against the existing registration it downloads."""
+        suffix = uuid.uuid4().hex[:8]
+        modelscope_name = f"user.RevisionExistingMS-{suffix}"
+        collection_name = f"user.RevisionExistingKit-{suffix}"
+        registrations = [
+            {
+                "model_name": modelscope_name,
+                "recipe": "llamacpp",
+                "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
+                "source": "modelscope",
+            },
+            {
+                "model_name": collection_name,
+                "recipe": "collection.omni",
+                "components": [ENDPOINT_TEST_MODEL],
+            },
+        ]
+        attempts = [
+            {"model_name": modelscope_name, "source": "huggingface"},
+            {"model_name": collection_name, "recipe": "llamacpp"},
+        ]
+        try:
+            for body in registrations:
+                response = requests.post(
+                    f"{self.base_url}/models/register",
+                    json=body,
+                    timeout=TIMEOUT_DEFAULT,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+            for body in attempts:
+                with self.subTest(model=body["model_name"]):
+                    response = requests.post(
+                        f"{self.base_url}/pull",
+                        json={**body, "revision": "main", "stream": False},
+                        timeout=TIMEOUT_DEFAULT,
+                    )
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn("revision", response.json().get("error", ""))
+        finally:
+            for name in (modelscope_name, collection_name):
+                requests.post(
+                    f"{self.base_url}/delete",
+                    json={"model_name": name},
+                    timeout=TIMEOUT_DEFAULT,
+                )
+        print("[OK] /pull checks a revision against the existing registration")
+
     def _hub_commits(self, repo_id):
         try:
             response = requests.get(
