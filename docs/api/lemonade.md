@@ -782,7 +782,16 @@ curl -X POST http://localhost:13305/v1/pull \
 - The model records the pinned commit in the repository's `.lemonade_registry.json`, and every later load of that model uses the pinned snapshot. `GET /v1/models/{id}` reports it as `pinned_revision`. A pinned model is excluded from update checks and auto-update.
 - Pulling the model again with `/v1/pull` (or `lemonade pull`) without `revision` removes the pin and returns the model to the default branch (`refs/main`). Nothing else removes a pin: load-time downloads, `do_not_upgrade` pulls, model sync, Ollama pulls and collection pulls re-download the pinned commit if its files are missing.
 - The non-streaming response includes `revision`, the resolved commit sha. The streaming and server-owned download modes accept `revision` too; read the result from `pinned_revision`.
-- `revision` is rejected with `400` for collections, local imports, models from a non-Hugging Face registry (for example ModelScope), and backends that manage their own downloads (`flm`, `cloud`). Revision pinning is Hugging Face only.
+- An explicit `/v1/pull` with `revision` always fetches and pins that revision, even when `do_not_upgrade` is `true` and the model is already downloaded, so it also moves an existing pin to a different commit.
+- `revision` is rejected with `400` for collections, local imports, models from a non-Hugging Face registry (for example ModelScope), backends that manage their own downloads (`flm`, `cloud`), a request that also changes an existing model's recipe or source, and when the server is in offline mode. `POST /v1/models/register` does not download and rejects `revision`.
+
+Known limits:
+
+- Hugging Face only.
+- The pin applies to the main checkpoint repository; auxiliary checkpoints in other repositories follow their default branch.
+- Streaming (`stream=true`) and server-owned job responses do not carry the resolved sha; read `pinned_revision` from `GET /v1/models/{id}` after the download completes.
+- If a repository's `.lemonade_registry.json` is corrupt, models in that repository that are not on the `refs/main` snapshot (pinned models included) report not downloaded. A later download of that repository rewrites the file and drops the pins it held.
+- Only the llama.cpp backend has been tested end to end with pinned revisions.
 
 **Install a Model that is Already Registered**
 
