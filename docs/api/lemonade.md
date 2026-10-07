@@ -754,6 +754,35 @@ The Lemonade Server built-in model registry has a collection of model names that
 |-----------|----------|-------------|
 | `stream` | No | If `true`, returns Server-Sent Events (SSE) with download progress. Defaults to `false`. |
 | `subscribe` | No | Only applies when `stream=true`. If `false`, the server starts a background model download job and returns a JSON snapshot immediately instead of keeping the HTTP response subscribed to SSE progress. Defaults to `true` for backwards compatibility. |
+| `revision` | No | Pin the download to an exact Hugging Face revision of the model's main checkpoint repository: a 40-character commit sha, or a branch or tag name. See [Pin a revision](#pin-a-revision). Omitted or empty pulls the registry's default branch, exactly as before. |
+
+**Pin a revision**
+
+A client can look up a model's commits on the Hub (for example `https://huggingface.co/api/models/<owner>/<repo>/commits/main`) and then download exactly one of them by passing `revision`:
+
+```bash
+curl -X POST http://localhost:13305/v1/pull \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_name": "user.Tiny-Stories",
+    "checkpoint": "ggml-org/tiny-llamas:stories260K.gguf",
+    "recipe": "llamacpp",
+    "revision": "6e091d820cbe8f22eeb604d136403eca290b8c1e"
+  }'
+```
+
+```json
+{"status":"success","model_name":"user.Tiny-Stories","revision":"6e091d820cbe8f22eeb604d136403eca290b8c1e"}
+```
+
+- `revision` must be a 40-character hexadecimal commit sha, or a branch/tag name of at most 128 characters made of `A-Z a-z 0-9 . _ / -` that does not contain `..` and does not start with `/` or `-` (for example `main` or `refs/pr/1`). Anything else is rejected with `400` before any registration or network request.
+- A branch or tag is resolved to its commit when the pull runs; the model stays on that commit even if the branch moves later.
+- The pin applies to the main checkpoint's repository only. Auxiliary checkpoints stored in other repositories (for example an `mmproj` or `draft` file) follow their repository's default branch. Auxiliary files in the main repository come from the pinned commit.
+- Files are stored under `snapshots/<commit sha>/` in the model's cache directory. A pinned pull never moves `refs/main`, so other models that share the repository keep loading the default-branch snapshot.
+- The model records the pinned commit in the repository's `.lemonade_registry.json`, and every later load of that model uses the pinned snapshot. `GET /v1/models/{id}` reports it as `pinned_revision`. A pinned model is excluded from update checks and auto-update.
+- Pulling the model again without `revision` removes the pin and returns the model to the default branch (`refs/main`).
+- The non-streaming response includes `revision`, the resolved commit sha. The streaming and server-owned download modes accept `revision` too; read the result from `pinned_revision`.
+- `revision` is rejected with `400` for collections, local imports, and backends that manage their own downloads (`flm`, `cloud`).
 
 **Install a Model that is Already Registered**
 

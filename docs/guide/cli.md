@@ -177,7 +177,7 @@ The `pull` command downloads and installs models. It can also register a custom 
 Common forms:
 
 ```bash
-lemonade pull MODEL_OR_CHECKPOINT [--alias ALIAS] [--checkpoint TYPE CHECKPOINT] [--recipe RECIPE] [--label LABEL] [--components MODEL ...]
+lemonade pull MODEL_OR_CHECKPOINT [--alias ALIAS] [--revision REVISION] [--checkpoint TYPE CHECKPOINT] [--recipe RECIPE] [--label LABEL] [--components MODEL ...]
 ```
 
 ```bash
@@ -192,6 +192,9 @@ lemonade pull unsloth/Qwen3-8B-GGUF:Q4_K_M
 
 # Register and pull a custom model with an alias
 lemonade pull user.MyModel --checkpoint main org/model:Q4_0 --recipe llamacpp --alias my-alias
+
+# Pin a pull to an exact Hugging Face commit
+lemonade pull unsloth/Qwen3-8B-GGUF:Q4_K_M --revision 0123456789abcdef0123456789abcdef01234567
 ```
 
 | Option | Description | Required |
@@ -199,6 +202,7 @@ lemonade pull user.MyModel --checkpoint main org/model:Q4_0 --recipe llamacpp --
 | `MODEL_OR_CHECKPOINT` | Registered model name, or `owner/repo[:variant]` Hugging Face/ModelScope checkpoint | Yes |
 | `--source` | Remote registry for checkpoint pulls: `huggingface` or `modelscope`; when omitted, the server's configured `default_model_source` applies. Direct hub URLs are auto-detected | No |
 | `--alias ALIAS` | Add an alias for the model being registered or pulled. | No |
+| `--revision REVISION` | Pin the pull to an exact Hugging Face commit sha, branch, or tag of the main checkpoint repository. Later loads use the pinned snapshot until the model is pulled again without `--revision`. See [Pin a revision](../api/lemonade.md#pin-a-revision). | No |
 | `--checkpoint TYPE CHECKPOINT` | Manual registration: add a checkpoint entry. Repeat for multi-component models such as `main` + `mmproj` or `main` + `vae`. | No |
 | `--recipe RECIPE` | Manual registration: recipe to associate with the new `user.*` model (`llamacpp`, `flm`, `ryzenai-llm`, `vllm`, `whispercpp`, `sd-cpp`, `kokoro`, `collection.omni`) | No |
 | `--label LABEL` | Manual registration: add a label to the new model. Repeatable. Valid: `audio-generation`, `chat`, `coding`, `dflash`, `embeddings`, `hot`, `image-classification`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `transcription`, `vision` | No |
