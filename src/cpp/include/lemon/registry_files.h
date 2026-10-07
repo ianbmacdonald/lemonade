@@ -54,6 +54,13 @@ std::string active_local_snapshot(
     const std::string& resolved_path,
     const std::filesystem::path& model_cache_path);
 
+// Snapshot a pinned pull recorded for model_name in the repository's
+// .lemonade_registry.json; empty when the model follows refs/main. A recorded
+// value that is not a single safe path component is ignored.
+std::string pinned_snapshot_id(
+    const std::filesystem::path& model_cache_path,
+    const std::string& model_name);
+
 // content_id identifies content across commits (LFS sha256 or git blob oid),
 // so revisions compare without downloading anything.
 struct HfFileMetadata {

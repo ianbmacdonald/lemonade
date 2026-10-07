@@ -1538,6 +1538,12 @@ std::string ModelManager::resolve_model_path(const ModelInfo& info, const std::s
     ctx.variant = checkpoint_to_variant(checkpoint);
     ctx.registry_source = effective_registry_source(info);
     ctx.model_cache_path = hf_cache + "/" + repo_id_to_cache_dir_name(ctx.repo_id, ctx.registry_source);
+    if (!info.pinned_revision.empty() && ctx.repo_id == ctx.main_repo_id) {
+        // Presenting the pinned snapshot as the whole repository cache keeps every
+        // backend's lookup, including refs/main and whole-cache fallbacks, on the
+        // pinned commit without each backend knowing about pins.
+        ctx.model_cache_path += "/snapshots/" + info.pinned_revision;
+    }
     ctx.type = type;
     ctx.checkpoint = checkpoint;
 
@@ -1545,6 +1551,15 @@ std::string ModelManager::resolve_model_path(const ModelInfo& info, const std::s
 }
 
 void ModelManager::resolve_all_model_paths(ModelInfo& info) {
+    info.pinned_revision.clear();
+    const std::string main_repo_id = checkpoint_to_repo_id(info.checkpoint("main"));
+    if (info.source.empty() && !main_repo_id.empty() &&
+        !is_model_collection_recipe(info.recipe)) {
+        info.pinned_revision = registry_files::pinned_snapshot_id(
+            path_from_utf8(get_hf_cache_dir()) /
+                repo_id_to_cache_dir_name(main_repo_id, effective_registry_source(info)),
+            info.model_name);
+    }
     for (auto const& [type, checkpoint] : info.checkpoints) {
         info.resolved_paths[type] = resolve_model_path(info, type, checkpoint);
     }
@@ -1899,6 +1914,12 @@ ModelManager::UpdateCheckResult ModelManager::check_for_model_updates(const std:
             // Local-path, local-upload and extra-directory models have no
             // remote registry to check.
             if (!info.source.empty()) {
+                continue;
+            }
+
+            // A pinned model asked for one commit; reporting the branch tip as an
+            // update would let auto-update silently undo the pin.
+            if (!info.pinned_revision.empty()) {
                 continue;
             }
 
@@ -5033,7 +5054,10 @@ void ModelManager::download_model(const std::string& model_name,
     // The do_not_upgrade flag means:
     //   - Load/inference endpoints: Don't check the remote registry for updates (use cache if available)
     //   - Pull endpoint: Always check the recorded registry for the latest version (do_not_upgrade=false)
-    if (do_not_upgrade && is_model_downloaded(model_name)) {
+    model_info.requested_revision =
+        JsonUtils::get_or_default<std::string>(model_data, "revision", "");
+    if (do_not_upgrade && model_info.requested_revision.empty() &&
+        is_model_downloaded(model_name)) {
         LOG(INFO, "ModelManager") << "Model already downloaded and do_not_upgrade=true, using cached version" << std::endl;
         return;
     }
@@ -5100,6 +5124,35 @@ std::string active_local_snapshot(
         snapshot = read_hf_ref_main(model_cache_path);
     }
     return snapshot;
+}
+
+std::string pinned_snapshot_id(
+    const fs::path& model_cache_path,
+    const std::string& model_name) {
+    const fs::path provenance_path = model_cache_path / ".lemonade_registry.json";
+    if (!safe_exists(provenance_path)) {
+        return "";
+    }
+    try {
+        const json provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
+        const auto models_it = provenance.find("processed_models");
+        if (models_it == provenance.end() || !models_it->is_object()) {
+            return "";
+        }
+        const auto model_it = models_it->find(model_name);
+        if (model_it == models_it->end() || !model_it->is_object()) {
+            return "";
+        }
+        const std::string pinned =
+            JsonUtils::get_or_default<std::string>(*model_it, "pinned_revision", "");
+        if (!registry_revision_error(pinned).empty() ||
+            pinned.find('/') != std::string::npos) {
+            return "";
+        }
+        return pinned;
+    } catch (const std::exception&) {
+        return "";
+    }
 }
 
 std::map<std::string, std::vector<std::string>> group_aux_checkpoint_variants(
@@ -5760,7 +5813,9 @@ void ModelManager::download_from_registry(const ModelInfo& info,
                                << source_display << ": " << main_repo_id << std::endl;
 
     std::map<std::string, RegistryRepository> repositories;
-    repositories.emplace(main_repo_id, registry.fetch_repository(main_repo_id));
+    const bool pinned = !info.requested_revision.empty();
+    repositories.emplace(main_repo_id,
+                         registry.fetch_repository(main_repo_id, info.requested_revision));
 
     std::map<std::string, std::vector<std::string>> files_to_download;
     std::vector<std::string> main_repo_files;
@@ -5859,6 +5914,9 @@ void ModelManager::download_from_registry(const ModelInfo& info,
     if (source == RemoteRegistrySource::HuggingFace) {
         for (const auto& [repo_id, files] : files_to_download) {
             if (files.empty()) continue;
+            // A pin must own snapshots/<sha> even when its artifacts match the
+            // snapshot refs/main names.
+            if (pinned && repo_id == main_repo_id) continue;
             const std::string current_ref = repo_snapshot_ids.at(repo_id);
             const std::string previous_ref = repo_previous_refs.at(repo_id);
             if (previous_ref.empty() || previous_ref == current_ref) continue;
@@ -5950,30 +6008,46 @@ void ModelManager::download_from_registry(const ModelInfo& info,
 
     for (const auto& [repo_id, snapshot_id] : repo_snapshot_ids) {
         const fs::path& cache_path = repo_cache_paths.at(repo_id);
+        const bool pinned_repo = pinned && repo_id == main_repo_id;
         const bool reusing_previous_snapshot =
             repos_reusing_previous_snapshot.count(repo_id) != 0;
         const std::string active_snapshot_id = reusing_previous_snapshot
             ? repo_previous_refs.at(repo_id)
             : snapshot_id;
 
-        write_hf_ref_main(cache_path, active_snapshot_id);
-        if (reusing_previous_snapshot) {
-            remove_unused_hf_snapshot(
-                cache_path, repo_snapshot_paths.at(repo_id), active_snapshot_id);
-        }
-
         const fs::path provenance_path = cache_path / ".lemonade_registry.json";
+        json previous_provenance = json::object();
         json processed_models = json::object();
         if (safe_exists(provenance_path)) {
             try {
-                const json previous_provenance =
-                    JsonUtils::load_from_file(path_to_utf8(provenance_path));
+                previous_provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
                 if (previous_provenance.contains("processed_models") &&
                     previous_provenance["processed_models"].is_object()) {
                     processed_models = previous_provenance["processed_models"];
                 }
             } catch (const std::exception&) {
                 // Replace invalid provenance after a successful download.
+                previous_provenance = json::object();
+            }
+        }
+
+        if (!pinned_repo) {
+            write_hf_ref_main(cache_path, active_snapshot_id);
+        }
+        if (reusing_previous_snapshot) {
+            // The commit refs/main skipped can be another model's pinned snapshot.
+            bool snapshot_pinned = false;
+            for (const auto& entry : processed_models) {
+                if (entry.is_object() &&
+                    JsonUtils::get_or_default<std::string>(entry, "pinned_revision", "") ==
+                        snapshot_id) {
+                    snapshot_pinned = true;
+                    break;
+                }
+            }
+            if (!snapshot_pinned) {
+                remove_unused_hf_snapshot(
+                    cache_path, repo_snapshot_paths.at(repo_id), active_snapshot_id);
             }
         }
 
@@ -5982,6 +6056,9 @@ void ModelManager::download_from_registry(const ModelInfo& info,
                 {"selection", registry_model_selection(info)},
                 {"snapshot_id", snapshot_id}
             };
+            if (pinned_repo) {
+                processed_models[info.model_name]["pinned_revision"] = snapshot_id;
+            }
         }
 
         const auto& repo = repositories.at(repo_id);
@@ -5992,6 +6069,16 @@ void ModelManager::download_from_registry(const ModelInfo& info,
             {"snapshot_id", active_snapshot_id},
             {"processed_models", std::move(processed_models)}
         };
+        if (pinned_repo) {
+            // The repository-level fields describe refs/main, which a pin leaves alone.
+            for (const char* field : {"revision", "snapshot_id"}) {
+                if (previous_provenance.contains(field)) {
+                    provenance[field] = previous_provenance[field];
+                } else {
+                    provenance.erase(field);
+                }
+            }
+        }
         JsonUtils::save_to_file(provenance, path_to_utf8(provenance_path));
     }
 

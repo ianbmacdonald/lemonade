@@ -101,6 +101,11 @@ struct ModelInfo {
     bool suggested = false;
     std::string source;  // Local origin: local_upload/local_path/extra_models_dir
     std::string registry_source;  // Remote registry: huggingface/modelscope; empty when unpinned
+    // Main-checkpoint snapshot a pinned pull recorded (read from the repository's
+    // .lemonade_registry.json); empty follows refs/main.
+    std::string pinned_revision;
+    // Registry revision requested for the download in progress; never persisted.
+    std::string requested_revision;
     bool downloaded = false;     // Whether model is downloaded and available
     bool update_available = false; // Whether a newer remote-registry version exists
     std::optional<bool> auto_update = std::nullopt; // Optional per-model auto-update override

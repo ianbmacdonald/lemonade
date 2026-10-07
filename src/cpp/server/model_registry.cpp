@@ -646,9 +646,30 @@ std::string huggingface_repository_api_url(
     std::string url = trim_trailing_slash(endpoint) +
                       "/api/models/" + percent_encode(repo_id, true);
     if (!revision.empty()) {
-        url += "/revision/" + percent_encode(revision, true);
+        // The Hub routes a ref such as refs/pr/1 only when its slashes are encoded.
+        url += "/revision/" + percent_encode(revision);
     }
     return url;
+}
+
+std::string registry_revision_error(const std::string& revision) {
+    if (revision.empty()) {
+        return "";
+    }
+    const std::string rule =
+        "a 40-character commit sha, or a branch/tag name of at most 128 characters "
+        "using A-Z a-z 0-9 . _ / - that contains no '..' and does not start with "
+        "'/' or '-'";
+    if (revision.size() > 128 || revision.front() == '/' || revision.front() == '-' ||
+        revision.find("..") != std::string::npos) {
+        return "Invalid revision '" + revision.substr(0, 128) + "': expected " + rule;
+    }
+    for (const unsigned char c : revision) {
+        if (!std::isalnum(c) && c != '.' && c != '_' && c != '/' && c != '-') {
+            return "Invalid revision '" + revision + "': expected " + rule;
+        }
+    }
+    return "";
 }
 
 std::optional<json> parse_huggingface_compatibility_response(

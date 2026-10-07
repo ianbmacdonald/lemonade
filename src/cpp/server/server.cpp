@@ -3338,6 +3338,9 @@ nlohmann::json Server::model_info_to_json(const std::string& model_id, const Mod
         {"components", public_components},
         {"recipe_options", info.recipe_options.to_json()},
     };
+    if (!info.pinned_revision.empty()) {
+        model_json["pinned_revision"] = info.pinned_revision;
+    }
 
     // Surface the cloud provider on cloud entries so the Model Manager can
     // bucket each provider into its own sub-heading. Omitted on local models
@@ -6177,6 +6180,25 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         bool subscribe = request_json.value("subscribe", true);
         bool local_import = request_json.value("local_import", false);
 
+        std::string revision;
+        if (request_json.contains("revision")) {
+            if (!request_json["revision"].is_string()) {
+                bad_request("`revision` must be a string when provided");
+                return;
+            }
+            revision = request_json["revision"].get<std::string>();
+            const std::string revision_error = lemon::registry_revision_error(revision);
+            if (!revision_error.empty()) {
+                bad_request(revision_error);
+                return;
+            }
+            request_json.erase("revision");
+            if (!revision.empty() && local_import) {
+                bad_request("`revision` applies only to registry downloads, not local imports");
+                return;
+            }
+        }
+
         // Resolve the pull's registry provenance once, up front, so download,
         // cache layout, and later refresh stay consistent. A registry-backed
         // checkpoint that names no source inherits the configured default; a
@@ -6198,6 +6220,9 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         }
         if (!recipe.empty()) {
             LOG(INFO, "Server") << "   recipe: " << recipe << std::endl;
+        }
+        if (!revision.empty()) {
+            LOG(INFO, "Server") << "   revision: " << revision << std::endl;
         }
 
         // Both API operations always enter the same registration path.
@@ -6242,6 +6267,16 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
                 download_request[field] = request_json[field];
             }
         }
+        if (!revision.empty()) {
+            const ModelInfo pinned_info = model_manager_->get_model_info(model_name);
+            if (is_model_collection_recipe(pinned_info.recipe) || !pinned_info.source.empty() ||
+                model_manager_->backend_self_manages_downloads(pinned_info.recipe)) {
+                bad_request("`revision` applies only to registry downloads; '" + model_name +
+                            "' (recipe " + pinned_info.recipe + ") cannot be pinned");
+                return;
+            }
+            download_request["revision"] = revision;
+        }
 
         if (stream) {
             auto operation = [this, model_name, download_request, do_not_upgrade](DownloadProgressCallback progress_cb) {
@@ -6272,6 +6307,13 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
             model_manager_->download_model(model_name, download_request, do_not_upgrade);
 
             nlohmann::json response = {{"status", "success"}, {"model_name", model_name}};
+            if (!revision.empty()) {
+                const std::string pinned =
+                    model_manager_->get_model_info(model_name).pinned_revision;
+                if (!pinned.empty()) {
+                    response["revision"] = pinned;
+                }
+            }
             res.set_content(response.dump(), "application/json");
         }
 
