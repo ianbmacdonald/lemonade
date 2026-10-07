@@ -1292,6 +1292,141 @@ class EndpointTests(ServerTestBase):
 
         print(f"[OK] Pull (streaming): received events: {set(events_received)}")
 
+    PINNED_PULL_REPO = "ggml-org/tiny-llamas"
+    PINNED_PULL_FILE = "stories260K.gguf"
+
+    def test_008a_pull_rejects_invalid_revision(self):
+        """An invalid revision is a 400 before registration or any download."""
+        model_name = "user.RevisionReject-" + uuid.uuid4().hex[:8]
+        for revision in [
+            "-main",
+            "/main",
+            "../main",
+            "a..b",
+            "bad revision",
+            "main@{1}",
+            "a" * 129,
+            7,
+        ]:
+            with self.subTest(revision=revision):
+                response = requests.post(
+                    f"{self.base_url}/pull",
+                    json={
+                        "model_name": model_name,
+                        "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
+                        "recipe": "llamacpp",
+                        "revision": revision,
+                        "stream": False,
+                    },
+                    timeout=TIMEOUT_DEFAULT,
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn("revision", response.json().get("error", ""))
+
+        model_response = requests.get(
+            f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
+        )
+        self.assertEqual(
+            model_response.status_code,
+            404,
+            "A rejected revision must not register the model",
+        )
+        print("[OK] /pull rejects invalid revisions with 400")
+
+    def _hub_commits(self, repo_id):
+        try:
+            response = requests.get(
+                f"https://huggingface.co/api/models/{repo_id}/commits/main",
+                timeout=TIMEOUT_DEFAULT,
+            )
+            response.raise_for_status()
+            return [c["id"] for c in response.json() if c.get("id")]
+        except Exception as exc:
+            self.skipTest(f"Hugging Face commit API unavailable: {exc}")
+
+    def test_008b_pull_pins_revision(self):
+        """A pinned pull loads its commit's snapshot until an unpinned pull."""
+        commits = self._hub_commits(self.PINNED_PULL_REPO)
+        if len(commits) < 2:
+            self.skipTest("Fixture repository no longer has two commits")
+        main_sha = commits[0]
+
+        pinned_sha = None
+        for sha in commits[1:]:
+            tree = requests.get(
+                f"https://huggingface.co/api/models/{self.PINNED_PULL_REPO}/tree/{sha}",
+                timeout=TIMEOUT_DEFAULT,
+            )
+            if tree.ok and any(
+                entry.get("path") == self.PINNED_PULL_FILE for entry in tree.json()
+            ):
+                pinned_sha = sha
+                break
+        if pinned_sha is None:
+            self.skipTest("No older commit of the fixture contains the test file")
+
+        model_name = "user.RevisionPin-" + uuid.uuid4().hex[:8]
+        pull_body = {
+            "model_name": model_name,
+            "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
+            "recipe": "llamacpp",
+            "stream": False,
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/pull",
+                json={**pull_body, "revision": pinned_sha},
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json().get("revision"), pinned_sha)
+
+            info = requests.get(
+                f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
+            ).json()
+            self.assertEqual(info.get("pinned_revision"), pinned_sha)
+            self.assertTrue(info.get("downloaded"), info)
+
+            repo_cache_dir = "models--" + self.PINNED_PULL_REPO.replace("/", "--")
+            cache_root = self._server_hf_cache_root(repo_cache_dir)
+            if cache_root is not None:
+                repo_cache = os.path.join(cache_root, repo_cache_dir)
+                self.assertTrue(
+                    os.path.isfile(
+                        os.path.join(
+                            repo_cache, "snapshots", pinned_sha, self.PINNED_PULL_FILE
+                        )
+                    )
+                )
+                refs_main = os.path.join(repo_cache, "refs", "main")
+                if os.path.isfile(refs_main):
+                    with open(refs_main, "r", encoding="utf-8") as ref_file:
+                        self.assertNotEqual(ref_file.read().strip(), pinned_sha)
+
+            response = requests.post(
+                f"{self.base_url}/pull",
+                json=pull_body,
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertNotIn("revision", response.json())
+
+            info = requests.get(
+                f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
+            ).json()
+            self.assertNotIn("pinned_revision", info)
+            self.assertTrue(info.get("downloaded"), info)
+            if cache_root is not None:
+                with open(refs_main, "r", encoding="utf-8") as ref_file:
+                    self.assertEqual(ref_file.read().strip(), main_sha)
+        finally:
+            requests.post(
+                f"{self.base_url}/delete",
+                json={"model_name": model_name},
+                timeout=TIMEOUT_DEFAULT,
+            )
+        print(f"[OK] /pull pins {self.PINNED_PULL_REPO} to {pinned_sha[:12]}")
+
     def test_009_load_model_basic(self):
         """Test loading a model into memory."""
         # Model is already pulled (setUpClass or previous pull tests)
