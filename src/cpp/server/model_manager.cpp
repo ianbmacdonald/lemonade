@@ -4324,11 +4324,18 @@ void ModelManager::download_registered_model(const ModelInfo& info, bool do_not_
     }
     std::lock_guard<std::mutex> download_lock(*repo_lock);
 
+    // Load-time downloads pass the cached ModelInfo; when a pinned snapshot has
+    // gone missing they must restore the pinned commit, not the branch tip.
+    ModelInfo download_info = info;
+    if (download_info.requested_revision.empty()) {
+        download_info.requested_revision = download_info.pinned_revision;
+    }
+
     // The backend's ops own the download (shared registry engine by default; flm pulls
     // via the flm CLI; cloud is a no-op).
     backends::BackendOpsContext octx;
     octx.model_manager = this;
-    backends::ops_for(info.recipe)->download_model(info, do_not_upgrade, progress_callback, octx);
+    backends::ops_for(info.recipe)->download_model(download_info, do_not_upgrade, progress_callback, octx);
 
     // Update cache after successful download
     update_model_in_cache(info.model_name, true);
@@ -5078,6 +5085,10 @@ void ModelManager::download_model(const std::string& model_name,
         is_model_downloaded(model_name)) {
         LOG(INFO, "ModelManager") << "Model already downloaded and do_not_upgrade=true, using cached version" << std::endl;
         return;
+    }
+    if (!do_not_upgrade && model_info.requested_revision.empty()) {
+        // An explicit unpinned pull is how a client releases a pin.
+        model_info.pinned_revision.clear();
     }
 
     std::map<std::string, std::filesystem::path> resolved_paths_before;
