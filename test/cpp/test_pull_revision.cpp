@@ -100,9 +100,23 @@ static void test_pinned_model_resolution(const fs::path& root, const fs::path& h
                    "user.pinned":{"selection":"s","snapshot_id":"bbbb","pinned_revision":"bbbb"},
                    "user.follow":{"selection":"s","snapshot_id":"aaaa"}}})");
 
+    // A repository whose first pull was pinned: no refs/main yet.
+    const fs::path first = hf_root / "models--org--firstpin";
+    write_file(first / "snapshots" / "cccc" / "model.gguf", "GGUF-pinned");
+    write_file(first / "snapshots" / "cccc" / "mmproj.gguf", "GGUF-mmproj");
+    write_file(first / "snapshots" / "cccc" / "other.gguf", "GGUF-other");
+    write_file(first / ".lemonade_registry.json",
+               R"({"processed_models":{
+                   "user.firstpinned":{"selection":"s","snapshot_id":"cccc","pinned_revision":"cccc"}}})");
+
+    const json first_checkpoints = {{"main", "org/firstpin:model.gguf"},
+                                    {"mmproj", "org/firstpin:mmproj.gguf"}};
     const json user_models = {
         {"pinned", json{{"checkpoint", "org/pin:model.gguf"}, {"recipe", "llamacpp"}}},
         {"follow", json{{"checkpoint", "org/pin:model.gguf"}, {"recipe", "llamacpp"}}},
+        {"firstpinned", json{{"checkpoints", first_checkpoints}, {"recipe", "llamacpp"}}},
+        {"firstfollow", json{{"checkpoints", first_checkpoints}, {"recipe", "llamacpp"}}},
+        {"firstother", json{{"checkpoint", "org/firstpin:other.gguf"}, {"recipe", "llamacpp"}}},
     };
     write_file(root / "user_models.json", user_models.dump(2));
 
@@ -119,6 +133,26 @@ static void test_pinned_model_resolution(const fs::path& root, const fs::path& h
     check("unpinned model sharing the repo follows refs/main",
           follow.downloaded &&
               path_from_utf8(follow.resolved_path()) == main_snapshot / "model.gguf");
+
+    const ModelInfo first_pinned = manager.get_model_info("user.firstpinned");
+    check("a first pinned pull resolves main and mmproj in its snapshot",
+          first_pinned.downloaded &&
+              path_from_utf8(first_pinned.resolved_path("mmproj")) ==
+                  first / "snapshots" / "cccc" / "mmproj.gguf");
+    const ModelInfo first_follow = manager.get_model_info("user.firstfollow");
+    check("an unpinned model never resolves into another model's pinned snapshot",
+          !first_follow.downloaded && first_follow.resolved_path("main").empty() &&
+              first_follow.resolved_path("mmproj").empty());
+
+    write_file(first / "snapshots" / "dddd" / "model.gguf", "GGUF-main");
+    write_file(first / "refs" / "main", "dddd");
+    manager.invalidate_models_cache();
+    check("once refs/main exists the unpinned model follows it",
+          path_from_utf8(manager.get_model_info("user.firstfollow").resolved_path()) ==
+              first / "snapshots" / "dddd" / "model.gguf");
+    check("a variant found only in another model's pinned snapshot is not used",
+          !manager.get_model_info("user.firstother").downloaded &&
+              manager.get_model_info("user.firstother").resolved_path().empty());
 
     fs::remove(pinned_snapshot / "model.gguf");
     manager.invalidate_models_cache();

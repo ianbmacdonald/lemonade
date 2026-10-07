@@ -1565,6 +1565,18 @@ std::string ModelManager::resolve_model_path(const ModelInfo& info, const std::s
     if (pinned && !ctx.variant.empty() && resolved == ctx.model_cache_path) {
         return "";
     }
+    if (!pinned && !resolved.empty()) {
+        // Backends that search every snapshot (no refs/main yet, or a variant
+        // missing from it) must not hand an unpinned model another model's
+        // pinned commit; it then reports not downloaded and a pull fetches main.
+        const fs::path cache_path = path_from_utf8(ctx.model_cache_path);
+        const std::string snapshot =
+            registry_files::snapshot_id_from_resolved_path(resolved, cache_path);
+        if (!snapshot.empty() && snapshot != read_hf_ref_main(cache_path) &&
+            registry_files::pinned_snapshot_ids(cache_path).count(snapshot) != 0) {
+            return "";
+        }
+    }
     return resolved;
 }
 
@@ -5160,29 +5172,49 @@ static bool is_snapshot_component(const std::string& snapshot_id) {
            snapshot_id.find('/') == std::string::npos;
 }
 
-std::string pinned_snapshot_id(
-    const fs::path& model_cache_path,
-    const std::string& model_name) {
+// Every valid pin recorded in a repository's .lemonade_registry.json, by model.
+static std::map<std::string, std::string> read_pinned_snapshot_ids(
+    const fs::path& model_cache_path) {
+    std::map<std::string, std::string> pins;
     const fs::path provenance_path = model_cache_path / ".lemonade_registry.json";
     if (!safe_exists(provenance_path)) {
-        return "";
+        return pins;
     }
     try {
         const json provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
         const auto models_it = provenance.find("processed_models");
         if (models_it == provenance.end() || !models_it->is_object()) {
-            return "";
+            return pins;
         }
-        const auto model_it = models_it->find(model_name);
-        if (model_it == models_it->end() || !model_it->is_object()) {
-            return "";
+        for (const auto& [model_name, entry] : models_it->items()) {
+            if (!entry.is_object()) continue;
+            const std::string pinned =
+                JsonUtils::get_or_default<std::string>(entry, "pinned_revision", "");
+            if (is_snapshot_component(pinned)) {
+                pins[model_name] = pinned;
+            }
         }
-        const std::string pinned =
-            JsonUtils::get_or_default<std::string>(*model_it, "pinned_revision", "");
-        return is_snapshot_component(pinned) ? pinned : "";
     } catch (const std::exception&) {
-        return "";
+        pins.clear();
     }
+    return pins;
+}
+
+std::string pinned_snapshot_id(
+    const fs::path& model_cache_path,
+    const std::string& model_name) {
+    const auto pins = read_pinned_snapshot_ids(model_cache_path);
+    const auto it = pins.find(model_name);
+    return it == pins.end() ? "" : it->second;
+}
+
+std::set<std::string> pinned_snapshot_ids(const fs::path& model_cache_path) {
+    std::set<std::string> ids;
+    for (const auto& [model_name, pinned] : read_pinned_snapshot_ids(model_cache_path)) {
+        (void)model_name;
+        ids.insert(pinned);
+    }
+    return ids;
 }
 
 bool is_pinnable_snapshot_id(const std::string& requested_revision,

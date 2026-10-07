@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -60,6 +61,9 @@ std::string active_local_snapshot(
 std::string pinned_snapshot_id(
     const std::filesystem::path& model_cache_path,
     const std::string& model_name);
+
+// Every snapshot some model in the repository is pinned to.
+std::set<std::string> pinned_snapshot_ids(const std::filesystem::path& model_cache_path);
 
 // False when a pinned pull must refuse the snapshot id the registry resolved:
 // not a single safe path component, or the requested name echoed back instead
