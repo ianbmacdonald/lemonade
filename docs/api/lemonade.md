@@ -782,7 +782,7 @@ curl -X POST http://localhost:13305/v1/pull \
 - The model records the pinned commit in the repository's `.lemonade_registry.json`, and every later load of that model uses the pinned snapshot. `GET /v1/models/{id}` reports it as `pinned_revision`. A pinned model is excluded from update checks and auto-update.
 - Pulling the model again without `revision` removes the pin and returns the model to the default branch (`refs/main`).
 - The non-streaming response includes `revision`, the resolved commit sha. The streaming and server-owned download modes accept `revision` too; read the result from `pinned_revision`.
-- `revision` is rejected with `400` for collections, local imports, and backends that manage their own downloads (`flm`, `cloud`).
+- `revision` is rejected with `400` for collections, local imports, models from a non-Hugging Face registry (for example ModelScope), and backends that manage their own downloads (`flm`, `cloud`). Revision pinning is Hugging Face only.
 
 **Install a Model that is Already Registered**
 

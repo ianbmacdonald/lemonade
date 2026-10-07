@@ -1339,7 +1339,23 @@ class EndpointTests(ServerTestBase):
         self.assertEqual(local_response.status_code, 400, local_response.text)
         self.assertIn("revision", local_response.json().get("error", ""))
 
-        for name in (model_name, local_name):
+        modelscope_name = "user.RevisionModelScope-" + uuid.uuid4().hex[:8]
+        modelscope_response = requests.post(
+            f"{self.base_url}/pull",
+            json={
+                "model_name": modelscope_name,
+                "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
+                "recipe": "llamacpp",
+                "source": "modelscope",
+                "revision": "master",
+                "stream": False,
+            },
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(modelscope_response.status_code, 400, modelscope_response.text)
+        self.assertIn("Hugging Face", modelscope_response.json().get("error", ""))
+
+        for name in (model_name, local_name, modelscope_name):
             model_response = requests.get(
                 f"{self.base_url}/models/{name}", timeout=TIMEOUT_DEFAULT
             )

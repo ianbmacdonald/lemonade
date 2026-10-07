@@ -6232,15 +6232,36 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
                 requested_source.empty() || lemon::is_remote_registry_source(requested_source)
                     ? std::string()
                     : requested_source;
+            std::string pinned_registry =
+                request_json.contains("registry_source") && request_json["registry_source"].is_string()
+                    ? request_json["registry_source"].get<std::string>()
+                    : std::string();
+            if (pinned_registry.empty() && lemon::is_remote_registry_source(requested_source)) {
+                pinned_registry = requested_source;
+            }
             if (model_manager_->model_exists(model_name)) {
                 const ModelInfo existing = model_manager_->get_model_info(model_name);
                 if (pinned_recipe.empty()) pinned_recipe = existing.recipe;
                 if (pinned_source.empty()) pinned_source = existing.source;
+                if (pinned_registry.empty()) pinned_registry = existing.registry_source;
             }
+            if (pinned_registry.empty()) pinned_registry = config_->default_model_source();
             if (is_model_collection_recipe(pinned_recipe) || !pinned_source.empty() ||
                 model_manager_->backend_self_manages_downloads(pinned_recipe)) {
                 bad_request("`revision` applies only to registry downloads; '" + model_name +
                             "' (recipe " + pinned_recipe + ") cannot be pinned");
+                return;
+            }
+            bool hugging_face = false;
+            try {
+                hugging_face = parse_remote_registry_source(pinned_registry) ==
+                               lemon::RemoteRegistrySource::HuggingFace;
+            } catch (const std::exception&) {
+                // An unrecognized registry name cannot be pinned either.
+            }
+            if (!hugging_face) {
+                bad_request("`revision` pinning is supported for Hugging Face only; '" +
+                            model_name + "' downloads from " + pinned_registry);
                 return;
             }
         }
