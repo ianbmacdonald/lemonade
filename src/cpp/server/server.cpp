@@ -6222,6 +6222,11 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
             res.set_content(response.dump(), "application/json");
         }
 
+    } catch (const lemon::OfflineDownloadError& e) {
+        LOG(ERROR, "Server") << "Failed to load model: " << e.what() << std::endl;
+        res.status = 400;
+        nlohmann::json error = {{"error", e.what()}, {"code", lemon::kOfflineErrorCode}};
+        res.set_content(error.dump(), "application/json");
     } catch (const std::exception& e) {
         LOG(ERROR, "Server") << "Failed to load model: " << e.what() << std::endl;
 

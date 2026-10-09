@@ -55,6 +55,15 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Thrown when a model download is needed while offline=true. Every download,
+// explicit or triggered by loading a model that is not on disk, passes through
+// download_registered_model, so the check lives there.
+class OfflineDownloadError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+constexpr const char* kOfflineErrorCode = "lemond_offline";
+
 // Progress information for download operations
 struct DownloadProgress {
     std::string file;           // Current file being downloaded

@@ -1119,7 +1119,7 @@ In case of an error, the status will be `error` and the message will contain the
 ## `POST /v1/load`
 <sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>
 
-Explicitly load a registered model into memory. This is useful to ensure that the model is loaded before you make a request. Installs the model if necessary.
+Explicitly load a registered model into memory. This is useful to ensure that the model is loaded before you make a request. Installs the model if necessary. When the server is in offline mode and the model is not downloaded, returns 400 with code `lemond_offline` instead.
 
 > Note: loading a collection (`recipe: "collection.omni"`) loads each of its components in turn. Per-model options like `ctx_size` or `llamacpp_backend` are not forwarded to components — set them on each component's own `recipe_options.json` entry instead.
 

@@ -4348,6 +4348,11 @@ bool ModelManager::backend_self_manages_downloads(const std::string& recipe) con
 }
 
 void ModelManager::download_registered_model(const ModelInfo& info, bool do_not_upgrade, DownloadProgressCallback progress_callback) {
+    if (auto* cfg = RuntimeConfig::global(); cfg && cfg->offline()) {
+        throw OfflineDownloadError("Lemond is in offline mode, model '" + info.model_name +
+                                   "' is not downloaded");
+    }
+
     // Serialize downloads per checkpoint repo. A second request for the same
     // repo (e.g. a client that timed out and retried /pull while the first
     // download is still running) must wait for the in-flight download instead
