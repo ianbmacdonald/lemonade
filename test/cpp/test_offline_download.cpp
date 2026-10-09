@@ -57,8 +57,10 @@ int main() {
     lemon::RuntimeConfig cfg(json{
         {"offline", true},
         {"disable_model_filtering", true},
+        {"enable_dgpu_gtt", false},
         {"no_fetch_executables", true},
         {"auto_check_model_updates", false},
+        {"auto_update_models", false},
     });
     lemon::RuntimeConfig::set_global(&cfg);
 
