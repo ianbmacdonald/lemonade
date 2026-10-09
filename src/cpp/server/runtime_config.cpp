@@ -468,14 +468,21 @@ int RuntimeConfig::download_connections() const {
 
 namespace {
 
-// Reads an integer setting that config.json may hold invalid or omit; any
-// value outside [lo, hi] falls back to `fallback` with a warning.
+// Reads an integer setting that config.json may hold invalid or omit. A value
+// above `hi` is clamped to `hi` rather than reset: for these limits the
+// default is "off", and a hand-edited value that is merely too large should
+// keep the limit on. Anything else invalid falls back to `fallback`.
 int bounded_int_setting(const json& config, const char* key, int lo, int hi, int fallback) {
     if (!config.contains(key) || !config[key].is_number_integer()) {
         return fallback;
     }
     const int64_t n = config[key].get<int64_t>();
-    if (n < lo || n > hi) {
+    if (n > hi) {
+        LOG(WARNING, "RuntimeConfig") << key << " value " << n << " in config is above the maximum, using "
+                                      << hi << std::endl;
+        return hi;
+    }
+    if (n < lo) {
         LOG(WARNING, "RuntimeConfig") << "Invalid " << key << " value in config, using "
                                       << fallback << std::endl;
         return fallback;

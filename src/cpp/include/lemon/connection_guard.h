@@ -19,11 +19,15 @@ namespace lemon {
 // connections per client address, and a deadline for receiving each request.
 //
 // cpp-httplib's read timeout is per read, so a client that sends one byte just
-// inside it can hold a worker thread indefinitely. The deadline is measured
-// from accept until the route handler starts, which is the point where the
+// inside it can hold a worker thread indefinitely. The deadline runs from when
+// a worker thread picks the connection up (time queued for a worker is not
+// counted) until the route handler starts, which is the point where the
 // headers and body have both been read. The server limits each connection to
-// one request while the deadline is enabled, so every request starts at
-// accept. A watchdog thread shuts down connections that miss the deadline.
+// one request while the deadline is enabled, so every request starts on a
+// fresh connection. A watchdog thread shuts down connections that miss the
+// deadline. A request whose body is read just before
+// a watchdog tick but whose handler has not yet started can still be closed;
+// the window is the few microseconds between the two inside httplib.
 class ConnectionGuard {
 public:
     using Clock = std::chrono::steady_clock;
@@ -66,11 +70,15 @@ public:
     const Limits& limits() const { return limits_; }
     bool deadline_enabled() const { return limits_.receive_timeout.count() > 0; }
 
-    // Admits a connection from `client` (normalized address). Returns false when
-    // the client is at its cap; the caller then refuses and closes the socket.
-    // On success `ticket` tracks the connection until it is destroyed.
-    bool admit(socket_t sock, const std::string& client, Ticket& ticket,
-               Clock::time_point now = Clock::now());
+    enum class Admission { admitted, over_cap, untrackable };
+
+    // Admits a connection from `client` (normalized address). On `admitted`,
+    // `ticket` tracks the connection until it is destroyed; otherwise the
+    // caller refuses and closes the socket. `untrackable` means the deadline
+    // is on but the socket could not be duplicated (descriptor exhaustion):
+    // refusing fails closed, where admitting would leave it with no deadline.
+    Admission admit(socket_t sock, const std::string& client, Ticket& ticket,
+                    Clock::time_point now = Clock::now());
 
     // Called on the serving thread when the route handler starts.
     static void mark_request_received();

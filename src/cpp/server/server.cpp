@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <fstream>
 #include <map>
@@ -854,6 +855,9 @@ void Server::setup_http_servers() {
     // need the same limits: they own accept and run the WebSocket upgrade peek
     // before delegating, so a stalled client could otherwise hold a front
     // worker there.
+    const uint64_t payload_bytes = static_cast<uint64_t>(config_->max_request_body_mb()) * 1024 * 1024;
+    const size_t payload_max = static_cast<size_t>(
+        std::min<uint64_t>(payload_bytes, std::numeric_limits<size_t>::max()));
     for (httplib::Server* srv : {static_cast<httplib::Server*>(http_front_.get()),
                                  static_cast<httplib::Server*>(http_front_v6_.get()),
                                  static_cast<httplib::Server*>(http_server_.get()),
@@ -861,7 +865,7 @@ void Server::setup_http_servers() {
         srv->set_read_timeout(30, 0);
         srv->set_write_timeout(300, 0);
         srv->set_keep_alive_max_count(100);
-        srv->set_payload_max_length(static_cast<size_t>(config_->max_request_body_mb()) * 1024 * 1024);
+        srv->set_payload_max_length(payload_max);
     }
 
     // The per-read timeout above still lets a client that trickles bytes hold

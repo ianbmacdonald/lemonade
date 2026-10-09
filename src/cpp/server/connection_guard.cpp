@@ -107,8 +107,8 @@ ConnectionGuard::~ConnectionGuard() {
     }
 }
 
-bool ConnectionGuard::admit(socket_t sock, const std::string& client, Ticket& ticket,
-                            Clock::time_point now) {
+ConnectionGuard::Admission ConnectionGuard::admit(socket_t sock, const std::string& client,
+                                                  Ticket& ticket, Clock::time_point now) {
     auto entry = std::make_shared<Entry>();
     entry->client = client;
     entry->accepted = now;
@@ -118,7 +118,7 @@ bool ConnectionGuard::admit(socket_t sock, const std::string& client, Ticket& ti
         if (limits_.max_connections_per_client > 0 && !is_loopback(client)) {
             auto it = per_client_.find(client);
             if (it != per_client_.end() && it->second >= limits_.max_connections_per_client) {
-                return false;
+                return Admission::over_cap;
             }
         }
         // The watchdog shuts down a duplicate of the socket, never the original
@@ -127,13 +127,18 @@ bool ConnectionGuard::admit(socket_t sock, const std::string& client, Ticket& ti
         // to this connection's socket until the entry is released.
         if (deadline_enabled()) {
             entry->watch_sock = duplicate_socket(sock);
+#ifndef _WIN32
+            if (entry->watch_sock == kInvalidSocket) {
+                return Admission::untrackable;
+            }
+#endif
         }
         ++per_client_[client];
         entries_.push_back(entry);
     }
     t_current_entry = entry.get();
     ticket = Ticket(this, std::move(entry));
-    return true;
+    return Admission::admitted;
 }
 
 void ConnectionGuard::release(const std::shared_ptr<Entry>& entry) {
@@ -195,11 +200,28 @@ void ConnectionGuard::watchdog_loop() {
             std::lock_guard<std::mutex> lock(mu_);
             closed = expire_locked(Clock::now(), true);
         }
-        for (const auto& e : closed) {
-            LOG(WARNING, "Server") << "Closed connection from " << e->client
-                                   << ": request not received within "
-                                   << limits_.receive_timeout.count() << "s" << std::endl;
+        if (closed.empty()) {
+            continue;
         }
+        // One line per tick: a client that reconnects in a loop would
+        // otherwise write a line for every connection it opens.
+        std::map<std::string, size_t> by_client;
+        for (const auto& e : closed) {
+            ++by_client[e->client];
+        }
+        std::string clients;
+        size_t listed = 0;
+        for (const auto& [client, n] : by_client) {
+            if (listed++ == 5) {
+                clients += ", ...";
+                break;
+            }
+            clients += (clients.empty() ? "" : ", ") + client + " x" + std::to_string(n);
+        }
+        LOG(WARNING, "Server") << "Closed " << closed.size()
+                               << " connection(s) that did not send a complete request within "
+                               << limits_.receive_timeout.count() << "s (" << clients << ")"
+                               << std::endl;
     }
 }
 
