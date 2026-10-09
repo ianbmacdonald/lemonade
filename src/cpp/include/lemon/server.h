@@ -396,6 +396,9 @@ private:
     std::mutex background_sync_mutex_;
 
 
+    // Declared before the front listeners so it outlives them.
+    std::unique_ptr<ConnectionGuard> connection_guard_;
+
     // Routed servers (all routes/handlers; never listen) and the main-port
     // front listeners that feed them — see upgradable_http_server.h
     std::unique_ptr<RoutedHttpServer> http_server_;

@@ -791,6 +791,18 @@ void Server::start_model_cache_warmup() {
 template struct lemon::detail::PrivateMemberInit<
     lemon::detail::ProcessAndCloseSocketTag,
     &httplib::Server::process_and_close_socket>;
+template struct lemon::detail::PrivateMemberInit<lemon::detail::GetHandlersTag,
+                                                 &httplib::Server::get_handlers_>;
+template struct lemon::detail::PrivateMemberInit<lemon::detail::PostHandlersTag,
+                                                 &httplib::Server::post_handlers_>;
+template struct lemon::detail::PrivateMemberInit<lemon::detail::PutHandlersTag,
+                                                 &httplib::Server::put_handlers_>;
+template struct lemon::detail::PrivateMemberInit<lemon::detail::PatchHandlersTag,
+                                                 &httplib::Server::patch_handlers_>;
+template struct lemon::detail::PrivateMemberInit<lemon::detail::DeleteHandlersTag,
+                                                 &httplib::Server::delete_handlers_>;
+template struct lemon::detail::PrivateMemberInit<lemon::detail::OptionsHandlersTag,
+                                                 &httplib::Server::options_handlers_>;
 
 void Server::setup_http_servers() {
     http_server_ = std::make_unique<RoutedHttpServer>();
@@ -849,10 +861,48 @@ void Server::setup_http_servers() {
         srv->set_read_timeout(30, 0);
         srv->set_write_timeout(300, 0);
         srv->set_keep_alive_max_count(100);
+        srv->set_payload_max_length(static_cast<size_t>(config_->max_request_body_mb()) * 1024 * 1024);
     }
+
+    // The per-read timeout above still lets a client that trickles bytes hold
+    // a worker for as long as it likes; the guard bounds the whole receive.
+    ConnectionGuard::Limits limits;
+    limits.receive_timeout = std::chrono::seconds(config_->request_receive_timeout());
+    limits.max_connections_per_client = static_cast<size_t>(config_->max_connections_per_client());
+#ifdef _WIN32
+    if (limits.receive_timeout.count() > 0) {
+        LOG(WARNING, "Server") << "request_receive_timeout is not supported on Windows; ignoring it"
+                               << std::endl;
+        limits.receive_timeout = std::chrono::seconds(0);
+    }
+#endif
+    std::unique_ptr<ConnectionGuard> guard;
+    if (limits.receive_timeout.count() > 0 || limits.max_connections_per_client > 0) {
+        guard = std::make_unique<ConnectionGuard>(limits);
+        LOG(INFO, "Server") << "Connection limits: request_receive_timeout="
+                            << limits.receive_timeout.count() << "s, max_connections_per_client="
+                            << limits.max_connections_per_client << std::endl;
+    }
+    if (guard && guard->deadline_enabled()) {
+        // The deadline runs from accept, so each connection carries one request.
+        for (httplib::Server* srv : {static_cast<httplib::Server*>(http_front_.get()),
+                                     static_cast<httplib::Server*>(http_front_v6_.get()),
+                                     static_cast<httplib::Server*>(http_server_.get()),
+                                     static_cast<httplib::Server*>(http_server_v6_.get())}) {
+            srv->set_keep_alive_max_count(1);
+        }
+    }
+    http_front_->set_connection_guard(guard.get());
+    http_front_v6_->set_connection_guard(guard.get());
+    connection_guard_ = std::move(guard);
 
     setup_routes(*http_server_);
     setup_routes(*http_server_v6_);
+
+    if (connection_guard_ && connection_guard_->deadline_enabled()) {
+        detail::wrap_route_handlers(*http_server_, &ConnectionGuard::mark_request_received);
+        detail::wrap_route_handlers(*http_server_v6_, &ConnectionGuard::mark_request_received);
+    }
 }
 
 void Server::stop_http_listeners() {
@@ -7832,6 +7882,15 @@ void Server::apply_config_side_effects(const json& applied_changes) {
                     udp_beacon_.stopBroadcasting();
                     stop_http_listeners();
                 }
+            }
+        } else if (key == "max_request_body_mb" || key == "request_receive_timeout" ||
+                   key == "max_connections_per_client") {
+            // Applied when the HTTP servers are created, so rebuild them.
+            LOG(INFO, "Server") << key << " changed; restarting the HTTP listeners" << std::endl;
+            if (running_) {
+                rebind_requested_ = true;
+                udp_beacon_.stopBroadcasting();
+                stop_http_listeners();
             }
         } else if (key == "host") {
             LOG(INFO, "Server") << "Host change requested to: " << config_->host() << std::endl;

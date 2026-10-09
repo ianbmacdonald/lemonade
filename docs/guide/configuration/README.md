@@ -101,7 +101,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
   "log_level": "info",
   "log_max_file_size_mb": 10,
   "log_max_files": 5,
+  "max_connections_per_client": 0,
   "max_loaded_models": 1,
+  "max_request_body_mb": 100,
   "models_dir": "auto",
   "moonshine": {
     "args": "",
@@ -121,6 +123,7 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
     "vulkan_bin": "builtin"
   },
   "port": 13305,
+  "request_receive_timeout": 0,
   "rocm_channel": "stable",
   "rocm_install_method": "auto",
   "ryzenai": {
@@ -220,6 +223,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
 | `log_max_files` | int | 5 | Max number of rotated log backup files to retain (.1 through .N); legacy oversized files are rotated into .1 and pruned over cycles |
 | `global_timeout` | int | 600 | Timeout in seconds for HTTP, inference, and readiness checks |
 | `max_loaded_models` | int | 1 | Max models per type slot. Use -1 for unlimited |
+| `max_request_body_mb` | int | 100 | Largest request body the server accepts, in MB (1–4096). A larger body is refused with 413 before it is buffered. On a memory-constrained gateway set it lower, for example `32`: that still fits a 25 MB audio upload. Changing it restarts the HTTP listeners. |
+| `request_receive_timeout` | int | 0 | Seconds a client has to send a complete request, headers and body, measured from when the connection is accepted (0–3600). `0` turns the limit off. The read timeout alone only limits the gap between two reads, so a client that sends a byte every few seconds can otherwise hold a worker thread indefinitely. While it is set, each connection carries one request (no keep-alive reuse). Not enforced on Windows. Changing it restarts the HTTP listeners. |
+| `max_connections_per_client` | int | 0 | Most connections one client address may have open at once (0–1024). `0` means no limit. Further connections are refused with 503. Loopback clients are exempt. Changing it restarts the HTTP listeners. |
 | `auto_evict` | bool | false | Enable dynamic VRAM management based on idle time and global GPU memory pressure. Can be overridden per model. |
 | `auto_evict_threshold_pct` | number | 0.90 | Global VRAM fraction at which pressure eviction is evaluated. Must be greater than 0 and at most 1.0; `0.90` means 90%. |
 | `beacon_listen` | bool | false | Linux/macOS only. Listen on UDP 13305 for other Lemonade servers' LAN broadcast beacons from on-link RFC1918 senders and list them under `beacon_listener` in `/v1/health`. Heard hosts are never contacted and never used as providers. The list is as readable as `/health`, so set `LEMONADE_API_KEY` when `host` is not localhost. `stats.url_mismatch` counts multi-homed peers whose source IP differs from their advertised URL, and beacons re-sent by a relay that is not listed in `beacon_trusted_relays`. UDP 13305 must be allowed inbound on the LAN side. By default it hears every RFC1918 interface, so on a gateway whose WAN side is also RFC1918 (double NAT), set `beacon_listen_interfaces` to the LAN bridges, or WAN-side hosts are listed too. |

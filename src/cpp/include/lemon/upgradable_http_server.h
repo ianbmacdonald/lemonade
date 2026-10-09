@@ -27,13 +27,19 @@
 #include <httplib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
+#include "lemon/connection_guard.h"
 #include "lemon/utils/aixlog.hpp"
 #include "lemon/utils/network_utils.h"
 
@@ -65,6 +71,39 @@ typename PrivateMemberInit<Tag, Member>::Setter PrivateMemberInit<Tag, Member>::
 struct ProcessAndCloseSocketTag {
     using type = ProcessAndCloseSocketFn;
 };
+
+// httplib's route tables (private). Spelled out because the Handlers alias is
+// private too. Only the non-content-reader tables: lemond registers no
+// content-reader routes.
+using RouteHandlerList =
+    std::vector<std::pair<std::unique_ptr<httplib::detail::MatcherBase>, httplib::Server::Handler>>;
+using RouteHandlerListMember = RouteHandlerList httplib::Server::*;
+struct GetHandlersTag { using type = RouteHandlerListMember; };
+struct PostHandlersTag { using type = RouteHandlerListMember; };
+struct PutHandlersTag { using type = RouteHandlerListMember; };
+struct PatchHandlersTag { using type = RouteHandlerListMember; };
+struct DeleteHandlersTag { using type = RouteHandlerListMember; };
+struct OptionsHandlersTag { using type = RouteHandlerListMember; };
+
+// Runs `on_enter` at the start of every route handler registered so far.
+// httplib calls a handler only after it has read the request body, so this is
+// the first point where a request is known to be fully received.
+inline void wrap_route_handlers(httplib::Server& srv, const std::function<void()>& on_enter) {
+    for (RouteHandlerListMember member : {PrivateMemberHolder<GetHandlersTag>::value,
+                                          PrivateMemberHolder<PostHandlersTag>::value,
+                                          PrivateMemberHolder<PutHandlersTag>::value,
+                                          PrivateMemberHolder<PatchHandlersTag>::value,
+                                          PrivateMemberHolder<DeleteHandlersTag>::value,
+                                          PrivateMemberHolder<OptionsHandlersTag>::value}) {
+        for (auto& route : srv.*member) {
+            route.second = [on_enter, inner = std::move(route.second)](
+                               const httplib::Request& req, httplib::Response& res) {
+                on_enter();
+                inner(req, res);
+            };
+        }
+    }
+}
 
 // Peek the first bytes of an accepted connection (without consuming them) and
 // decide whether it is a WebSocket upgrade for one of our realtime paths.
@@ -140,8 +179,18 @@ public:
 
     socket_t listen_socket() const { return svr_sock_; }
 
+    void set_connection_guard(ConnectionGuard* guard) { guard_ = guard; }
+
 private:
     bool process_and_close_socket(socket_t sock) override {
+        ConnectionGuard::Ticket ticket;
+        if (guard_) {
+            const std::string client = ConnectionGuard::peer_address(sock);
+            if (!guard_->admit(sock, client, ticket)) {
+                refuse_over_cap(sock, client);
+                return true;
+            }
+        }
         if (!lemon::utils::configure_tcp_keepalive(sock)) {
             LOG(DEBUG, "Server") << "Failed to configure TCP keep-alive on accepted socket" << std::endl;
         }
@@ -154,8 +203,31 @@ private:
         return (delegate_->*fn)(sock);
     }
 
+    void refuse_over_cap(socket_t sock, const std::string& client) {
+        static const std::string kBody =
+            "{\"error\": \"Too many connections from this client; retry shortly\"}";
+        static const std::string kBusy =
+            "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\n"
+            "Content-Type: application/json\r\nContent-Length: " +
+            std::to_string(kBody.size()) + "\r\n\r\n" + kBody;
+        httplib::detail::send_socket(sock, kBusy.data(), kBusy.size(), 0);
+        httplib::detail::shutdown_socket(sock);
+        httplib::detail::close_socket(sock);
+        // A client at its cap is usually retrying in a loop; log the first
+        // refusal and then every 100th rather than every one.
+        const auto n = refused_.fetch_add(1) + 1;
+        if (n == 1 || n % 100 == 0) {
+            LOG(WARNING, "Server") << "Refused connection from " << client << ": "
+                                   << guard_->limits().max_connections_per_client
+                                   << " connections already open (" << n << " refused so far)"
+                                   << std::endl;
+        }
+    }
+
     RoutedHttpServer* delegate_;
     UpgradeHandler upgrade_handler_;
+    ConnectionGuard* guard_ = nullptr;
+    std::atomic<uint64_t> refused_{0};
 };
 
 } // namespace lemon

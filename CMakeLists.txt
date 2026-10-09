@@ -1026,6 +1026,7 @@ set(SOURCES_CORE
     src/cpp/server/routing_policy_parser.cpp
     src/cpp/server/routing_policy_store.cpp
     src/cpp/server/route_decision_response.cpp
+    src/cpp/server/connection_guard.cpp
     src/cpp/server/runtime_config.cpp
     src/cpp/server/telemetry.cpp
     src/cpp/server/logging_config.cpp
@@ -3210,6 +3211,32 @@ if(BUILD_TESTING AND EXISTS "${_CONFIG_DOWNLOAD_RATE_LIMIT_TEST_SRC}")
     target_link_libraries(test_config_download_rate_limit PRIVATE lemonade-server-core)
     add_cpp_ci_test(ConfigDownloadRateLimitTest CI ON
         COMMAND test_config_download_rate_limit
+    )
+endif()
+
+set(_CONFIG_GATEWAY_LIMITS_TEST_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_config_gateway_limits.cpp"
+)
+if(BUILD_TESTING AND EXISTS "${_CONFIG_GATEWAY_LIMITS_TEST_SRC}")
+    add_executable(test_config_gateway_limits
+        test/cpp/test_config_gateway_limits.cpp
+    )
+    target_link_libraries(test_config_gateway_limits PRIVATE lemonade-server-core)
+    add_cpp_ci_test(ConfigGatewayLimitsTest CI ON
+        COMMAND test_config_gateway_limits
+    )
+endif()
+
+set(_CONNECTION_GUARD_TEST_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_connection_guard.cpp"
+)
+if(BUILD_TESTING AND EXISTS "${_CONNECTION_GUARD_TEST_SRC}")
+    add_executable(test_connection_guard
+        test/cpp/test_connection_guard.cpp
+    )
+    target_link_libraries(test_connection_guard PRIVATE lemonade-server-core)
+    add_cpp_ci_test(ConnectionGuardTest CI ON
+        COMMAND test_connection_guard
     )
 endif()
 
