@@ -6,6 +6,7 @@
 #include "lemon/backends/backend_utils.h"
 #include "lemon/backends/executorch/executorch.h"
 #include "lemon/backends/hf_cache_util.h"
+#include "lemon/classify_text_limit.h"
 #include "lemon/error_types.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
@@ -26,10 +27,6 @@ namespace lemon {
 namespace backends {
 
 namespace {
-// et-server rejects larger bodies itself; refusing here keeps an oversized
-// request from being copied into a second body just to be refused.
-constexpr size_t kMaxClassifyTextBytes = 1024 * 1024;
-
 // The config is mandatory even when a manifest is present: the manifest
 // describes the output contract only, and et-server still needs the config to
 // check the architecture against its supported input convention.
@@ -267,15 +264,8 @@ json ExecutorchServer::classify(const json& request) {
             }}
         };
     }
-    if (text.size() > kMaxClassifyTextBytes) {
-        return json{
-            {"error", {
-                {"message", "Classify text exceeds " + std::to_string(kMaxClassifyTextBytes) +
-                            " bytes"},
-                {"type", "invalid_request_error"},
-                {"status_code", 413},
-            }}
-        };
+    if (auto err = classify_text::too_large_error(text)) {
+        return *err;
     }
     return forward_classify(text, request);
 }

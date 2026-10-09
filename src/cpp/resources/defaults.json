@@ -63,7 +63,9 @@
   "log_level": "info",
   "log_max_file_size_mb": 10,
   "log_max_files": 5,
+  "max_connections_per_client": 0,
   "max_loaded_models": 1,
+  "max_request_body_mb": 100,
   "models_dir": "auto",
   "moonshine": {
     "args": "",
@@ -83,6 +85,7 @@
     "vulkan_bin": "builtin"
   },
   "port": 13305,
+  "request_receive_timeout": 0,
   "rocm_channel": "stable",
   "rocm_install_method": "auto",
   "ryzenai": {

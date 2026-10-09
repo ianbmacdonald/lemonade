@@ -46,6 +46,14 @@ public:
     int64_t download_rate_limit_bytes_per_second() const;
     int download_connections() const;
     std::string allowed_origins() const;
+    int max_request_body_mb() const;
+    int request_receive_timeout() const;
+    int max_connections_per_client() const;
+
+    static constexpr int kDefaultMaxRequestBodyMb = 100;
+    static constexpr int kMaxMaxRequestBodyMb = 4096;
+    static constexpr int kMaxRequestReceiveTimeout = 3600;
+    static constexpr int kMaxConnectionsPerClient = 1024;
 
     std::string models_dir() const;
     int ctx_size() const;

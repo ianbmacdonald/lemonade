@@ -466,6 +466,59 @@ int RuntimeConfig::download_connections() const {
     return static_cast<int>(n);
 }
 
+namespace {
+
+// Reads an integer setting that config.json may hold invalid or omit. A value
+// above `hi` is clamped to `hi` rather than reset: for these limits the
+// default is "off", and a hand-edited value that is merely too large should
+// keep the limit on. Anything else invalid falls back to `fallback`.
+int bounded_int_setting(const json& config, const char* key, int lo, int hi, int fallback) {
+    if (!config.contains(key) || !config[key].is_number_integer()) {
+        return fallback;
+    }
+    const int64_t n = config[key].get<int64_t>();
+    if (n > hi) {
+        LOG(WARNING, "RuntimeConfig") << key << " value " << n << " in config is above the maximum, using "
+                                      << hi << std::endl;
+        return hi;
+    }
+    if (n < lo) {
+        LOG(WARNING, "RuntimeConfig") << "Invalid " << key << " value in config, using "
+                                      << fallback << std::endl;
+        return fallback;
+    }
+    return static_cast<int>(n);
+}
+
+void validate_bounded_int_setting(const std::string& key, const json& value, int lo, int hi) {
+    if (!value.is_number_integer()) {
+        throw std::invalid_argument("'" + key + "' must be an integer");
+    }
+    const int64_t n = value.get<int64_t>();
+    if (n < lo || n > hi) {
+        throw std::invalid_argument("'" + key + "' must be between " + std::to_string(lo) +
+                                    " and " + std::to_string(hi));
+    }
+}
+
+} // namespace
+
+int RuntimeConfig::max_request_body_mb() const {
+    std::shared_lock lock(mutex_);
+    return bounded_int_setting(config_, "max_request_body_mb", 1, kMaxMaxRequestBodyMb,
+                               kDefaultMaxRequestBodyMb);
+}
+
+int RuntimeConfig::request_receive_timeout() const {
+    std::shared_lock lock(mutex_);
+    return bounded_int_setting(config_, "request_receive_timeout", 0, kMaxRequestReceiveTimeout, 0);
+}
+
+int RuntimeConfig::max_connections_per_client() const {
+    std::shared_lock lock(mutex_);
+    return bounded_int_setting(config_, "max_connections_per_client", 0, kMaxConnectionsPerClient, 0);
+}
+
 std::string RuntimeConfig::allowed_origins_unlocked() const {
     if (allowed_origins_override_.has_value()) {
         return *allowed_origins_override_;
@@ -933,6 +986,12 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
                 "'download_connections' must be between 1 and " +
                 std::to_string(utils::HttpClient::kMaxDownloadConnections));
         }
+    } else if (key == "max_request_body_mb") {
+        validate_bounded_int_setting(key, value, 1, kMaxMaxRequestBodyMb);
+    } else if (key == "request_receive_timeout") {
+        validate_bounded_int_setting(key, value, 0, kMaxRequestReceiveTimeout);
+    } else if (key == "max_connections_per_client") {
+        validate_bounded_int_setting(key, value, 0, kMaxConnectionsPerClient);
     } else if (key == "allowed_origins") {
         if (!value.is_string()) {
             throw std::invalid_argument("'allowed_origins' must be a string");
