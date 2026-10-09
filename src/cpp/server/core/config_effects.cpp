@@ -25,6 +25,11 @@ void ConfigEffects::apply(const std::string& key, const json& value) {
     if (key == "port" || key == "host" || key == "websocket_port" ||
         key == "broadcast" || key == "no_broadcast") {
         ctx_.listener->rebind();
+    } else if (key == "max_request_body_mb" || key == "request_receive_timeout" ||
+               key == "max_connections_per_client") {
+        // Applied when the HTTP servers are created, so rebuild them.
+        LOG(INFO, "Server") << key << " changed; restarting the HTTP listeners" << std::endl;
+        ctx_.listener->rebuild();
     } else if (key == "beacon_listen_interfaces" || key == "beacon_trusted_relays") {
         ctx_.listener->sync_beacon_listener();
     } else if (key == "beacon_listen") {

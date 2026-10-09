@@ -9,6 +9,7 @@
 
 #include <httplib.h>
 
+#include "lemon/connection_guard.h"
 #include "lemon/upgradable_http_server.h"
 #include "lemon/utils/beacon_listener.h"
 #include "lemon/utils/network_beacon.h"
@@ -45,6 +46,10 @@ public:
     // Applies the host, port, websocket_port and broadcast settings from RuntimeConfig to
     // the running listeners. Only what changed is restarted.
     void rebind();
+
+    // Recreates the HTTP servers so settings applied only at creation (the request body
+    // limit, receive deadline and per-client cap) take effect.
+    void rebuild();
 
     // Idempotent: start(), stop() and the config side-effect path all converge on config.
     void sync_beacon_listener();
@@ -83,6 +88,9 @@ private:
     std::string bound_host_;
     int websocket_requested_port_;
     bool broadcast_;
+
+    // Declared before the front listeners so it outlives them.
+    std::unique_ptr<ConnectionGuard> connection_guard_;
 
     // The routed servers carry every route and never listen; the fronts own the main
     // port and hand WebSocket upgrades to websocket_server_ (see upgradable_http_server.h).

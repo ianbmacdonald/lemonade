@@ -6,6 +6,7 @@
 #include "lemon/backends/backend_utils.h"
 #include "lemon/backends/hf_cache_util.h"
 #include "lemon/backend_manager.h"
+#include "lemon/classify_text_limit.h"
 #include "lemon/image_classify_request.h"
 #include "lemon/utils/path_utils.h"
 #include "lemon/utils/custom_args.h"
@@ -313,6 +314,9 @@ json TfliteServer::classify(const json& request) {
                 {"status_code", 400},
             }}
         };
+    }
+    if (auto err = classify_text::too_large_error(text)) {
+        return *err;
     }
     return forward_classify(text, request);
 }
