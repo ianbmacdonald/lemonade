@@ -1990,6 +1990,8 @@ window.api = {
     // Override default headers for static files to include no-cache
     // This ensures the web UI always gets the latest version
     web_server.set_file_request_handler([](const httplib::Request& req, httplib::Response& res) {
+        // Mount-point files bypass the route tables wrap_route_handlers covers.
+        ConnectionGuard::mark_request_received();
         // Add no-cache headers for static files
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_header("Pragma", "no-cache");
