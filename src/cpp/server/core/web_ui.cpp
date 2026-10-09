@@ -7,6 +7,7 @@
 #include <lemon/utils/aixlog.hpp>
 #include <nlohmann/json.hpp>
 
+#include "lemon/connection_guard.h"
 #include "lemon/model_manager.h"
 #include "lemon/server/http_listener.h"
 #include "lemon/server/model_json.h"
@@ -318,6 +319,8 @@ window.api = {
     // Static files always get no-cache headers, so the web UI picks up a new version
     // as soon as lemond is updated.
     server.set_file_request_handler([](const httplib::Request&, httplib::Response& res) {
+        // Mount-point files bypass the route tables wrap_route_handlers covers.
+        ConnectionGuard::mark_request_received();
         set_no_cache_headers(res);
     });
 }
