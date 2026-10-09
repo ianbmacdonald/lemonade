@@ -44,6 +44,16 @@ int main() {
     check(bad.request_receive_timeout() == 0, "negative timeout falls back to off");
     check(bad.max_connections_per_client() == 0, "non-integer cap falls back to off");
 
+    const RuntimeConfig too_big(json{{"max_request_body_mb", 100000},
+                                     {"request_receive_timeout", 7200},
+                                     {"max_connections_per_client", 5000}});
+    check(too_big.max_request_body_mb() == RuntimeConfig::kMaxMaxRequestBodyMb,
+          "a body limit above the maximum is clamped, not reset");
+    check(too_big.request_receive_timeout() == RuntimeConfig::kMaxRequestReceiveTimeout,
+          "a timeout above the maximum is clamped, not switched off");
+    check(too_big.max_connections_per_client() == RuntimeConfig::kMaxConnectionsPerClient,
+          "a cap above the maximum is clamped, not switched off");
+
     check(!set_throws({{"max_request_body_mb", 32}}), "set accepts a valid body limit");
     check(set_throws({{"max_request_body_mb", 0}}), "set refuses a zero body limit");
     check(set_throws({{"max_request_body_mb", RuntimeConfig::kMaxMaxRequestBodyMb + 1}}),
