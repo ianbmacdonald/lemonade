@@ -186,8 +186,9 @@ private:
         ConnectionGuard::Ticket ticket;
         if (guard_) {
             const std::string client = ConnectionGuard::peer_address(sock);
-            if (!guard_->admit(sock, client, ticket)) {
-                refuse_over_cap(sock, client);
+            const auto admission = guard_->admit(sock, client, ticket);
+            if (admission != ConnectionGuard::Admission::admitted) {
+                refuse(sock, client, admission);
                 return true;
             }
         }
@@ -203,9 +204,9 @@ private:
         return (delegate_->*fn)(sock);
     }
 
-    void refuse_over_cap(socket_t sock, const std::string& client) {
+    void refuse(socket_t sock, const std::string& client, ConnectionGuard::Admission why) {
         static const std::string kBody =
-            "{\"error\": \"Too many connections from this client; retry shortly\"}";
+            "{\"error\": \"Too many connections; retry shortly\"}";
         static const std::string kBusy =
             "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\n"
             "Content-Type: application/json\r\nContent-Length: " +
@@ -217,10 +218,17 @@ private:
         // refusal and then every 100th rather than every one.
         const auto n = refused_.fetch_add(1) + 1;
         if (n == 1 || n % 100 == 0) {
-            LOG(WARNING, "Server") << "Refused connection from " << client << ": "
-                                   << guard_->limits().max_connections_per_client
-                                   << " connections already open (" << n << " refused so far)"
-                                   << std::endl;
+            if (why == ConnectionGuard::Admission::untrackable) {
+                LOG(ERROR, "Server") << "Refused connection from " << client
+                                     << ": could not duplicate the socket to enforce "
+                                        "request_receive_timeout (out of file descriptors?) ("
+                                     << n << " refused so far)" << std::endl;
+            } else {
+                LOG(WARNING, "Server") << "Refused connection from " << client << ": "
+                                       << guard_->limits().max_connections_per_client
+                                       << " connections already open (" << n
+                                       << " refused so far)" << std::endl;
+            }
         }
     }
 
