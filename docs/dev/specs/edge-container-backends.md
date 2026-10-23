@@ -7,6 +7,8 @@
 - [Backends](#backends)
 - [Changes to the Container Backends Spec](#changes-to-the-container-backends-spec)
 - [Engine Contract](#engine-contract)
+- [Decision and Zero-Shot Models](#decision-and-zero-shot-models)
+- [NPU Devices](#npu-devices)
 - [Gateway Profile](#gateway-profile)
 - [prpl Life Cycle Management](#prpl-life-cycle-management)
 - [Breaking Changes](#breaking-changes)
@@ -16,9 +18,9 @@
 
 ## Summary
 
-This spec proposes three CPU classification backends for gateways and other small Linux hosts, delivered in the container backend format of the [Container Backends Spec](./container-backends.md) (RFC #3585).
+This spec proposes three CPU classification and decision backends for gateways and other small Linux hosts, delivered in the container backend format of the [Container Backends Spec](./container-backends.md) (RFC #3585).
 
-- The backends are `tflite:cpu`, `executorch:cpu` and `onnxruntime:edge`, each a `guest` tier, `container` format backend.
+- The backends are `tflite:edge`, `executorch:edge` and `onnxruntime:edge`, each a `guest` tier, `container` format backend.
 - Each backend runs from a digest-pinned, multi-arch (amd64 and arm64) OCI image, through the `ContainerManager` that #3709 adds.
 - The first deployment target is prplOS, the prpl Foundation's OpenWrt-based gateway OS, whose Life Cycle Management (LCM) already runs OCI containers. Netstatz wires `lemond` into prplOS on its own fork first; this spec covers only what upstream Lemonade would carry.
 
@@ -28,9 +30,9 @@ Major feature, delivered as one PR per backend after the container backend stack
 
 ## User Story
 
-A gateway vendor ships `lemond` in the gateway's base image and gives on-device applications one local inference API for small classifiers, such as phishing text detection and image tagging. The engines arrive as container images, so the vendor installs, updates and removes them through the same tooling it uses for every other containerized application. A request for a model the gateway cannot hold goes to a LAN `lemond` or a cloud provider through the existing `cloud_providers` setting.
+A gateway vendor ships `lemond` in the gateway's base image and gives on-device applications one local inference API for small classifiers and decision models, such as phishing text detection, image tagging, and choosing the cause of a network fault from a short list. The engines arrive as container images, so the vendor installs, updates and removes them through the same tooling it uses for every other containerized application. A request for a model the gateway cannot hold goes to a LAN `lemond` or a cloud provider through the existing `cloud_providers` setting.
 
-Release note: "Three guest CPU backends for text and image classification (`tflite:cpu`, `executorch:cpu`, `onnxruntime:edge`), shipped as amd64 and arm64 container images, for small Linux hosts such as home gateways."
+Release note: "Three guest CPU backends for text, image and zero-shot classification and for decision models (`tflite:edge`, `executorch:edge`, `onnxruntime:edge`), shipped as amd64 and arm64 container images, for small Linux hosts such as home gateways."
 
 ## Scope
 
@@ -40,7 +42,7 @@ This section states what the beta covers.
 | --- | --- |
 | Platform | Linux amd64 and arm64, CPU only |
 | Container tools | Podman and Docker, exactly as the [Container Backends Spec](./container-backends.md) defines them |
-| Modes | Text classification (`POST /v1/classify`), image classification (`POST /v1/images/classify`, `tflite:cpu` only) |
+| Modes | Text classification and zero-shot classification (`POST /v1/classify`), image classification (`POST /v1/images/classify`, `tflite:edge` only), decision questions (`POST /v1/systemone`) |
 | Models | Downloaded by Lemonade and mounted read-only, per the Container Backends Spec |
 | Image source | One new namespace, `ghcr.io/ianbmacdonald/*`, until the maintainers choose a home (see [Open Questions](#open-questions)) |
 | prpl LCM as a container tool | Not in the beta (see [prpl Life Cycle Management](#prpl-life-cycle-management)) |
@@ -51,9 +53,9 @@ Each backend is a new `support` row with its own descriptor labels. `tflite` and
 
 | Backend | Tier | Format | Image | Engine | Modes |
 | --- | --- | --- | --- | --- | --- |
-| `tflite:cpu` | guest | container | `ghcr.io/ianbmacdonald/tflite-server` | LiteRT, CPU with XNNPACK | `classification`, `image-classification` |
-| `executorch:cpu` | guest | container | `ghcr.io/ianbmacdonald/et-server` | ExecuTorch, CPU with XNNPACK | `classification` |
-| `onnxruntime:edge` | guest | container | `ghcr.io/ianbmacdonald/ort-server` | ONNX Runtime CPU | `classification`, for `model.onnx` and `model.ort` files |
+| `tflite:edge` | guest | container | `ghcr.io/ianbmacdonald/tflite-server` | LiteRT, CPU with XNNPACK | `classification`, `image-classification`, `systemone` |
+| `executorch:edge` | guest | container | `ghcr.io/ianbmacdonald/et-server` | ExecuTorch, CPU with XNNPACK | `classification`, `systemone` |
+| `onnxruntime:edge` | guest | container | `ghcr.io/ianbmacdonald/ort-server` | ONNX Runtime CPU | `classification`, `systemone`, for `model.onnx` and `model.ort` files |
 
 Each backend's `ContainerPolicy` is:
 
@@ -85,14 +87,56 @@ This section defines what the three engine images share, so one `WrappedServer` 
 | Program | `<engine> --model-path /mnt/models/<model> --port <port> --host 0.0.0.0` |
 | Ready endpoint | `GET /health`, which returns `{"status": "ok", "task": "<task>"}` |
 | Text classification | `POST /classify` |
+| Zero-shot classification | `POST /classify` with a `labels` array, the field #3952 has `lemond` send to `ort-server` |
+| Decision questions | `POST /systemone`, with the request and response of llama.cpp's `POST /v1/systemone`: a `state` and named `questions` of type `choice`, `score` or `noul`, answered with one entry per question in `answers` |
 | Image classification | `POST /classify/image`, multipart (`tflite-server` only) |
 | Model directory | Manifest, tokenizer files and one model file (`model.tflite`, `model.pte`, `model.onnx` or `model.ort`), mounted one file at a time by the Container Backends Spec's directory rule |
 | Writable state | `tflite-server`'s XNNPACK weight cache goes to `/tmp` inside the container, never beside the read-only model |
 
-Two engine changes are required before the images ship, one release per engine:
+These engine changes are required before the images ship, one release per engine:
 
 1. Add a `--host` flag. Today each engine binds `127.0.0.1`, which a container's published port cannot reach.
 2. In `tflite-server`, add a weight cache path flag. Today the cache is written beside the model.
+3. Accept `labels` on `POST /classify`. `onnxruntime:edge` takes this from `ort-server` once #3952 lands; `tflite-server` and `et-server` port it.
+4. Add `POST /systemone` to all three engines.
+5. Build each engine with its framework's full default operator set. The curated operator sets on the Netstatz fork refuse zero-shot models such as GLiClass.
+
+## Decision and Zero-Shot Models
+
+This section describes the two model types that need the new engine endpoints, and the `lemond` routes they reach through.
+
+A decision model scores options the caller supplies instead of generating text. ggml-org's decision models (Julia-1, 144M, mmBERT-small; Laya, 421M, ModernBERT-large) are encoders of DistilBERT's class, so an export to ONNX, LiteRT or ExecuTorch that keeps the decision head should run on these CPU engines. No such export has run yet. A zero-shot classifier scores the input against labels the caller declares per request.
+
+The target models are:
+
+| Model | Type | Backends | Status |
+| --- | --- | --- | --- |
+| Julia-1 (144M) | Decision | All three | Export with the decision head not yet done |
+| Laya (421M) | Decision | All three | Export with the decision head not yet done |
+| `knowledgator/gliclass-modern-base-v3.0` (151M) | Zero-shot | `onnxruntime:edge` | Export not yet done; needs the full operator set |
+
+The `lemond` routes come from two open PRs, and each needs one widening:
+
+| PR | Adds | Widening this spec needs |
+| --- | --- | --- |
+| #3952 | `labels` on `POST /v1/classify`, and a `zero_shot` router classifier | None for `onnxruntime:edge`. `tflite:edge` and `executorch:edge` accept `labels` once their engines do |
+| #3956 | `POST /v1/systemone`, answered by a `llamacpp` model labelled `systemone` | Also route `/v1/systemone` to any backend whose descriptor lists the `systemone` mode |
+
+## NPU Devices
+
+This section describes how an NPU fits these backends when gateway NPUs arrive. The beta is CPU only and adds nothing for NPUs.
+
+An NPU backend is a separate `support` row per NPU vendor, beside the CPU row, such as `tflite:edge-<vendor>`:
+
+| Item | NPU row |
+| --- | --- |
+| Device type | `DEVICE_NPU`, with a new device key per vendor beside today's `amd_npu` |
+| `ContainerPolicy.devices` | The vendor's NPU device nodes |
+| Image | The CPU image plus the vendor's delegate or execution provider libraries |
+| Detection | `lemond` detects the vendor's NPU before it offers the row, as it does for `amd_npu` |
+| Scheduling | The Router's existing NPU exclusivity applies |
+
+The engines' delegates (LiteRT), backends (ExecuTorch) and execution providers (ONNX Runtime) already select the accelerator at load, so an NPU row changes the image and the device nodes, not the engine contract.
 
 ## Gateway Profile
 
