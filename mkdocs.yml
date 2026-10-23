@@ -94,6 +94,7 @@ nav:
     - Specs:
       - Writing Guide: dev/specs/spec-writing-guide.md
       - Container Backends: dev/specs/container-backends.md
+      - Edge Container Backends: dev/specs/edge-container-backends.md
       - HTTP Server: dev/specs/http-server.md
       - Model Management Spec: dev/specs/model-management.md
     - Working Groups: dev/working-groups/README.md
