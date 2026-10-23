@@ -114,7 +114,7 @@ This section states who builds each artifact today, so reviewers can see where t
 | `ort-server` musl build | Netstatz | `github.com/ianbmacdonald/ort-server`, a fork of `lemonade-sdk/ort-server` | v0.2.1-musl, x86_64 and aarch64 |
 | `lemond` musl build | Netstatz | `github.com/ianbmacdonald/lemonade`, branch `release/prpl-demo` | `prpl-demo-musl-2026.43.0-571d17e15`, aarch64 |
 
-The musl builds use the prpl Foundation's OpenWrt SDK cross-compile recipe. The prpl Foundation's demo work packages these releases as prplOS packages and runs them on a gateway; it does not build them.
+The musl builds use the prplOS 5.1 toolchain (GCC 13.3, musl) and a copy of its sysroot from a prplOS build tree. The prpl Foundation's demo work packages these releases as prplOS packages and runs them on a gateway; it does not build them.
 
 ## Decision and Zero-Shot Models
 
