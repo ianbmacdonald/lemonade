@@ -7,6 +7,7 @@
 - [Backends](#backends)
 - [Changes to the Container Backends Spec](#changes-to-the-container-backends-spec)
 - [Engine Contract](#engine-contract)
+- [Build Provenance](#build-provenance)
 - [Decision and Zero-Shot Models](#decision-and-zero-shot-models)
 - [NPU Devices](#npu-devices)
 - [Gateway Profile](#gateway-profile)
@@ -101,6 +102,19 @@ These engine changes are required before the images ship, one release per engine
 3. Accept `labels` on `POST /classify`. `ort-server` gains this in lemonade-sdk/ort-server#4, which #3952 waits on; the musl `ort-server` build rebases onto that release, and `tflite-server` and `et-server` port it.
 4. Add `POST /systemone` to all three engines, for models carrying the `systemone` label.
 5. Build each engine with its framework's full default operator set. The curated operator sets on the Netstatz fork refuse zero-shot models such as GLiClass.
+
+## Build Provenance
+
+This section states who builds each artifact today, so reviewers can see where the build pipeline and its upkeep already live.
+
+| Artifact | Built and released by | Source | Latest release |
+| --- | --- | --- | --- |
+| `tflite-server` | Netstatz | `github.com/ianbmacdonald/tflite-server` | v0.3.0, musl, x86_64 and aarch64 |
+| `et-server` | Netstatz | `github.com/ianbmacdonald/et-server` | v0.2.0, musl, x86_64 and aarch64 |
+| `ort-server` musl build | Netstatz | `github.com/ianbmacdonald/ort-server`, a fork of `lemonade-sdk/ort-server` | v0.2.1-musl, x86_64 and aarch64 |
+| `lemond` musl build | Netstatz | `github.com/ianbmacdonald/lemonade`, branch `release/prpl-demo` | `prpl-demo-musl-2026.43.0-571d17e15`, aarch64 |
+
+The musl builds use the prpl Foundation's OpenWrt SDK cross-compile recipe. The prpl Foundation's demo work packages these releases as prplOS packages and runs them on a gateway; it does not build them.
 
 ## Decision and Zero-Shot Models
 
