@@ -63,7 +63,7 @@ Each backend's `ContainerPolicy` is:
 | `devices` | `{}` |
 | `cap_add` | `{}` |
 
-Each image is built from the engine's own repository by that repository's CI, for `linux/amd64` and `linux/arm64`, and pinned in `backend_versions.json` as `<tag>@<digest>`.
+Each image is `FROM scratch` with the engine's musl build and its shared libraries, built from the engine's own repository by that repository's CI, for `linux/amd64` and `linux/arm64`, and pinned in `backend_versions.json` as `<tag>@<digest>`.
 
 ## Changes to the Container Backends Spec
 
@@ -121,7 +121,7 @@ prplOS installs and runs containers through LCM. An install request (`SoftwareMo
 
 A prpl LCM container tool in `ContainerManager` is a follow-up RFC, written once Netstatz has run it on its fork. The beta's images are the same images prplOS would install, so the engine work is shared.
 
-The container format also separates the engines from the gateway's libc: an image carries its own userspace, so the engines need no musl builds. `lemond` itself stays native on prplOS; its aarch64 musl build is released on the Netstatz fork. Not yet verified: a glibc-based engine image running under LCM on an aarch64 prplOS gateway.
+Each image is `FROM scratch` with the engine's musl build, so one build per architecture serves three paths: the native package prplOS installs today, a container under Podman or Docker on any Linux host, and a container under LCM. `lemond` itself stays native on prplOS; its aarch64 musl build is released on the Netstatz fork. Not yet verified: a `scratch` musl engine image running under LCM on an aarch64 prplOS gateway.
 
 ## Breaking Changes
 
