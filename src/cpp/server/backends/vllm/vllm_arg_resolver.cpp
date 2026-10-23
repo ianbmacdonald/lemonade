@@ -329,6 +329,33 @@ VLLMArgResolution resolve_vllm_args(const std::string& model_name,
     take_speculative_config(family, "family");
     take_speculative_config(model_entry, "model");
 
+    std::vector<std::pair<std::string, std::string>> env;
+    auto take_env = [&env](const nlohmann::json* src, const char* scope) {
+        if (!src || !src->contains("env")) {
+            return;
+        }
+        const nlohmann::json& e = (*src)["env"];
+        if (!e.is_object()) {
+            throw std::runtime_error(std::string("env in the ") + scope +
+                                     " entry must be a JSON object, got " + e.type_name());
+        }
+        for (auto it = e.begin(); it != e.end(); ++it) {
+            if (!it.value().is_string()) {
+                throw std::runtime_error(std::string("env.") + it.key() + " in the " + scope +
+                                         " entry must be a string, got " + it.value().type_name());
+            }
+            auto existing = std::find_if(env.begin(), env.end(),
+                                         [&it](const auto& kv) { return kv.first == it.key(); });
+            if (existing != env.end()) {
+                existing->second = it.value().get<std::string>();
+            } else {
+                env.emplace_back(it.key(), it.value().get<std::string>());
+            }
+        }
+    };
+    take_env(family, "family");
+    take_env(model_entry, "model");
+
     return {
         flatten_args(resolved),
         has_memory_budget_arg(resolved),
@@ -336,7 +363,8 @@ VLLMArgResolution resolve_vllm_args(const std::string& model_name,
         has_enforce_eager,
         quantization_arg != nullptr,
         quantization_value,
-        speculative_config
+        speculative_config,
+        env
     };
 }
 

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace lemon {
@@ -22,6 +23,9 @@ struct VLLMArgResolution {
     // Structured rather than a passthrough flag: the `vllm_args` tokenizer strips quotes
     // and would corrupt inline JSON. The backend re-serializes it.
     std::string speculative_config;
+    // Environment for vllm-server from the model config, family first, model keys win.
+    // Some kernel paths (AITER on CDNA) are switched by environment, not flags.
+    std::vector<std::pair<std::string, std::string>> env;
 };
 
 VLLMArgResolution resolve_vllm_args(const std::string& model_name,

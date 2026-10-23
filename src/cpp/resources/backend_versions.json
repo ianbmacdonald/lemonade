@@ -157,7 +157,7 @@
       "gfx942": "ianbmacdonald/vllm-rocm-cdna"
     },
     "rocm_arch_overrides": {
-      "gfx942": "vllm0.23.1.dev0+rocm7.15.0a20260721.g0fc695fc6.d20260723-rocm7.15.0",
+      "gfx942": "vllm0.30.1rc1.dev245+rocm7.15.0a20260728.gaf7f9488c-rocm7.15.0",
       "gfx950": "vllm0.23.1.dev0+rocm7.15.0a20260721.g0fc695fc6.d20260723-rocm7.15.0"
     }
   },

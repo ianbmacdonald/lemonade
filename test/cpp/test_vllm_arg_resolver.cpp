@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <exception>
 #include <string>
+#include <utility>
 #include <vector>
 
 using lemon::backends::VLLMArgResolution;
@@ -387,6 +388,46 @@ int main() {
     failures += !expect_utilization(
         "the same free share on a large pool is still worth requesting",
         gib_of(32.0), gib_of(256.0), 0.07);
+
+    {
+        json env_config = test_config();
+        env_config["families"]["qwen3"]["env"] = {{"A", "family"}, {"B", "family"}};
+        env_config["models"]["Qwen3.5-4B-vLLM"]["env"] = {{"B", "model"}, {"C", "model"}};
+        auto r = resolve_vllm_args("Qwen3.5-4B-vLLM", "Qwen/Qwen3.5-4B", env_config, "");
+        std::vector<std::pair<std::string, std::string>> want = {
+            {"A", "family"}, {"B", "model"}, {"C", "model"}};
+        bool ok = r.env == want;
+        std::printf("[%s] model env keys override family env keys\n", ok ? "PASS" : "FAIL");
+        failures += !ok;
+
+        auto none = resolve_vllm_args("NoFamily-vLLM", "Other/Model", test_config(), "");
+        ok = none.env.empty();
+        std::printf("[%s] no env in the config leaves env empty\n", ok ? "PASS" : "FAIL");
+        failures += !ok;
+    }
+
+    {
+        json bad = test_config();
+        bad["models"]["Qwen3.5-4B-vLLM"]["env"] = json::array({"VLLM_ROCM_USE_AITER=1"});
+        bool ok = false;
+        try {
+            (void)resolve_vllm_args("Qwen3.5-4B-vLLM", "Qwen/Qwen3.5-4B", bad, "");
+        } catch (const std::exception& e) {
+            ok = std::string(e.what()).find("must be a JSON object") != std::string::npos;
+        }
+        std::printf("[%s] env that is not an object is rejected\n", ok ? "PASS" : "FAIL");
+        failures += !ok;
+
+        bad["models"]["Qwen3.5-4B-vLLM"]["env"] = {{"VLLM_ROCM_USE_AITER", 1}};
+        ok = false;
+        try {
+            (void)resolve_vllm_args("Qwen3.5-4B-vLLM", "Qwen/Qwen3.5-4B", bad, "");
+        } catch (const std::exception& e) {
+            ok = std::string(e.what()).find("must be a string") != std::string::npos;
+        }
+        std::printf("[%s] a non-string env value is rejected\n", ok ? "PASS" : "FAIL");
+        failures += !ok;
+    }
 
     std::printf("\n%d failures\n", failures);
     return failures == 0 ? 0 : 1;

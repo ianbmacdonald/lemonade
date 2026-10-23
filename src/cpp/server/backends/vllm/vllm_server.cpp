@@ -526,6 +526,17 @@ void VLLMServer::load(const std::string& model_name,
     // Prevent system/user Python packages from leaking into the bundled vLLM environment
     env_vars.push_back({"PYTHONNOUSERSITE", "1"});
 
+    // A variable already set in lemond's own environment wins, so an operator can override
+    // a model's default without editing the config.
+    for (const auto& [key, value] : resolved_vllm_args.env) {
+        if (std::getenv(key.c_str()) != nullptr) {
+            LOG(INFO, "vLLM") << "Keeping " << key << " from lemond's environment over the model config" << std::endl;
+            continue;
+        }
+        LOG(DEBUG, "vLLM") << "Model config env: " << key << "=" << value << std::endl;
+        env_vars.push_back({key, value});
+    }
+
     bool inherit_output = (log_level_ == "info") || is_debug();
     set_process_handle(ProcessManager::start_process(executable, args, "", inherit_output, true, env_vars),
                        executable, args);
