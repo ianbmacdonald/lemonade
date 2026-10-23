@@ -53,9 +53,9 @@ Each backend is a new `support` row with its own descriptor labels. `tflite` and
 
 | Backend | Tier | Format | Image | Engine | Modes |
 | --- | --- | --- | --- | --- | --- |
-| `tflite:edge` | guest | container | `ghcr.io/ianbmacdonald/tflite-server` | LiteRT, CPU with XNNPACK | `classification`, `image-classification`, `systemone` |
-| `executorch:edge` | guest | container | `ghcr.io/ianbmacdonald/et-server` | ExecuTorch, CPU with XNNPACK | `classification`, `systemone` |
-| `onnxruntime:edge` | guest | container | `ghcr.io/ianbmacdonald/ort-server` | ONNX Runtime CPU | `classification`, `systemone`, for `model.onnx` and `model.ort` files |
+| `tflite:edge` | guest | container | `ghcr.io/ianbmacdonald/tflite-server` | LiteRT, CPU with XNNPACK | `classification`, `image-classification` |
+| `executorch:edge` | guest | container | `ghcr.io/ianbmacdonald/et-server` | ExecuTorch, CPU with XNNPACK | `classification` |
+| `onnxruntime:edge` | guest | container | `ghcr.io/ianbmacdonald/ort-server` (Netstatz's musl build of `lemonade-sdk/ort-server`) | ONNX Runtime CPU | `classification`, for `model.onnx` and `model.ort` files |
 
 Each backend's `ContainerPolicy` is:
 
@@ -74,7 +74,8 @@ This section lists the edits the [Container Backends Spec](./container-backends.
 | Spec section | Today | Proposed |
 | --- | --- | --- |
 | Scope, Platform | Linux-only, GPU-only, single GPU | Linux-only; GPU or CPU; single device |
-| `containers` Descriptor Field, `devices` | Required, at least one device node | Required; `{}` declares a CPU-only container, which gets no `--device` and no `--group-add` |
+| `containers` Descriptor Field, `devices` | Required | Required; `{}` declares a CPU-only container. New behaviour: such a container gets no `--device` and no `--group-add` |
+| Run Options, `-v` | Read-only model mounts only | Adds one writable mount for engine state, from a directory `lemond` owns, for engines that keep a cache beside the model (see [Engine Contract](#engine-contract)) |
 | `containers` Descriptor Field, `image` | Only `docker.io/kyuz0/*` and `ghcr.io/peonist-ai/*` | Adds `ghcr.io/ianbmacdonald/*` |
 | Run Options, `--env HIP_VISIBLE_DEVICES` | Set when `devices` includes `/dev/kfd` | Unchanged; never set for a CPU-only container |
 
@@ -91,14 +92,14 @@ This section defines what the three engine images share, so one `WrappedServer` 
 | Decision questions | `POST /systemone`, with the request and response of llama.cpp's `POST /v1/systemone`: a `state` and named `questions` of type `choice`, `score` or `noul`, answered with one entry per question in `answers` |
 | Image classification | `POST /classify/image`, multipart (`tflite-server` only) |
 | Model directory | Manifest, tokenizer files and one model file (`model.tflite`, `model.pte`, `model.onnx` or `model.ort`), mounted one file at a time by the Container Backends Spec's directory rule |
-| Writable state | `tflite-server`'s XNNPACK weight cache goes to `/tmp` inside the container, never beside the read-only model |
+| Writable state | `tflite-server`'s XNNPACK weight cache goes to the writable mount, never beside the read-only model. On a gateway the mount is on the data volume: `/tmp` is often RAM-backed, and the cache for one model measured 172 MB |
 
 These engine changes are required before the images ship, one release per engine:
 
 1. Add a `--host` flag. Today each engine binds `127.0.0.1`, which a container's published port cannot reach.
-2. In `tflite-server`, add a weight cache path flag. Today the cache is written beside the model.
-3. Accept `labels` on `POST /classify`. `onnxruntime:edge` takes this from `ort-server` once #3952 lands; `tflite-server` and `et-server` port it.
-4. Add `POST /systemone` to all three engines.
+2. Have `lemond` pass `tflite-server`'s existing `--weight-cache` flag a path on the writable mount. Today `lemond` passes `<model_path>/model.tflite.xnnpack_cache`, beside the model.
+3. Accept `labels` on `POST /classify`. `ort-server` gains this in lemonade-sdk/ort-server#4, which #3952 waits on; the musl `ort-server` build rebases onto that release, and `tflite-server` and `et-server` port it.
+4. Add `POST /systemone` to all three engines, for models carrying the `systemone` label.
 5. Build each engine with its framework's full default operator set. The curated operator sets on the Netstatz fork refuse zero-shot models such as GLiClass.
 
 ## Decision and Zero-Shot Models
@@ -119,8 +120,8 @@ The `lemond` routes come from two open PRs, and each needs one widening:
 
 | PR | Adds | Widening this spec needs |
 | --- | --- | --- |
-| #3952 | `labels` on `POST /v1/classify`, and a `zero_shot` router classifier | None for `onnxruntime:edge`. `tflite:edge` and `executorch:edge` accept `labels` once their engines do |
-| #3956 | `POST /v1/systemone`, answered by a `llamacpp` model labelled `systemone` | Also route `/v1/systemone` to any backend whose descriptor lists the `systemone` mode |
+| #3952 | `labels` on `POST /v1/classify`, and a `zero_shot` router classifier. Waits on an `ort-server` release with lemonade-sdk/ort-server#4 | None. Each `:edge` backend accepts `labels` once its engine does |
+| #3956 (depends on #3952) | `POST /v1/systemone`, answered by a `llamacpp` GGUF model in the `classification` mode carrying the `systemone` label | Accept a `systemone`-labelled classification model on the `:edge` backends too: skip the GGUF check for them, and forward `/v1/systemone` to their engine |
 
 ## NPU Devices
 
@@ -163,6 +164,8 @@ prplOS installs and runs containers through LCM. An install request (`SoftwareMo
 | Private network per container | An LCM bridge |
 | Models mounted read-only | Not yet mapped |
 
+One known LCM limit: `InstallDU` takes no CA file, and Rlyeh's libcurl has no default CA store, so a fresh install cannot pull an image over TLS (fault 7002). Netstatz's deployment pre-pulled the image with a CA file.
+
 A prpl LCM container tool in `ContainerManager` is a follow-up RFC, written once Netstatz has run it on its fork. The beta's images are the same images prplOS would install, so the engine work is shared.
 
 Each image is `FROM scratch` with the engine's musl build, so one build per architecture serves three paths: the native package prplOS installs today, a container under Podman or Docker on any Linux host, and a container under LCM. `lemond` itself stays native on prplOS; its aarch64 musl build is released on the Netstatz fork. Not yet verified: a `scratch` musl engine image running under LCM on an aarch64 prplOS gateway.
@@ -179,11 +182,11 @@ This section maps the backends onto the backend policy proposed in [#3925](https
 | --- | --- |
 | Tier | `guest`: maintained by Netstatz, without a support guarantee from Lemonade's maintainers |
 | Sandbox | The `container` format meets the guest tier's sandbox requirement |
-| Test plan | A smoketest per backend on GitHub-hosted runners: install, load, classify, unload. CPU only, so no self-hosted or DevLab Dispatch hardware is needed |
+| Test plan | A smoketest per backend on GitHub-hosted runners covering every feature it serves: install, load, text classification, zero-shot `labels`, `/v1/systemone`, image classification (`tflite:edge`), unload. The backends need no GPU or NPU, so they need no self-hosted or DevLab Dispatch hardware |
 | Engine updates | Each engine's CI publishes a multi-arch image per release; a PR updates the pin in `backend_versions.json` |
 | New models | Registry entries only; the engines need no per-model code |
 | Promote to `experimental` | A Lemonade maintainer agrees to own the backend, for example after prplOS adopts it, or Android or ChromeOS targets ask for the same engines |
-| Remove | No adopter by a date the maintainers set when merging |
+| Remove | Proposed here, not in the backend policy: removed if no adopter appears by a date the maintainers set when merging |
 
 ## Risks
 
@@ -200,4 +203,5 @@ These are the decisions that belong to the maintainers.
 
 1. **Image home.** Should the three images publish under `lemonade-sdk` beside `ort-server`, or under `ghcr.io/ianbmacdonald` as guest images?
 2. **Native fallback.** The engines also build as native binaries. Should a `native` format row for each backend sit beside the container row, for hosts without Podman or Docker?
-3. **Beta gate.** Should the backends wait for the full container backend stack to merge, or land behind `enable_containers` as soon as #3709 merges?
+3. **Recipe ownership.** `onnxruntime`'s `cpu` backend is maintainer-owned (`experimental`). Should a `guest` `onnxruntime:edge` row sit in the same recipe, or should it be a separate recipe so each recipe has one owner?
+4. **Beta gate.** Should the backends wait for the full container backend stack to merge, or land behind `enable_containers` as soon as #3709 merges?
