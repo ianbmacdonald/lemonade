@@ -1,0 +1,104 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+	legacy_home="/opt/var/lib/lemonade"
+	new_home="/var/lib/lemonade"
+
+	# Create the lemonade user and group if they don't exist
+	if ! getent group lemonade > /dev/null; then
+		groupadd lemonade
+	fi
+
+	if ! getent passwd lemonade > /dev/null; then
+		useradd -m -r -g lemonade -d "$new_home" -s /usr/sbin/nologin lemonade
+	fi
+
+	# Move all data from the legacy home
+	if [ -d "$legacy_home" ]; then
+		usermod -d "$new_home" -m lemonade >/dev/null
+	fi
+
+	# Add lemonade user to systemd-journal group for journal access.
+	if getent group systemd-journal > /dev/null; then
+		usermod -a -G systemd-journal lemonade
+	fi
+
+	# Add lemonade user to render group for GPU access
+	if getent group render > /dev/null; then
+		usermod -a -G render lemonade
+	fi
+
+	# Create /var/lib/lemonade (writable state + config for lemonade user).
+	# Ensure ownership even if usermod -m didn't move existing data.
+	if [ ! -d /var/lib/lemonade ]; then
+		mkdir -p /var/lib/lemonade
+	fi
+	# Own the state + config tree, but skip the HuggingFace model cache: it can
+	# be tens of GB and is already owned by the service that downloaded it, so
+	# recursing into it would make every upgrade's chown walk the whole cache.
+	find /var/lib/lemonade -path /var/lib/lemonade/.cache/huggingface -prune -o \
+		-exec chown lemonade:lemonade {} + 2>/dev/null || true
+	chmod 0750 /var/lib/lemonade
+
+	# Create the FHS cache directory for the service (owned by the service user).
+	# Systemd CacheDirectory= handles this at runtime on fresh boots, but we
+	# create it here to set correct ownership immediately after install.
+	if [ ! -d /var/cache/lemonade ]; then
+		mkdir -p /var/cache/lemonade
+	fi
+	chown lemonade:lemonade /var/cache/lemonade
+	chmod 0755 /var/cache/lemonade
+
+	# Migrate split environment files from /etc/lemonade/conf.d/*.conf to /etc/default/lemond
+	if [ -d /etc/lemonade/conf.d ]; then
+		if [ -f /etc/default/lemond ]; then
+			# Append old conf.d files to existing /etc/default/lemond
+			for conf in /etc/lemonade/conf.d/*.conf; do
+				[ -f "$conf" ] || continue
+				echo "" >> /etc/default/lemond
+				echo "# Migrated from $conf" >> /etc/default/lemond
+				cat "$conf" >> /etc/default/lemond
+			done
+		else
+			# Create /etc/default/lemond by merging all conf.d files
+			for conf in /etc/lemonade/conf.d/*.conf; do
+				[ -f "$conf" ] || continue
+				cat "$conf" >> /etc/default/lemond
+				echo "" >> /etc/default/lemond
+			done
+			chmod 0640 /etc/default/lemond
+			chown root:root /etc/default/lemond
+		fi
+		echo "Migrated environment files from /etc/lemonade/conf.d/ to /etc/default/lemond"
+	fi
+fi
+
+# #2125: migrate pre-fix upgrades — disable per-user lemond.service and stop
+# any still-running instance that conflicts with the system service.
+if [ "$1" = "configure" ] && [ -n "$2" ] && dpkg --compare-versions "$2" lt "10.10.0~"; then
+	if command -v deb-systemd-helper > /dev/null 2>&1; then
+		deb-systemd-helper --user disable lemond.service > /dev/null 2>&1 || true
+	fi
+	if [ -d /run/systemd/system ] && command -v deb-systemd-invoke > /dev/null 2>&1; then
+		deb-systemd-invoke --user stop lemond.service > /dev/null 2>&1 || true
+	fi
+fi
+
+
+# cpack has no debhelper, so enable and start the system service here.
+if [ "$1" = "configure" ]; then
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload > /dev/null 2>&1 || true
+	fi
+	if command -v deb-systemd-helper > /dev/null 2>&1; then
+		deb-systemd-helper enable lemond.service > /dev/null 2>&1 || true
+	fi
+	if [ -d /run/systemd/system ]; then
+		if command -v deb-systemd-invoke > /dev/null 2>&1; then
+			deb-systemd-invoke restart lemond.service > /dev/null 2>&1 || true
+		else
+			systemctl restart lemond.service > /dev/null 2>&1 || true
+		fi
+	fi
+fi
