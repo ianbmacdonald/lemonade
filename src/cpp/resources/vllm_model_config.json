@@ -60,7 +60,7 @@
     },
     "Qwen3.8-Flash-Next-FP8-vLLM": {
       "family": "qwen3.",
-      "args": "--max-num-seqs 8 --enable-prefix-caching --max-model-len 262144",
+      "args": "--max-num-seqs 8",
       "speculative_config": { "method": "mtp", "num_speculative_tokens": 3 },
       "env": { "VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_MOE": "0" }
     },

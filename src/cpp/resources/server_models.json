@@ -2570,7 +2570,10 @@
             "vision",
             "mtp"
         ],
-        "size": 185.5
+        "size": 185.5,
+        "recipe_options": {
+            "ctx_size": 262144
+        }
     },
     "GLM-4.7-Flash-FP16-vLLM": {
         "checkpoint": "zai-org/GLM-4.7-Flash",

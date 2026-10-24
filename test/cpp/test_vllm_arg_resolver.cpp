@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -428,6 +429,26 @@ int main() {
         std::printf("[%s] a non-string env value is rejected\n", ok ? "PASS" : "FAIL");
         failures += !ok;
     }
+
+#ifdef LEMONADE_VLLM_MODEL_CONFIG_PATH
+    {
+        // A single invalid entry makes lemond ignore the whole shipped file, so every
+        // model is resolved here exactly as load() would.
+        std::ifstream in(LEMONADE_VLLM_MODEL_CONFIG_PATH);
+        json shipped = json::parse(in);
+        int bad = 0;
+        for (auto it = shipped["models"].begin(); it != shipped["models"].end(); ++it) {
+            try {
+                (void)resolve_vllm_args(it.key(), "", shipped, "");
+            } catch (const std::exception& e) {
+                std::printf("[FAIL] shipped vllm_model_config.json model '%s': %s\n", it.key().c_str(), e.what());
+                ++bad;
+            }
+        }
+        std::printf("[%s] every model in the shipped vllm_model_config.json resolves\n", bad == 0 ? "PASS" : "FAIL");
+        failures += bad != 0;
+    }
+#endif
 
     std::printf("\n%d failures\n", failures);
     return failures == 0 ? 0 : 1;

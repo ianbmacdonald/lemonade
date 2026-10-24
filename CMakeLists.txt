@@ -1225,6 +1225,8 @@ if(BUILD_TESTING AND EXISTS "${VLLM_ARG_RESOLVER_TEST_SOURCE}")
         src/cpp/server/backends/vllm/vllm_arg_resolver.cpp
     )
     target_link_libraries(test_vllm_arg_resolver PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_definitions(test_vllm_arg_resolver PRIVATE
+        LEMONADE_VLLM_MODEL_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/resources/vllm_model_config.json")
     add_cpp_ci_test(vllm_arg_resolver CI ON COMMAND test_vllm_arg_resolver)
 endif()
 
