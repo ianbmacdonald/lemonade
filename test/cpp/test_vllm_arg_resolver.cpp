@@ -435,17 +435,33 @@ int main() {
         // A single invalid entry makes lemond ignore the whole shipped file, so every
         // model is resolved here exactly as load() would.
         std::ifstream in(LEMONADE_VLLM_MODEL_CONFIG_PATH);
-        json shipped = json::parse(in);
+        json shipped = json::parse(in, nullptr, false);
         int bad = 0;
-        for (auto it = shipped["models"].begin(); it != shipped["models"].end(); ++it) {
+        if (!in.is_open() || shipped.is_discarded()) {
+            std::printf("[FAIL] cannot read %s as JSON\n", LEMONADE_VLLM_MODEL_CONFIG_PATH);
+            ++bad;
+            shipped = json::object();
+        }
+        auto check = [&bad](const std::string& what, const std::string& model, const json& config) {
             try {
-                (void)resolve_vllm_args(it.key(), "", shipped, "");
+                (void)resolve_vllm_args(model, "", config, "");
             } catch (const std::exception& e) {
-                std::printf("[FAIL] shipped vllm_model_config.json model '%s': %s\n", it.key().c_str(), e.what());
+                std::printf("[FAIL] shipped vllm_model_config.json %s: %s\n", what.c_str(), e.what());
                 ++bad;
             }
+        };
+        const json models = shipped.value("models", json::object());
+        const json families = shipped.value("families", json::object());
+        for (auto it = models.begin(); it != models.end(); ++it) {
+            check("model '" + it.key() + "'", it.key(), shipped);
         }
-        std::printf("[%s] every model in the shipped vllm_model_config.json resolves\n", bad == 0 ? "PASS" : "FAIL");
+        // A family no model names would otherwise never be parsed here.
+        for (auto it = families.begin(); it != families.end(); ++it) {
+            json probe = shipped;
+            probe["models"]["__family_probe__"] = {{"family", it.key()}};
+            check("family '" + it.key() + "'", "__family_probe__", probe);
+        }
+        std::printf("[%s] every model and family in the shipped vllm_model_config.json resolves\n", bad == 0 ? "PASS" : "FAIL");
         failures += bad != 0;
     }
 #endif

@@ -1,11 +1,17 @@
 #!/bin/sh
 set -e
 
+# cpack has no debhelper: clean up the unit state postinst's deb-systemd-helper enable created.
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+	systemctl daemon-reload > /dev/null 2>&1 || true
+fi
+if [ "$1" = "purge" ] && command -v deb-systemd-helper > /dev/null 2>&1; then
+	deb-systemd-helper purge lemond.service > /dev/null 2>&1 || true
+fi
+
 if [ purge = "$1" ]; then
 	# Handle the rare case "userdel" not being available, see bug #1071142.
 	if command -v userdel > /dev/null 2>&1; then
 		userdel lemonade
 	fi
 fi
-
-

@@ -527,8 +527,15 @@ void VLLMServer::load(const std::string& model_name,
     env_vars.push_back({"PYTHONNOUSERSITE", "1"});
 
     // A variable already set in lemond's own environment wins, so an operator can override
-    // a model's default without editing the config.
+    // a model's default without editing the config. Variables lemond sets above win too: a
+    // duplicate key would leave the child's value to whichever entry its getenv finds first.
     for (const auto& [key, value] : resolved_vllm_args.env) {
+        const bool managed = std::any_of(env_vars.begin(), env_vars.end(),
+                                         [&key](const auto& kv) { return kv.first == key; });
+        if (managed) {
+            LOG(WARNING, "vLLM") << "Ignoring model config env " << key << ": Lemonade sets it" << std::endl;
+            continue;
+        }
         if (std::getenv(key.c_str()) != nullptr) {
             LOG(INFO, "vLLM") << "Keeping " << key << " from lemond's environment over the model config" << std::endl;
             continue;
