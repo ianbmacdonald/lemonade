@@ -28,7 +28,7 @@ inline const BackendDescriptor descriptor = {
          "Custom arguments to pass to tflite-server", "TFLite Options"},
     },
     /*support*/ {
-        {"system", {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
+        {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
     },
     /*supported_modes*/ {"classification", "image-classification"},
     /*required_checkpoints*/ {"main"},

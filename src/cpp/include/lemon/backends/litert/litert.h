@@ -27,7 +27,7 @@ inline const BackendDescriptor descriptor = {
          "Custom arguments to pass to litert-lm-server", "LiteRT Options"},
     },
     /*support*/ {
-        {"system", {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
+        {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
     },
     /*supported_modes*/ {"chat"},
     /*required_checkpoints*/ {"main"},

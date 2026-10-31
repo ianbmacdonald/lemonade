@@ -47,12 +47,8 @@ template struct lemon::detail::PrivateMemberInit<lemon::detail::OptionsHandlersT
 
 namespace lemon {
 
-namespace {
-
-// Clients find lemond by listening on this port, so it is not configurable.
-constexpr int kBeaconPort = 13305;
-
-} // namespace
+// Clients find lemond by listening on kBeaconPort (beacon_listener.h), so it is
+// not configurable.
 
 HttpListener::HttpListener(RuntimeConfig* config, Router* router, SetupFn setup,
                            std::function<void()> stop_server, bool api_key_set,
