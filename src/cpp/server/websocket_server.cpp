@@ -1,3 +1,4 @@
+#include "lemon/connection_guard.h"
 #include "lemon/router.h"
 #include "lemon/runtime_config.h"
 #include "lemon/utils/json_utils.h"
@@ -94,12 +95,20 @@ int WebSocketServer::ws_callback(struct lws* wsi,
             if (!server->authenticate_connection(wsi, authenticated_token, authenticated)) {
                 return 1;
             }
-            if (pss) {
-                pss->authenticated = authenticated;
-            }
+            char peer[sizeof(PerSessionData::peer)] = {0};
+            lws_get_peer_simple(wsi, peer, sizeof(peer));
+            const std::string client = ConnectionGuard::normalize_address(peer);
             {
                 std::lock_guard<std::mutex> lock(server->connections_mutex_);
+                if (!server->admits_locked(client)) {
+                    server->note_refusal_locked(client);
+                    return 1;
+                }
                 server->pending_authenticated_tokens_[wsi] = authenticated_token;
+            }
+            if (pss) {
+                pss->authenticated = authenticated;
+                std::snprintf(pss->peer, sizeof(pss->peer), "%s", client.c_str());
             }
             break;
         }
@@ -128,6 +137,7 @@ int WebSocketServer::ws_callback(struct lws* wsi,
             }
 
             std::string token;
+            int auth_timeout_seconds = 0;
             {
                 std::lock_guard<std::mutex> lock(server->connections_mutex_);
                 auto it = server->pending_authenticated_tokens_.find(wsi);
@@ -135,6 +145,13 @@ int WebSocketServer::ws_callback(struct lws* wsi,
                     token = std::move(it->second);
                     server->pending_authenticated_tokens_.erase(it);
                 }
+                ++server->open_connections_;
+                ++server->per_client_[pss->peer];
+                pss->counted = true;
+                auth_timeout_seconds = server->limits_.auth_timeout_seconds;
+            }
+            if (!pss->authenticated && auth_timeout_seconds > 0) {
+                lws_set_timeout(wsi, PENDING_TIMEOUT_USER_OK, auth_timeout_seconds);
             }
 
             server->handle_connection(pss->connection_id, wsi, token, pss->authenticated);
@@ -145,6 +162,14 @@ int WebSocketServer::ws_callback(struct lws* wsi,
             {
                 std::lock_guard<std::mutex> lock(server->connections_mutex_);
                 server->pending_authenticated_tokens_.erase(wsi);
+                if (pss->counted) {
+                    pss->counted = false;
+                    --server->open_connections_;
+                    auto it = server->per_client_.find(pss->peer);
+                    if (it != server->per_client_.end() && --it->second == 0) {
+                        server->per_client_.erase(it);
+                    }
+                }
             }
             server->handle_close(pss->connection_id);
             break;
@@ -171,7 +196,14 @@ int WebSocketServer::ws_callback(struct lws* wsi,
                 if (state_it == server->connection_states_.end()) {
                     break;
                 }
-                server->receive_buffers_[conn_id].append(static_cast<const char*>(in), len);
+                auto& buffer = server->receive_buffers_[conn_id];
+                if (buffer.size() + len > kMaxMessageBytes) {
+                    LOG(WARNING, "WebSocket") << "Closing connection " << conn_id
+                                              << ": message exceeds " << kMaxMessageBytes
+                                              << " bytes" << std::endl;
+                    return -1;
+                }
+                buffer.append(static_cast<const char*>(in), len);
             }
 
             if (lws_remaining_packet_payload(wsi) == 0 && lws_is_final_fragment(wsi)) {
@@ -286,6 +318,8 @@ void WebSocketServer::stop() {
         message_queues_.clear();
         receive_buffers_.clear();
         pending_authenticated_tokens_.clear();
+        per_client_.clear();
+        open_connections_ = 0;
     }
     for (const auto& [_, state] : states) {
         if (!state.realtime_session_id.empty()) {
@@ -322,8 +356,16 @@ bool WebSocketServer::adopt_socket(intptr_t fd) {
             return false;
         }
     }
+    size_t max_pending = 0;
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        max_pending = limits_.max_pending_adoptions;
+    }
     {
         std::lock_guard<std::mutex> lock(adoption_mutex_);
+        if (max_pending > 0 && pending_adoptions_.size() >= max_pending) {
+            return false;
+        }
         pending_adoptions_.push(fd);
     }
     // Wake the service thread; adoption happens there (lws is not thread-safe)
@@ -334,6 +376,37 @@ bool WebSocketServer::adopt_socket(intptr_t fd) {
         }
     }
     return true;
+}
+
+void WebSocketServer::set_limits(const Limits& limits) {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    limits_ = limits;
+}
+
+bool WebSocketServer::admits_locked(const std::string& client) const {
+    if (limits_.max_connections > 0 && open_connections_ >= limits_.max_connections) {
+        return false;
+    }
+    if (limits_.max_connections_per_client > 0 && !ConnectionGuard::is_loopback(client)) {
+        auto it = per_client_.find(client);
+        if (it != per_client_.end() && it->second >= limits_.max_connections_per_client) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void WebSocketServer::note_refusal_locked(const std::string& client) {
+    // A client at its cap is usually retrying in a loop; log the first
+    // refusal and then every 100th rather than every one.
+    const uint64_t n = ++refused_;
+    if (n == 1 || n % 100 == 0) {
+        LOG(WARNING, "WebSocket") << "Refused connection from " << client << ": "
+                                  << open_connections_ << " open, limits "
+                                  << limits_.max_connections << " total and "
+                                  << limits_.max_connections_per_client << " per client ("
+                                  << n << " refused so far)" << std::endl;
+    }
 }
 
 void WebSocketServer::drain_pending_adoptions() {
@@ -554,6 +627,7 @@ void WebSocketServer::handle_message(const std::string& connection_id, const std
             }
 
             if (is_valid) {
+                struct lws* wsi = nullptr;
                 {
                     std::lock_guard<std::mutex> lock(connections_mutex_);
                     auto state_it = connection_states_.find(connection_id);
@@ -565,6 +639,14 @@ void WebSocketServer::handle_message(const std::string& connection_id, const std
                             state_it->second.client_session_id = request.value("client_session_id", "");
                         }
                     }
+                    auto ws_it = connection_websockets_.find(connection_id);
+                    if (ws_it != connection_websockets_.end()) {
+                        wsi = ws_it->second;
+                    }
+                }
+                // handle_message runs on the service thread, from LWS_CALLBACK_RECEIVE.
+                if (wsi) {
+                    lws_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
                 }
                 send_json(connection_id, {{"type", "auth.ok"}});
                 update_telemetry_listener_registration();

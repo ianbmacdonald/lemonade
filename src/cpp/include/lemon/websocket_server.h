@@ -1,7 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -29,7 +32,9 @@ class Router;
  */
 struct PerSessionData {
     char connection_id[32];
+    char peer[64];
     bool authenticated;
+    bool counted;
 };
 
 /**
@@ -38,6 +43,15 @@ struct PerSessionData {
  */
 class WebSocketServer {
 public:
+    struct Limits {
+        size_t max_connections_per_client = 0;  // 0 = no cap; loopback is exempt
+        size_t max_connections = 64;
+        size_t max_pending_adoptions = 64;
+        int auth_timeout_seconds = 10;  // for a /spans connection opened without a credential
+    };
+
+    static constexpr size_t kMaxMessageBytes = 4 * 1024 * 1024;
+
     WebSocketServer(Router* router, const std::string& host, int requested_port);
     ~WebSocketServer();
 
@@ -75,6 +89,8 @@ public:
      * Thread-safe; ownership of the socket transfers on success.
      */
     bool adopt_socket(intptr_t fd);
+
+    void set_limits(const Limits& limits);
 
     // libwebsockets callback (public — referenced by file-scope protocols array)
     static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
@@ -140,6 +156,11 @@ private:
     std::mutex connections_mutex_;
     bool telemetry_listener_registered_{false};
 
+    Limits limits_;
+    std::map<std::string, size_t> per_client_;
+    size_t open_connections_ = 0;
+    uint64_t refused_ = 0;
+
     // Handle new WebSocket connection
     void handle_connection(const std::string& connection_id, struct lws* wsi, const std::string& initial_token = "", bool initial_authenticated = false);
 
@@ -171,6 +192,8 @@ private:
     void schedule_pending_writes();
     void update_telemetry_listener_registration();
     void drain_pending_adoptions();
+    bool admits_locked(const std::string& client) const;
+    void note_refusal_locked(const std::string& client);
 
     // Service loop run in background thread
     void service_loop();

@@ -47,6 +47,16 @@ template struct lemon::detail::PrivateMemberInit<lemon::detail::OptionsHandlersT
 
 namespace lemon {
 
+namespace {
+
+WebSocketServer::Limits websocket_limits(const RuntimeConfig& config) {
+    WebSocketServer::Limits limits;
+    limits.max_connections_per_client = static_cast<size_t>(config.max_connections_per_client());
+    return limits;
+}
+
+} // namespace
+
 // Clients find lemond by listening on kBeaconPort (beacon_listener.h), so it is
 // not configurable.
 
@@ -74,6 +84,7 @@ HttpListener::HttpListener(RuntimeConfig* config, Router* router, SetupFn setup,
     create_servers();
     websocket_server_ = std::make_unique<WebSocketServer>(
         router_, config_->host(), config_->websocket_port());
+    websocket_server_->set_limits(websocket_limits(*config_));
 }
 
 HttpListener::~HttpListener() {
@@ -499,6 +510,7 @@ void HttpListener::restart_websocket() {
     websocket_server_->stop();
     websocket_server_ = std::make_unique<WebSocketServer>(
         router_, config_->host(), config_->websocket_port());
+    websocket_server_->set_limits(websocket_limits(*config_));
     if (running_) {
         websocket_server_->start();
     }
@@ -556,6 +568,9 @@ void HttpListener::rebind() {
 
 void HttpListener::rebuild() {
     std::lock_guard<std::mutex> lock(rebind_mutex_);
+    if (websocket_server_) {
+        websocket_server_->set_limits(websocket_limits(*config_));
+    }
     if (running_) {
         rebind_requested_ = true;
         udp_beacon_.stopBroadcasting();

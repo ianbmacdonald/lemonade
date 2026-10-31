@@ -3825,6 +3825,13 @@ if(BUILD_TESTING AND EXISTS "${_CONNECTION_GUARD_TEST_SRC}")
     )
 endif()
 
+set(_WEBSOCKET_LIMITS_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_websocket_limits.cpp")
+if(BUILD_TESTING AND EXISTS "${_WEBSOCKET_LIMITS_TEST_SRC}")
+    add_executable(test_websocket_limits test/cpp/test_websocket_limits.cpp)
+    target_link_libraries(test_websocket_limits PRIVATE lemonade-server-core)
+    add_cpp_ci_test(WebSocketLimitsTest CI ON COMMAND test_websocket_limits)
+endif()
+
 set(_CONFIG_ALLOWED_ORIGINS_TEST_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_config_allowed_origins.cpp"
 )
