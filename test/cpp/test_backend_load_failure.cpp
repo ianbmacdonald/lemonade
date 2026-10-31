@@ -71,6 +71,9 @@ static void test_nuclear_retry_classification() {
     check("a missing file still skips it",
           Router::load_error_skips_nuclear_retry(
               std::runtime_error("Model directory not found for checkpoint: x")));
+    check("refused request arguments skip it",
+          Router::load_error_skips_nuclear_retry(std::invalid_argument(
+              "Invalid custom tflite-server arguments:\nArgument '--host' is managed by Lemonade")));
     check("a generic failure keeps it",
           !Router::load_error_skips_nuclear_retry(
               std::runtime_error("llama-server failed to allocate VRAM")));

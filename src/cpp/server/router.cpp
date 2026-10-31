@@ -23,6 +23,7 @@
 #include <lemon/model_manager.h>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 #include "lemon/utils/aixlog.hpp"
 #include "lemon/global_vram_monitor.h"
@@ -125,6 +126,11 @@ Router::Router(RuntimeConfig* config, ModelManager* model_manager, BackendManage
 
 bool Router::load_error_skips_nuclear_retry(const std::exception& error) {
     if (dynamic_cast<const NonRetryableLoadException*>(&error) != nullptr) {
+        return true;
+    }
+    // Refused request arguments (a reserved *_args flag) are refused again
+    // after an eviction; retrying would only unload every other model.
+    if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
         return true;
     }
     // A missing file stays missing after an eviction, so it is the one
