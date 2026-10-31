@@ -304,10 +304,13 @@ private:
             const json& prompt = req.arg(kPrompt);
             // Token ids and token-id arrays are valid completions prompts that dispatch
             // routes as empty text, so only other element types are rejected.
+            const auto is_integer = [](const json& token) { return token.is_number_integer(); };
             const bool valid = prompt.is_string() ||
-                std::all_of(prompt.begin(), prompt.end(), [](const json& part) {
-                    return part.is_string() || part.is_number_integer() || part.is_array();
-                });
+                (prompt.is_array() &&
+                 std::all_of(prompt.begin(), prompt.end(), [&](const json& part) {
+                     return part.is_string() || part.is_number_integer() ||
+                            (part.is_array() && std::all_of(part.begin(), part.end(), is_integer));
+                 }));
             if (!valid) {
                 write_plain_error(res, kRegisteredInvalid,
                                   "'prompt' must be a string or an array of strings or token ids");

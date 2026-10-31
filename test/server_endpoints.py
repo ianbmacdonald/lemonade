@@ -6002,6 +6002,10 @@ class EndpointTests(ServerTestBase):
             for bad_field in (
                 {"prompt": [{"text": "hi"}]},
                 {"prompt": [None]},
+                {"prompt": {"text": "hi"}},
+                {"prompt": [[None]]},
+                {"prompt": [["hi"]]},
+                {"prompt": [[1, [2]]]},
                 {"input": 42},
             ):
                 malformed = requests.post(
@@ -6014,6 +6018,7 @@ class EndpointTests(ServerTestBase):
 
             for accepted in (
                 {"prompt": [1, 2, 3]},
+                {"prompt": [[1, 2], [3]]},
                 {"prompt": ["def f", "code"]},
                 {"input": [{"role": "user", "content": "code"}]},
             ):
