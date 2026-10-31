@@ -55,6 +55,8 @@ from utils.test_models import PORT, TIMEOUT_DEFAULT
 TIMEOUT_CLASSIFY = 300
 
 MODEL = "user.MobileNetV2-1.0-224-TFLite"
+TEXT_MODEL = "user.B194-Text-TFLite"
+POISON_TEXT = "B194-POISON-TEXT"
 FIXTURE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "test_image_grace_hopper.jpg"
 )
@@ -149,6 +151,26 @@ def _write_stub_model_dir(path):
     return os.path.abspath(path)
 
 
+def _write_stub_text_model_dir(path):
+    """A text model dir for the fake backend, which never reads the model."""
+    os.makedirs(path, exist_ok=True)
+    for name, content in (
+        ("model.tflite", "stub"),
+        ("tokenizer.json", "{}"),
+        ("config.json", "{}"),
+    ):
+        with open(os.path.join(path, name), "w", encoding="utf-8") as f:
+            f.write(content)
+    return os.path.abspath(path)
+
+
+def _line_count(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, encoding="utf-8") as f:
+        return len(f.read().splitlines())
+
+
 def _vm_rss_kb(pid):
     with open(f"/proc/{pid}/status", encoding="utf-8") as f:
         for line in f:
@@ -161,6 +183,7 @@ class ImageClassifyTests(ServerTestBase):
     """Tests for the /images/classify endpoint."""
 
     _registered = False
+    _text_registered = False
 
     def _url(self, prefix="/api/v1"):
         return f"http://localhost:{PORT}{prefix}/images/classify"
@@ -499,6 +522,38 @@ class ImageClassifyTests(ServerTestBase):
         finally:
             load_model(MODEL, tflite_args="")
 
+    def test_507c_weight_cache_symlink_not_used(self):
+        # The engine would write its weight cache through the link, which in an
+        # HF snapshot points into the shared blob store.
+        if not _opts.fake_backend or not _opts.fake_state_dir:
+            self.skipTest("needs --fake-backend and --fake-state-dir")
+        self._require_model()
+        args_log = os.path.join(_opts.fake_state_dir, "args.log")
+        cache = os.path.join(
+            _opts.hf_cache,
+            "models--" + MODEL[len("user.") :],
+            "model.tflite.xnnpack_cache",
+        )
+        outside = os.path.join(_opts.fake_state_dir, "outside-cache")
+
+        def last_args():
+            with open(args_log, encoding="utf-8") as f:
+                return json.loads(f.read().splitlines()[-1])
+
+        try:
+            if os.path.lexists(cache):
+                os.remove(cache)
+            os.symlink(outside, cache)
+            unload_model(MODEL)
+            self.assertEqual(load_model(MODEL).status_code, 200)
+            self.assertNotIn("--weight-cache", last_args())
+        finally:
+            if os.path.lexists(cache):
+                os.remove(cache)
+        unload_model(MODEL)
+        self.assertEqual(load_model(MODEL).status_code, 200)
+        self.assertIn(cache, last_args())
+
     def test_508_crash_is_not_replayed(self):
         if not _opts.fake_backend or not _opts.fake_state_dir:
             self.skipTest("needs --fake-backend and --fake-state-dir")
@@ -627,6 +682,84 @@ class ImageClassifyTests(ServerTestBase):
         self._assert_reference(response, 1)
         self.assertEqual(
             lines(starts) - starts_before, 1, "expected one reload after the pause"
+        )
+
+    # ---- text classification on the same engine (fake backend only) ----
+
+    def _require_text_model(self):
+        if not _opts.fake_backend or not _opts.fake_state_dir or not _opts.hf_cache:
+            self.skipTest("needs --fake-backend, --fake-state-dir and --hf-cache")
+        if ImageClassifyTests._text_registered:
+            return
+        dest = os.path.join(_opts.hf_cache, "models--" + TEXT_MODEL[len("user.") :])
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        _write_stub_text_model_dir(dest)
+        response = requests.post(
+            f"{self.base_url}/pull",
+            json={
+                "model_name": TEXT_MODEL,
+                "recipe": "tflite",
+                "labels": ["classification"],
+                "local_import": True,
+            },
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200, response.text[:500])
+        ImageClassifyTests._text_registered = True
+
+    def _classify_text(self, text, **extra):
+        return requests.post(
+            f"{self.base_url}/classify",
+            json={"model": TEXT_MODEL, "input": text, **extra},
+            timeout=TIMEOUT_CLASSIFY,
+        )
+
+    def test_511_text_labels_refused_by_fixed_label_model(self):
+        self._require_text_model()
+        self._assert_status(self._classify_text("hello"), 200, "text classify")
+        response = self._classify_text("hello", labels=["caller-category"])
+        self._assert_status(response, 400, "labels sent to a fixed-label model")
+
+    def test_512_text_crash_is_not_replayed(self):
+        self._require_text_model()
+        crashes = os.path.join(_opts.fake_state_dir, "crashes.log")
+        starts = os.path.join(_opts.fake_state_dir, "starts.log")
+        self._assert_status(self._classify_text("hello"), 200, "warm-up")
+        crashes_before, starts_before = _line_count(crashes), _line_count(starts)
+
+        response = self._classify_text(POISON_TEXT)
+        self._assert_status(response, 502, "poison text")
+        self.assertEqual(response.json()["error"]["code"], "backend_crashed_on_input")
+        self.assertEqual(
+            _line_count(crashes) - crashes_before, 1, "the poison text was replayed"
+        )
+
+        self._assert_status(self._classify_text("hello"), 200, "after the crash")
+        self.assertEqual(
+            _line_count(starts) - starts_before, 1, "expected exactly one reload"
+        )
+
+    def test_513_repeated_text_crashes_pause_the_model(self):
+        self._require_text_model()
+        crashes = os.path.join(_opts.fake_state_dir, "crashes.log")
+        starts = os.path.join(_opts.fake_state_dir, "starts.log")
+        response = None
+        for _ in range(4):
+            response = self._classify_text(POISON_TEXT)
+            if response.status_code != 502:
+                break
+        self._assert_status(response, 503, "poison text after repeated crashes")
+        self.assertEqual(response.json()["error"]["code"], "backend_crash_cooldown")
+        self.assertTrue(1 <= int(response.headers["Retry-After"]) <= 60)
+
+        crashes_before, starts_before = _line_count(crashes), _line_count(starts)
+        self._assert_status(self._classify_text("hello"), 503, "good text while paused")
+        self.assertEqual(
+            _line_count(crashes), crashes_before, "paused model crashed again"
+        )
+        self.assertEqual(
+            _line_count(starts), starts_before, "paused model was reloaded"
         )
 
 

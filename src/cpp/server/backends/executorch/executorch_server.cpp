@@ -239,6 +239,15 @@ json ExecutorchServer::forward_classify(const std::string& text, const json& par
 }
 
 json ExecutorchServer::classify(const json& request) {
+    if (request.contains("labels")) {
+        return json{
+            {"error", {
+                {"message", "This model has a fixed label set and does not take 'labels'"},
+                {"type", "invalid_request_error"},
+                {"status_code", 400},
+            }}
+        };
+    }
     // Accept either OpenAI-style "input" or plain "text".
     std::string text;
     if (request.contains("text") && request["text"].is_string()) {

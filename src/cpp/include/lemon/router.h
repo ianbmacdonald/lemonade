@@ -234,10 +234,10 @@ public:
     json reranking(const json& request);
     json classify(const json& request);
     json classify_image(const json& params, std::string image_bytes);
-    // The 503 error to return while image classification for this model is
-    // paused after repeated backend crashes; checked before any auto-load so a
-    // paused model is not reloaded either.
-    std::optional<json> image_classify_cooldown_error(const std::string& model_name);
+    // The 503 error to return while classification (text or image) for this
+    // model is paused after repeated backend crashes; checked before any
+    // auto-load so a paused model is not reloaded either.
+    std::optional<json> classify_cooldown_error(const std::string& model_name);
     json get_slots();
     json slots_action(int slot_id, const std::string& action, const json& request_body);
     json tokenize(const json& request);
@@ -318,7 +318,7 @@ private:
 
     // Concurrency control for load operations
     mutable std::mutex load_mutex_;              // Protects loading state and loaded_servers_
-    CrashBreaker image_crash_breaker_{3, std::chrono::seconds(60), std::chrono::seconds(60)};
+    CrashBreaker classify_crash_breaker_{3, std::chrono::seconds(60), std::chrono::seconds(60)};
     bool is_loading_ = false;                    // True when a load operation is in progress
     std::condition_variable load_cv_;            // Signals when load completes
 
@@ -421,6 +421,7 @@ private:
     ModelTelemetryIdentity get_telemetry_identity(WrappedServer* server) const;
     void record_request_telemetry_for_model(const ModelTelemetryIdentity& identity,
                                             const StreamingProxy::TelemetryData& telemetry);
+    void record_classify_crash(const json& response, const std::string& requested_model);
 
     // retry_after_watchdog_reset=false is for requests whose input may itself be
     // what crashed the backend: replaying it would crash the fresh one too, so

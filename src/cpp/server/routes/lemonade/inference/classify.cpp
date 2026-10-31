@@ -24,6 +24,14 @@ const RouteError kBackendRejected{
     "model, which is found only after it loads, or because `labels` is sent to a fixed-label "
     "model or left out for a zero-shot one"};
 
+const RouteError kCrashCooldown{
+    503, "backend_crash_cooldown",
+    "The model's backend crashed on 3 inputs within 60 seconds, which pauses classification "
+    "for that model for 60 seconds (with `Retry-After`)"};
+const RouteError kCrashedOnInput{
+    502, "backend_crashed_on_input",
+    "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
+
 const RouteArg kModel{"model", ArgIn::JsonBody, {{"type", "string"}}, false, Support::Available,
                       "The classifier model. Optional when exactly one classification model is loaded; that "
                       "model is used."};
@@ -111,8 +119,8 @@ public:
         })");
         s.examples = {example};
         s.errors = join_errors({{kBodyNotJson, kArgMissing, kArgInvalid,
-                                 kNoSoleClassifier, kImageModel,
-                                 kBackendRejected, kModelUnloaded, kBackendError,
+                                 kNoSoleClassifier, kImageModel, kCrashCooldown,
+                                 kBackendRejected, kCrashedOnInput, kModelUnloaded, kBackendError,
                                  kMalformedBackendResponse, kUnexpectedException},
                                 ModelLoader::errors()});
         s.error_format = ErrorFormat::OpenAi;
@@ -169,6 +177,13 @@ protected:
                 "POST /v1/images/classify");
             return false;
         }
+
+        if (auto paused = ctx_.router->classify_cooldown_error(req.model)) {
+            res.status = kCrashCooldown.status;
+            res.set_header("Retry-After", std::to_string((*paused)["error"]["retry_after"].get<long long>()));
+            res.set_content(paused->dump(), "application/json");
+            return false;
+        }
         return true;
     }
 
@@ -193,6 +208,9 @@ protected:
                 }
             } else {
                 res.status = kBackendError.status;
+            }
+            if (err.contains("retry_after") && err["retry_after"].is_number_integer()) {
+                res.set_header("Retry-After", std::to_string(err["retry_after"].get<long long>()));
             }
             res.set_content(response.dump(), "application/json");
             return;

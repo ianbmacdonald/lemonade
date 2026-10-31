@@ -38,7 +38,7 @@ const RouteError kServerBusy{
     "Two image-classification requests are already in progress (`Retry-After: 1`)"};
 const RouteError kCrashCooldown{
     503, "backend_crash_cooldown",
-    "The model's backend crashed on 3 inputs within 60 seconds, which pauses image classification "
+    "The model's backend crashed on 3 inputs within 60 seconds, which pauses classification "
     "for that model for 60 seconds (with `Retry-After`)"};
 const RouteError kNotImageClassifier{400, "model_not_applicable", "`model` is not an image-classification model"};
 const RouteError kNoSoleImageClassifier{
@@ -181,7 +181,7 @@ public:
     void handle(RouteRequest& req, httplib::Response& res) override {
         const httplib::Request& http = req.http;
         auto send_if_paused = [this, &res](const std::string& model) {
-            auto paused = ctx_.router->image_classify_cooldown_error(model);
+            auto paused = ctx_.router->classify_cooldown_error(model);
             if (!paused) return false;
             res.status = 503;
             res.set_header("Retry-After",

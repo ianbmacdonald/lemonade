@@ -217,9 +217,20 @@ void TfliteServer::load(const std::string& model_name,
     };
 
     // XNNPACK otherwise packs the weights into anonymous memory once per
-    // signature; a cache file holds one packed copy, mapped and shared.
-    args.push_back("--weight-cache");
-    args.push_back(path_to_utf8(path_from_utf8(model_path) / "model.tflite.xnnpack_cache"));
+    // signature; a cache file holds one packed copy, mapped and shared. The
+    // engine writes through a symlink, which in an HF snapshot points into the
+    // shared blob store, so only a missing path or a plain file is used.
+    const fs::path weight_cache = path_from_utf8(model_path) / "model.tflite.xnnpack_cache";
+    // A missing path sets the error code too, so only file_type::none is an error.
+    std::error_code cache_ec;
+    const fs::file_type cache_type = fs::symlink_status(weight_cache, cache_ec).type();
+    if (cache_type == fs::file_type::not_found || cache_type == fs::file_type::regular) {
+        args.push_back("--weight-cache");
+        args.push_back(path_to_utf8(weight_cache));
+    } else {
+        LOG(WARNING, "TfliteServer") << "Not using weight cache " << path_to_utf8(weight_cache)
+                                     << ": it is not a regular file" << std::endl;
+    }
 
     if (!extra_args.empty()) {
         std::string validation_error =
@@ -296,6 +307,15 @@ json TfliteServer::classify(const json& request) {
         return json{
             {"error", {
                 {"message", "This is an image-classification model; POST /v1/images/classify"},
+                {"type", "invalid_request_error"},
+                {"status_code", 400},
+            }}
+        };
+    }
+    if (request.contains("labels")) {
+        return json{
+            {"error", {
+                {"message", "This model has a fixed label set and does not take 'labels'"},
                 {"type", "invalid_request_error"},
                 {"status_code", 400},
             }}

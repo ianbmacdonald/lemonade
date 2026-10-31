@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Stand-in for tflite-server's image-classification contract, for exercising
-lemond's /v1/images/classify forwarding without a LiteRT build.
+Stand-in for tflite-server's classification contract, for exercising lemond's
+/v1/images/classify and /v1/classify forwarding without a LiteRT build.
 
 Install it on PATH as `tflite-server` (see server_image_classify.py). It
 accepts the flags lemond passes, answers GET /health with
@@ -15,8 +15,13 @@ task=image-classification, and serves POST /classify/image:
   is truncated, gets 400 like the real decoder;
 - anything else gets a fixed ranked prediction list.
 
+A model dir with tokenizer.json and config.json and no manifest.json is served
+as a text classifier instead: POST /classify takes {"text"}, crashes on text
+containing POISON_TEXT, and otherwise returns fixed label scores.
+
 When FAKE_TFLITE_STATE_DIR is set, each start and each crash appends a line to
-starts.log / crashes.log there.
+starts.log / crashes.log there, and each start writes its arguments as a JSON
+list to args.log.
 """
 
 import argparse
@@ -32,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 POISON = b"B169-POISON-IMAGE"
 SLOW = b"B169-SLOW-IMAGE"
+POISON_TEXT = "B194-POISON-TEXT"
 SLOW_SECONDS = 4
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -70,7 +76,14 @@ def _image_part(handler, body):
     return image, top_k
 
 
-def make_handler(args):
+def _crash():
+    _log("crashes.log", str(os.getpid()))
+    os.kill(os.getpid(), signal.SIGSEGV)
+    # The signal can land on another thread; never answer this request.
+    time.sleep(60)
+
+
+def make_handler(args, task):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -87,13 +100,22 @@ def make_handler(args):
             if self.path == "/health":
                 self._send(
                     200,
-                    {"status": "ok", "engine": "fake", "task": "image-classification"},
+                    {"status": "ok", "engine": "fake", "task": task},
                 )
             else:
                 self._send(404, {"error": "not found"})
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if task == "text-classification":
+                if self.path != "/classify":
+                    self._send(404, {"error": "not found"})
+                    return
+                text = json.loads(body or b"{}").get("text", "")
+                if POISON_TEXT in text:
+                    _crash()
+                self._send(200, {"labels": {"safe": 0.9, "unsafe": 0.1}})
+                return
             if self.path == "/classify":
                 self._send(
                     400,
@@ -111,10 +133,7 @@ def make_handler(args):
                 self._send(400, {"error": "exactly one image part required"})
                 return
             if POISON in image:
-                _log("crashes.log", str(os.getpid()))
-                os.kill(os.getpid(), signal.SIGSEGV)
-                # The signal can land on another thread; never answer this request.
-                time.sleep(60)
+                _crash()
             if SLOW in image:
                 time.sleep(SLOW_SECONDS)
             if image.startswith(PNG_SIGNATURE):
@@ -148,12 +167,22 @@ def main():
     parser.add_argument("--weight-cache")
     parser.add_argument("--max-image-pixels", type=int, default=4_000_000)
     args, _ = parser.parse_known_args()
-    manifest = os.path.join(args.model_path, "manifest.json")
-    if not os.path.exists(manifest):
-        print("tflite-server: fake supports image models only", file=sys.stderr)
+
+    def has(name):
+        return os.path.exists(os.path.join(args.model_path, name))
+
+    if has("manifest.json"):
+        task = "image-classification"
+    elif has("tokenizer.json") and has("config.json"):
+        task = "text-classification"
+    else:
+        print("tflite-server: fake found no image or text model", file=sys.stderr)
         sys.exit(1)
     _log("starts.log", str(os.getpid()))
-    ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(args)).serve_forever()
+    _log("args.log", json.dumps(sys.argv[1:]))
+    ThreadingHTTPServer(
+        ("127.0.0.1", args.port), make_handler(args, task)
+    ).serve_forever()
 
 
 if __name__ == "__main__":
