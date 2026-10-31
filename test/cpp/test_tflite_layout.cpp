@@ -103,6 +103,33 @@ int main() {
     check("missing directory is None",
           detect_tflite_layout(root / "does_not_exist") == TfliteLayout::None);
 
+#ifndef _WIN32
+    {
+        const fs::path repo = root / "hub" / "models--org--img";
+        write(repo / "blobs" / "4f1a", "background\ncat\n");
+        const fs::path snap = repo / "snapshots" / "6e091d820cbe8f22eeb604d136403eca290b8c1e";
+        write(snap / "model.tflite", "x");
+        write(snap / "manifest.json", kImageManifest);
+        fs::create_symlink("../../blobs/4f1a", snap / "labels.txt");
+        check("labels file linked to its repository's blob is Image",
+              detect_tflite_layout(snap) == TfliteLayout::Image);
+
+        const fs::path escape = repo / "snapshots" / "aaaa";
+        write(escape / "model.tflite", "x");
+        write(escape / "manifest.json", kImageManifest);
+        fs::create_symlink(root / "text" / "config.json", escape / "labels.txt");
+        check("labels file linked outside its repository is None",
+              detect_tflite_layout(escape) == TfliteLayout::None);
+
+        const fs::path plain = root / "image_link_escape";
+        write(plain / "model.tflite", "x");
+        write(plain / "manifest.json", kImageManifest);
+        fs::create_symlink(root / "text" / "config.json", plain / "labels.txt");
+        check("labels file linked outside a plain model dir is None",
+              detect_tflite_layout(plain) == TfliteLayout::None);
+    }
+#endif
+
     const fs::path two = root / "two";
     make_text(two / "a");
     make_image(two / "b");

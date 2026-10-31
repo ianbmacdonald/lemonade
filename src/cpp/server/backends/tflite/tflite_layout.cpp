@@ -55,6 +55,28 @@ bool read_image_manifest(const fs::path& dir, std::string& labels_file) {
     return true;
 }
 
+// A Hugging Face snapshot links each file into its repository's blobs/, so a
+// labels file may resolve anywhere in that repository; outside a snapshot it
+// must resolve inside the model dir. Checked on the resolved target, since the
+// lexical check in read_image_manifest does not see through symlinks.
+bool labels_file_confined(const fs::path& dir, const std::string& labels_file) {
+    std::error_code ec;
+    const fs::path abs_dir = fs::absolute(dir, ec);
+    if (ec) return false;
+    fs::path root = abs_dir;
+    for (fs::path p = abs_dir; p.has_relative_path(); p = p.parent_path()) {
+        if (p.filename() == "snapshots") {
+            root = p.parent_path();
+            break;
+        }
+    }
+    const fs::path base = fs::canonical(root, ec);
+    if (ec) return false;
+    const fs::path target = fs::canonical(abs_dir / fs::path(labels_file), ec);
+    if (ec) return false;
+    return std::mismatch(base.begin(), base.end(), target.begin(), target.end()).first == base.end();
+}
+
 }  // namespace
 
 TfliteLayout detect_tflite_layout(const fs::path& dir) noexcept {
@@ -64,7 +86,8 @@ TfliteLayout detect_tflite_layout(const fs::path& dir) noexcept {
 
         std::string labels_file;
         if (read_image_manifest(dir, labels_file)) {
-            return fs::is_regular_file(dir / fs::path(labels_file), ec) && !ec
+            return fs::is_regular_file(dir / fs::path(labels_file), ec) && !ec &&
+                           labels_file_confined(dir, labels_file)
                        ? TfliteLayout::Image
                        : TfliteLayout::None;
         }
