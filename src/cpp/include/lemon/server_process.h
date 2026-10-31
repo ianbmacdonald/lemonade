@@ -40,6 +40,9 @@ public:
     virtual bool running() const;
 
     utils::ProcessHandle handle() const { return handle_; }
+    // The status stop() reaped from a server that had already exited; -1 when stop()
+    // terminated it, or it never started.
+    int exit_code() const { return exit_code_; }
     const std::vector<std::string>& command_line() const { return command_line_; }
 
 protected:
@@ -48,6 +51,7 @@ protected:
 
     utils::ProcessHandle handle_{nullptr, 0};
     std::vector<std::string> command_line_;
+    int exit_code_ = -1;
 
 private:
     ProcessOutput output_;

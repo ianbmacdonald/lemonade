@@ -407,6 +407,7 @@ bool WrappedServer::has_backend_process_exited() const {
 
 void WrappedServer::start_server(std::unique_ptr<ServerProcess> process,
                                  const ServerCommand& command, long timeout_seconds) {
+    startup_exit_code_ = -1;
     const std::string host = process->start(command);
     std::unique_ptr<ServerProcess> previous;
     {
@@ -421,7 +422,11 @@ void WrappedServer::start_server(std::unique_ptr<ServerProcess> process,
     }
 
     if (!wait_for_ready(command.ready_endpoint, timeout_seconds)) {
-        stop_server();
+        stop_backend_watchdog();
+        if (auto failed = take_process()) {
+            failed->stop();
+            startup_exit_code_ = failed->exit_code();
+        }
         throw std::runtime_error(server_name_ + " failed to start");
     }
     start_backend_watchdog(command.ready_endpoint);

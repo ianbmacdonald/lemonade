@@ -235,17 +235,15 @@ void TfliteServer::load(const std::string& model_name,
     }
 
     bool inherit_output = (log_level_ == "info") || is_debug();
-    ProcessHandle started_handle = utils::ProcessManager::start_process(
-        executable, args, "", inherit_output, false, {});
-    set_process_handle(started_handle, executable, args);
-
-    if (!has_process_handle(started_handle)) {
-        throw std::runtime_error("Failed to start tflite-server process");
-    }
-    LOG(INFO, "TfliteServer") << "Process started with PID: " << started_handle.pid << std::endl;
-
-    if (!wait_for_ready("/health")) {
-        unload();
+    ServerCommand command;
+    command.program = executable;
+    command.args = args;
+    command.port = port_;
+    try {
+        start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
+                     command);
+    } catch (const std::runtime_error&) {
+        if (load_cancelled()) throw;
         // The subprocess's stderr is invisible when lemond runs windowless (CI,
         // tray), so a startup failure would otherwise surface only as "not
         // ready". Re-run it briefly to capture the reason it refused the model.
@@ -271,17 +269,11 @@ void TfliteServer::load(const std::string& model_name,
                               "' for a text-classification model");
     }
 
-    start_backend_watchdog("/health");
     LOG(INFO, "TfliteServer") << "Server is ready!" << std::endl;
 }
 
 void TfliteServer::unload() {
-    stop_backend_watchdog();
-    const ProcessHandle handle = consume_process_handle_for_cleanup();
-    if (has_process_handle(handle)) {
-        LOG(INFO, "TfliteServer") << "Stopping server (PID: " << handle.pid << ")" << std::endl;
-        utils::ProcessManager::stop_process(handle);
-    }
+    stop_server();
 }
 
 json TfliteServer::forward_classify(const std::string& text, const json& params) {

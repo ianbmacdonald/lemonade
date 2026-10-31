@@ -6,10 +6,12 @@
 
 #include "lemon/error_types.h"
 #include "lemon/router.h"
+#include "lemon/server_process.h"
 #include "lemon/utils/process_manager.h"
 #include "lemon/wrapped_server.h"
 
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
@@ -36,18 +38,18 @@ public:
 
     void load(const std::string&, const ModelInfo&, const RecipeOptions&, bool) override {}
 
-    void unload() override {
-        const ProcessHandle handle = consume_process_handle_for_cleanup();
-        if (has_process_handle(handle)) utils::ProcessManager::stop_process(handle);
-    }
-
-    // Returns wait_for_ready's verdict and leaves startup_exit_code() readable.
     bool start_and_wait(const std::string& script, long timeout_seconds) {
-        choose_port();
-        const std::vector<std::string> args = {"-c", script};
-        ProcessHandle handle = utils::ProcessManager::start_process("/bin/sh", args);
-        set_process_handle(handle, "/bin/sh", args);
-        return wait_for_ready("/health", timeout_seconds, 50);
+        ServerCommand command;
+        command.program = "/bin/sh";
+        command.args = {"-c", script};
+        command.port = choose_port();
+        try {
+            start_server(std::make_unique<NativeProcess>(ProcessOutput{false, false}), command,
+                         timeout_seconds);
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+        return true;
     }
 
     using WrappedServer::startup_exit_code;

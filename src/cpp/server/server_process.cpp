@@ -47,6 +47,7 @@ void ServerProcess::stop() {
         ProcessManager::stop_process(handle_);
     } else {
         const int exit_code = ProcessManager::reap_process(handle_);
+        exit_code_ = exit_code;
         LOG(ERROR, "ServerProcess") << command_line_.front() << " (PID " << handle_.pid
                                     << ") had exited with code " << exit_code << std::endl;
     }

@@ -189,23 +189,20 @@ void ExecutorchServer::load(const std::string& model_name,
     }
 
     bool inherit_output = (log_level_ == "info") || is_debug();
-    ProcessHandle started_handle = utils::ProcessManager::start_process(
-        executable, args, "", inherit_output, false, {});
-    set_process_handle(started_handle, executable, args);
-
-    if (!has_process_handle(started_handle)) {
-        throw std::runtime_error("Failed to start et-server process");
-    }
-    LOG(INFO, "ExecutorchServer") << "Process started with PID: " << started_handle.pid << std::endl;
-
+    ServerCommand command;
+    command.program = executable;
+    command.args = args;
+    command.port = port;
     constexpr long kReadyTimeoutSeconds = 600;
-    if (!wait_for_ready("/health", kReadyTimeoutSeconds)) {
-        unload();
+    try {
+        start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
+                     command, kReadyTimeoutSeconds);
+    } catch (const std::runtime_error&) {
         // Every failure below is non-retryable: et-server is CPU-only, so the
         // Router's evict-everything-and-retry would only cost the resident LLM
         // and repeat a load that failed for reasons eviction does not change.
         const int exit_code = startup_exit_code();
-        if (load_cancel_ && load_cancel_->load()) {
+        if (load_cancelled()) {
             throw NonRetryableLoadException("et-server load cancelled");
         }
         if (exit_code < 0) {
@@ -229,17 +226,11 @@ void ExecutorchServer::load(const std::string& model_name,
         throw NonRetryableLoadException("et-server " + status + " during startup" +
                                         (details.empty() ? "" : ": " + details));
     }
-    start_backend_watchdog("/health");
     LOG(INFO, "ExecutorchServer") << "Server is ready!" << std::endl;
 }
 
 void ExecutorchServer::unload() {
-    stop_backend_watchdog();
-    const ProcessHandle handle = consume_process_handle_for_cleanup();
-    if (has_process_handle(handle)) {
-        LOG(INFO, "ExecutorchServer") << "Stopping server (PID: " << handle.pid << ")" << std::endl;
-        utils::ProcessManager::stop_process(handle);
-    }
+    stop_server();
 }
 
 json ExecutorchServer::forward_classify(const std::string& text, const json& params) {
