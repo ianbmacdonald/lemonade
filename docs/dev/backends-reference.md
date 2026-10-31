@@ -11,8 +11,10 @@ the generator instead. Prose outside the markers is preserved. -->
 |--------|------|--------------------|---------------|----------|
 | `acestep` | ACE-Step | yes | no | cuda, rocm, vulkan |
 | `ds4` | DwarfStar4 | no | yes | rocm |
+| `executorch` | ExecuTorch | no | no | system |
 | `flm` | FastFlowLM NPU | no | yes | npu |
 | `kokoro` | Kokoro | no | no | cpu, metal |
+| `litert` | LiteRT | no | no | system |
 | `llamacpp` | Llama.cpp GPU | yes | yes | cpu, cuda, metal, rocm, system, vulkan |
 | `llamacpp-hrx` | HRX GPU | no | yes | hrx |
 | `moonshine` | Moonshine | no | no | cpu |
@@ -20,6 +22,7 @@ the generator instead. Prose outside the markers is preserved. -->
 | `openmoss` | OpenMOSS TTS | yes | no | cuda, vulkan |
 | `ryzenai-llm` | Ryzen AI LLM | no | yes | npu |
 | `sd-cpp` | StableDiffusion.cpp | yes | no | cpu, cuda, metal, rocm, vulkan |
+| `tflite` | TFLite | no | no | system |
 | `thenoise` | TheNoise | yes | no | cuda, rocm |
 | `thinksound` | ThinkSound | yes | no | cuda, rocm, vulkan |
 | `trellis` | TRELLIS.2 | yes | no | cuda, rocm, vulkan |
@@ -38,9 +41,11 @@ Each backend has a tier and a format; see [Backend Tiers and Formats](../api/lem
 | `acestep` | vulkan | experimental | native | linux, windows | amd_gpu; cpu (x86_64); nvidia_gpu |
 | `acestep` | rocm | experimental | native | linux, windows | amd_gpu (gfx103X, gfx110X, gfx1150, gfx1151, gfx1152, gfx120X) |
 | `ds4` | rocm | guest | native | linux | amd_gpu (gfx1151) |
+| `executorch` | system | experimental | native | linux | cpu (x86_64) |
 | `flm` | npu | core | native | linux, windows | amd_npu (XDNA2) |
 | `kokoro` | metal | core | native | macos | metal |
 | `kokoro` | cpu | core | native | linux, windows | cpu (x86_64) |
+| `litert` | system | experimental | native | linux | cpu (arm64, x86_64) |
 | `llamacpp` | system | core | native | linux | cpu (arm64, x86_64) |
 | `llamacpp` | metal | core | native | macos | metal |
 | `llamacpp` | cuda | core | native | linux, windows | nvidia_gpu (sm_100, sm_120, sm_121, sm_75, sm_80, sm_86, sm_89, sm_90) |
@@ -62,6 +67,7 @@ Each backend has a tier and a format; see [Backend Tiers and Formats](../api/lem
 | `sd-cpp` | vulkan | core | native | linux, windows | amd_gpu; cpu (x86_64); nvidia_gpu |
 | `sd-cpp` | rocm | core | native | linux, windows | amd_gpu (gfx103X, gfx110X, gfx1150, gfx1151, gfx1152, gfx120X) |
 | `sd-cpp` | cpu | core | native | linux, windows | cpu (x86_64) |
+| `tflite` | system | experimental | native | linux | cpu (arm64, x86_64) |
 | `thenoise` | rocm | core | python | linux, windows | amd_gpu (gfx103X, gfx110X, gfx1150, gfx1151, gfx1152, gfx120X) |
 | `thenoise` | cuda | experimental | python | linux | nvidia_gpu |
 | `thinksound` | cuda | experimental | native | linux, windows | nvidia_gpu |
@@ -70,7 +76,7 @@ Each backend has a tier and a format; see [Backend Tiers and Formats](../api/lem
 | `trellis` | cuda | experimental | native | linux, windows | nvidia_gpu |
 | `trellis` | vulkan | experimental | native | linux, windows | amd_gpu; cpu (x86_64); nvidia_gpu |
 | `trellis` | rocm | experimental | native | linux, windows | amd_gpu (gfx103X, gfx110X, gfx1150, gfx1151, gfx1152, gfx120X) |
-| `vllm` | rocm | experimental | python | linux | amd_gpu (gfx110X, gfx1150, gfx1151, gfx120X) |
+| `vllm` | rocm | experimental | python | linux | amd_gpu (gfx110X, gfx1150, gfx1151, gfx120X, gfx942, gfx950) |
 | `whispercpp` | npu | core | native | windows | amd_npu (XDNA2) |
 | `whispercpp` | metal | core | native | macos | metal |
 | `whispercpp` | vulkan | core | native | linux, windows | amd_gpu; cpu (x86_64) |
@@ -101,12 +107,24 @@ Each backend has a tier and a format; see [Backend Tiers and Formats](../api/lem
 | `ctx_size` | `--ctx-size` | SIZE | -1 | Context size for the model |
 | `ds4_args` | `--ds4-args` | ARGS | "" | Custom arguments to pass to ds4-server |
 
+#### `executorch` — ExecuTorch
+
+| Option | CLI flag | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `executorch_args` | `--executorch-args` | ARGS | "" | Custom arguments to pass to et-server |
+
 #### `flm` — FastFlowLM NPU
 
 | Option | CLI flag | Type | Default | Description |
 |--------|----------|------|---------|-------------|
 | `ctx_size` | `--ctx-size` | SIZE | -1 | Context size for the model |
 | `flm_args` | `--flm-args` | ARGS | "" | Safe flm serve tuning args: --pmode, --prefill-chunk-len, --img-pre-resize, --socket, --q-len, --preemption |
+
+#### `litert` — LiteRT
+
+| Option | CLI flag | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `litert_args` | `--litert-args` | ARGS | "" | Custom arguments to pass to litert-lm-server |
 
 #### `llamacpp` — Llama.cpp GPU
 
@@ -154,6 +172,12 @@ Each backend has a tier and a format; see [Backend Tiers and Formats](../api/lem
 | `height` | — | SIZE | 512 | Output image height |
 | `sampling_method` | — | ARGS | "" | Sampling method |
 | `flow_shift` | — | SIZE | 0.0 | Flow shift |
+
+#### `tflite` — TFLite
+
+| Option | CLI flag | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `tflite_args` | `--tflite-args` | ARGS | "" | Custom arguments to pass to tflite-server |
 
 #### `thenoise` — TheNoise
 
