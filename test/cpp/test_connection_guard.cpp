@@ -1,5 +1,9 @@
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -13,6 +17,7 @@
 #endif
 
 #include <lemon/connection_guard.h>
+#include <lemon/upgradable_http_server.h>
 
 #include "test_config_helpers.h"
 
@@ -36,6 +41,30 @@ static void test_addresses() {
     check(ConnectionGuard::is_loopback("::1"), "::1 is loopback");
     check(!ConnectionGuard::is_loopback("192.0.2.5"), "a LAN address is not loopback");
     check(!ConnectionGuard::is_loopback(""), "an unreadable address is not loopback");
+}
+
+static void test_bounded_task_queue() {
+    std::unique_ptr<httplib::TaskQueue> pool(lemon::detail::new_bounded_thread_pool(1, 2));
+    std::mutex mu;
+    std::condition_variable cv;
+    bool release = false;
+    std::atomic<bool> started{false};
+    check(pool->enqueue([&] {
+        started = true;
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return release; });
+    }), "a connection goes to the idle worker");
+    while (!started) {
+        std::this_thread::sleep_for(1ms);
+    }
+    check(pool->enqueue([] {}) && pool->enqueue([] {}), "connections queue up to the bound");
+    check(!pool->enqueue([] {}), "a connection past the queue bound is refused");
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        release = true;
+    }
+    cv.notify_all();
+    pool->shutdown();
 }
 
 static void test_cap() {
@@ -181,6 +210,7 @@ int main() {
     std::puts("=== RUNNING CONNECTION GUARD TESTS ===");
     test_addresses();
     test_cap();
+    test_bounded_task_queue();
 #ifndef _WIN32
     test_deadline_logic();
     test_watchdog_shuts_down_socket();

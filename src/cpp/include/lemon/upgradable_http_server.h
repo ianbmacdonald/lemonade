@@ -36,6 +36,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -102,6 +103,19 @@ inline void wrap_route_handlers(httplib::Server& srv, const std::function<void()
                 inner(req, res);
             };
         }
+    }
+}
+
+// Connections the pool cannot take are closed at accept instead of queueing
+// without bound, each holding a descriptor. cpp-httplib 0.33 inserted
+// max_threads ahead of max_queued_requests, so a positional queue bound would
+// set the thread ceiling on newer versions.
+template <typename Pool = httplib::ThreadPool>
+httplib::TaskQueue* new_bounded_thread_pool(size_t threads, size_t max_queued) {
+    if constexpr (std::is_constructible<Pool, size_t, size_t, size_t>::value) {
+        return new Pool(threads, 0, max_queued);
+    } else {
+        return new Pool(threads, max_queued);
     }
 }
 

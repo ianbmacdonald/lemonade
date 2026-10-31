@@ -121,7 +121,7 @@ void HttpListener::create_servers() {
     std::function<httplib::TaskQueue *(void)> task_queue_factory = [thread_count] {
         LOG(DEBUG, "Server") << "Creating new thread pool with " << thread_count
                              << " threads" << std::endl;
-        return new httplib::ThreadPool(thread_count);
+        return detail::new_bounded_thread_pool(thread_count, thread_count * 2);
     };
 
     // The fronts own the accept loops (and therefore the task queues)
