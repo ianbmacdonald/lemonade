@@ -486,6 +486,19 @@ class ImageClassifyTests(ServerTestBase):
             unload_model(MODEL)
             load_model(MODEL, tflite_args="")
 
+    def test_507b_load_refuses_bind_override(self):
+        # tflite_args comes from the request body; --host would put the engine
+        # on the LAN without lemond's API key.
+        self._require_model()
+        unload_model(MODEL)
+        try:
+            for args in ("--host 0.0.0.0", "--host=0.0.0.0", "--weight-cache /tmp/x"):
+                response = load_model(MODEL, tflite_args=args)
+                self.assertNotEqual(response.status_code, 200, args)
+                self.assertIn("managed by Lemonade", response.text, args)
+        finally:
+            load_model(MODEL, tflite_args="")
+
     def test_508_crash_is_not_replayed(self):
         if not _opts.fake_backend or not _opts.fake_state_dir:
             self.skipTest("needs --fake-backend and --fake-state-dir")

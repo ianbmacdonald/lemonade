@@ -2,9 +2,21 @@
 
 #include "lemon/backends/backend_descriptor.h"
 
+#include <set>
+#include <string>
+
 namespace lemon {
 namespace backends {
 namespace executorch {
+
+// Arguments executorch_args must not carry; same reasons as
+// tflite::reserved_custom_arg_flags (the request body sets them).
+inline const std::set<std::string>& reserved_custom_arg_flags() {
+    static const std::set<std::string> flags = {
+        "--model-path", "--port", "--host", "--weight-cache",
+    };
+    return flags;
+}
 
 // Serves text classification on /v1/classify through an et-server subprocess,
 // which speaks the same ort-server /classify contract as tflite-server over an

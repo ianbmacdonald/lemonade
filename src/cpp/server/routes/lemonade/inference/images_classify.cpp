@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -299,8 +300,15 @@ public:
                                               ? p["label"].get<std::string>()
                                               : std::to_string(p["index"].get<long long>());
                 data.push_back({{"index", p["index"]}, {"label", label}, {"score", p["score"]}});
-                if (!labels.contains(label)) labels[label] = p["score"];
+                if (!labels.contains(label) ||
+                    labels[label].get<double>() < p["score"].get<double>()) {
+                    labels[label] = p["score"];
+                }
             }
+            // The documented contract is best-first; do not rely on the backend's order.
+            std::stable_sort(data.begin(), data.end(), [](const json& a, const json& b) {
+                return a["score"].get<double>() > b["score"].get<double>();
+            });
             json enveloped = {
                 {"object", "image_classification"},
                 {"model", model},

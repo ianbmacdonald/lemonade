@@ -4,6 +4,7 @@
 #include "lemon/backends/backend_ops.h"
 #include "lemon/backends/backend_utils.h"
 #include "lemon/backend_manager.h"
+#include "lemon/error_types.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
 #include "lemon/utils/path_utils.h"
@@ -110,7 +111,8 @@ void LiteRtServer::load(const std::string& model_name,
                      command);
     } catch (const std::runtime_error&) {
         if (load_cancelled()) throw;
-        throw std::runtime_error("litert-lm-server failed to start or become ready");
+        // A CPU engine that fails to start is not fixed by evicting other models.
+        throw NonRetryableLoadException("litert-lm-server failed to start or become ready");
     }
     LOG(INFO, "LiteRtServer") << "Server is ready!" << std::endl;
 }

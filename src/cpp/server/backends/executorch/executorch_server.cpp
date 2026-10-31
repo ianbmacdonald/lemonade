@@ -14,7 +14,6 @@
 #include "lemon/utils/process_manager.h"
 #include <algorithm>
 #include <filesystem>
-#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -178,9 +177,9 @@ void ExecutorchServer::load(const std::string& model_name,
         "--port", std::to_string(port),
     };
 
-    std::set<std::string> reserved_flags = {"--model-path", "--port"};
     if (!extra_args.empty()) {
-        std::string validation_error = validate_custom_args(extra_args, reserved_flags);
+        std::string validation_error =
+            validate_custom_args(extra_args, executorch::reserved_custom_arg_flags());
         if (!validation_error.empty()) {
             throw std::invalid_argument("Invalid custom et-server arguments:\n" + validation_error);
         }

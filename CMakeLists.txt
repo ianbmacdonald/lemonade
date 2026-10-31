@@ -3993,6 +3993,13 @@ if(BUILD_TESTING AND EXISTS "${_DS4_INSTALL_TEST_SRC}")
     add_cpp_ci_test(Ds4InstallParamsTest CI ON COMMAND test_ds4_install_params)
 endif()
 
+set(_ENGINE_RESERVED_ARGS_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_engine_reserved_args.cpp")
+if(BUILD_TESTING AND EXISTS "${_ENGINE_RESERVED_ARGS_TEST_SRC}")
+    add_executable(test_engine_reserved_args test/cpp/test_engine_reserved_args.cpp)
+    target_link_libraries(test_engine_reserved_args PRIVATE lemonade-server-core)
+    add_cpp_ci_test(EngineReservedArgsTest CI ON COMMAND test_engine_reserved_args)
+endif()
+
 # llamacpp gfx950 (MI350) install gate: only the Linux + stable-channel asset is
 # published, so the shared Windows/Linux support row must not advertise Windows
 # or nightly installs for gfx950.

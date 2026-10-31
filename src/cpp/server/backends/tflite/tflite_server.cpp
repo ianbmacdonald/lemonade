@@ -7,6 +7,7 @@
 #include "lemon/backends/hf_cache_util.h"
 #include "lemon/backend_manager.h"
 #include "lemon/classify_text_limit.h"
+#include "lemon/error_types.h"
 #include "lemon/image_classify_request.h"
 #include "lemon/utils/path_utils.h"
 #include "lemon/utils/custom_args.h"
@@ -14,7 +15,6 @@
 #include "lemon/utils/process_manager.h"
 #include <algorithm>
 #include <filesystem>
-#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -173,7 +173,7 @@ void TfliteServer::load(const std::string& model_name,
     // the resolved path is the only candidate.
     auto candidates = tflite::find_complete_model_dirs(path_from_utf8(model_path));
     if (candidates.empty()) {
-        throw std::runtime_error(
+        throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
             "': need model.tflite + tokenizer.json + config.json for a text classifier "
             "(manifest.json is optional and overrides the output contract), or "
@@ -183,7 +183,7 @@ void TfliteServer::load(const std::string& model_name,
     if (candidates.size() > 1) {
         std::string listing;
         for (const auto& c : candidates) listing += "\n  " + path_to_utf8(c);
-        throw std::runtime_error(
+        throw NonRetryableLoadException(
             "Ambiguous model layout under '" + model_path + "': " +
             std::to_string(candidates.size()) +
             " complete model directories found — keep exactly one:" + listing);
@@ -196,7 +196,7 @@ void TfliteServer::load(const std::string& model_name,
     const tflite::TfliteLayout wanted =
         wants_image ? tflite::TfliteLayout::Image : tflite::TfliteLayout::Text;
     if (layout != wanted) {
-        throw std::runtime_error(
+        throw NonRetryableLoadException(
             "Model '" + model_name + "' is labeled " + model_type_to_string(model_info.type) +
             " and needs a " + tflite::tflite_layout_name(wanted) + " layout, but '" +
             model_path + "' is a " + tflite::tflite_layout_name(layout) + " layout");
@@ -218,15 +218,12 @@ void TfliteServer::load(const std::string& model_name,
 
     // XNNPACK otherwise packs the weights into anonymous memory once per
     // signature; a cache file holds one packed copy, mapped and shared.
-    bool has_weight_cache = extra_args.find("--weight-cache") != std::string::npos;
-    if (!has_weight_cache) {
-        args.push_back("--weight-cache");
-        args.push_back(path_to_utf8(path_from_utf8(model_path) / "model.tflite.xnnpack_cache"));
-    }
+    args.push_back("--weight-cache");
+    args.push_back(path_to_utf8(path_from_utf8(model_path) / "model.tflite.xnnpack_cache"));
 
-    std::set<std::string> reserved_flags = {"--model-path", "--port"};
     if (!extra_args.empty()) {
-        std::string validation_error = validate_custom_args(extra_args, reserved_flags);
+        std::string validation_error =
+            validate_custom_args(extra_args, tflite::reserved_custom_arg_flags());
         if (!validation_error.empty()) {
             throw std::invalid_argument("Invalid custom tflite-server arguments:\n" + validation_error);
         }
@@ -243,13 +240,25 @@ void TfliteServer::load(const std::string& model_name,
         start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
                      command);
     } catch (const std::runtime_error&) {
-        if (load_cancelled()) throw;
+        // Non-retryable for the same reason as et-server: tflite-server is
+        // CPU-only, so evicting other models cannot fix a failed start.
+        if (load_cancelled()) throw NonRetryableLoadException("tflite-server load cancelled");
+        const int exit_code = startup_exit_code();
+        if (exit_code < 0) {
+            throw NonRetryableLoadException("tflite-server did not become ready");
+        }
+        if (exit_code == 128 + 9) {
+            // SIGKILL during load is the OOM killer's signature; relaunching to
+            // capture stderr would repeat the full load under the same pressure.
+            throw NonRetryableLoadException(
+                "tflite-server was killed by signal 9 (likely out of memory)");
+        }
         // The subprocess's stderr is invisible when lemond runs windowless (CI,
         // tray), so a startup failure would otherwise surface only as "not
         // ready". Re-run it briefly to capture the reason it refused the model.
         std::string details = capture_startup_error(executable, args);
-        throw std::runtime_error("tflite-server failed to start or become ready" +
-                                 (details.empty() ? "" : ": " + details));
+        throw NonRetryableLoadException("tflite-server failed to start or become ready" +
+                                        (details.empty() ? "" : ": " + details));
     }
     // A tflite-server older than 0.2.0 reports no task and cannot serve images;
     // it would otherwise load and then 404 on every request.
@@ -262,7 +271,7 @@ void TfliteServer::load(const std::string& model_name,
                          (!wants_image && reported_task == "token-classification");
     if (!task_ok) {
         unload();
-        throw std::runtime_error(
+        throw NonRetryableLoadException(
             wants_image ? "tflite-server >= 0.2.0 required for image-classification "
                           "(it reported task '" + reported_task + "')"
                         : "tflite-server reported task '" + reported_task +
