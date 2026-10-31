@@ -33,7 +33,6 @@ inline const BackendDescriptor descriptor = {
     /*supported_modes*/ {"classification", "image-classification"},
     /*required_checkpoints*/ {"main"},
     /*default_capabilities*/ {},
-    /*experimental*/    true,
     /*web_display_name*/ "",
     /*rocm_channels*/   {},
     /*exposes_prometheus_metrics*/ false,
