@@ -29,7 +29,11 @@ void EvictionEngine::start(int interval_ms) {
 }
 
 void EvictionEngine::stop() {
-    running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(wake_mutex_);
+        running_ = false;
+    }
+    wake_cv_.notify_all();
     if (engine_thread_.joinable()) {
         engine_thread_.join();
     }
@@ -52,7 +56,8 @@ void EvictionEngine::evaluation_loop() {
     while (running_) {
         // Also perform regular time-based idle checks
         evaluate_servers(-1.0);
-        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
+        std::unique_lock<std::mutex> lock(wake_mutex_);
+        wake_cv_.wait_for(lock, std::chrono::milliseconds(interval_ms_), [this] { return !running_; });
     }
 }
 
