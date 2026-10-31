@@ -1602,7 +1602,12 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
 
                 CURLcode head_res = curl_easy_perform(head_curl);
 
+                long head_status = 0;
                 if (head_res == CURLE_OK) {
+                    curl_easy_getinfo(head_curl, CURLINFO_RESPONSE_CODE, &head_status);
+                }
+                // CURLE_OK covers any HTTP status; an error page's length proves nothing.
+                if (head_res == CURLE_OK && head_status >= 200 && head_status < 300) {
                     curl_off_t remote_size = 0;
                     curl_easy_getinfo(head_curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &remote_size);
 

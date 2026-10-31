@@ -144,16 +144,14 @@ std::vector<FilesystemRequirement> plan_filesystem_requirements(const DownloadPl
         if (safe_exists(output_path_fs) && !safe_exists(partial_path_fs)) {
             bytes_needed = 0;
         } else if (safe_exists(partial_path_fs)) {
-            // Cap credit to the manifest size: a partial cannot save more than
-            // the file costs, and a manifest can carry size=0 entries while
-            // partials exist.
-            std::error_code ec;
-            std::uintmax_t partial_size = fs::file_size(partial_path_fs, ec);
-            if (!ec) {
-                const std::uint64_t credited =
-                    (std::min)(static_cast<std::uint64_t>(partial_size), file.size);
-                bytes_needed = file.size > credited ? file.size - credited : 0;
-            }
+            // Credit only what a resume keeps (a parallel partial is cut back
+            // to its journaled prefix), capped at the manifest size: a partial
+            // cannot save more than the file costs, and a manifest can carry
+            // size=0 entries while partials exist.
+            const std::uint64_t kept =
+                static_cast<std::uint64_t>(HttpClient::resumable_partial_bytes(output_path));
+            const std::uint64_t credited = (std::min)(kept, file.size);
+            bytes_needed = file.size > credited ? file.size - credited : 0;
         }
 
         if (bytes_needed > 0) {

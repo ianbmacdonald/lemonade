@@ -209,6 +209,20 @@ int main() {
         }
         res.set_content(payload, "application/octet-stream");
     });
+    // Every resume is refused with 416, and HEAD answers 404 with a body the
+    // size of the partial: an error page whose length happens to match.
+    server.Get("/head404.bin", [&](const httplib::Request& req, httplib::Response& res) {
+        log.add(req);
+        if (req.method == "HEAD") {
+            res.status = 404;
+            res.set_content(small, "text/plain");
+        } else if (!req.get_header_value("Range").empty()) {
+            res.status = 416;
+            res.set_content("", "text/plain");
+        } else {
+            res.set_content(small, "application/octet-stream");
+        }
+    });
     // Upper-half ranges are refused with 416, as by an inconsistent CDN edge.
     server.Get("/reject416.bin", [&](const httplib::Request& req, httplib::Response& res) {
         log.add(req);
@@ -635,6 +649,19 @@ int main() {
         log.take();
         r.check(!result.success || read_all(f) == small,
                 "a partial longer than the remote file is never accepted as complete");
+    }
+
+    {
+        const fs::path f = dir / "head404.bin";
+        const std::string garbage(small.size(), 'x');
+        write_all(partial_of(f), garbage);
+        auto options = parallel_options();
+        options.allow_parallel = false;
+        auto result = HttpClient::download_file(base + "/head404.bin", f.string(), nullptr, {},
+                                                options, policy);
+        log.take();
+        r.check(!(result.success && read_all(f) == garbage),
+                "a 404 HEAD whose length matches the partial does not complete the download");
     }
 
     server.stop();

@@ -153,6 +153,14 @@ static void test_space_accounting() {
     write_file(dir / "missing.bin.partial", std::string(400, 'x'));
     check_num("a partial is credited", total_needed(plan_filesystem_requirements(one)), 600);
 
+    // A parallel partial is cut back to its journaled prefix on resume, so
+    // only the prefix is credited.
+    write_file(dir / "missing.bin.partial", std::string(800, 'x'));
+    write_file(dir / "missing.bin.partial.ranges", "200\n");
+    check_num("a parallel partial is credited its journaled prefix",
+              total_needed(plan_filesystem_requirements(one)), 800);
+    fs::remove(dir / "missing.bin.partial.ranges");
+
     // Credit is capped at the manifest size, never negative.
     write_file(dir / "missing.bin.partial", std::string(1500, 'x'));
     check_num("credit is capped at the file size", total_needed(plan_filesystem_requirements(one)),
