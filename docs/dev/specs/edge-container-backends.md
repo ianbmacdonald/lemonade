@@ -66,7 +66,7 @@ Each backend's `ContainerPolicy` is:
 | `devices` | `{}` |
 | `cap_add` | `{}` |
 
-Each image is `FROM scratch` with the engine's musl build and its shared libraries, built from the engine's own repository by that repository's CI, for `linux/amd64` and `linux/arm64`, and pinned in `backend_versions.json` as `<tag>@<digest>`.
+Each image is `FROM scratch` with the engine's musl build and its shared libraries, built from the engine's own repository by that repository's CI, for `linux/amd64` and `linux/arm64`, and pinned in `backend_versions.json` as `<tag>@<digest>`. The image sets an absolute `Entrypoint`, so the engine runs as PID 1 with no shell or init, and ships empty `/proc`, `/sys`, `/dev`, `/tmp`, `/run` and `/etc` directories as mountpoints.
 
 ## Changes to the Container Backends Spec
 
@@ -102,6 +102,7 @@ These engine changes are required before the images ship, one release per engine
 3. Accept `labels` on `POST /classify`. `ort-server` gains this in lemonade-sdk/ort-server#4, which #3952 waits on; the musl `ort-server` build rebases onto that release, and `tflite-server` and `et-server` port it.
 4. Add `POST /systemone` to all three engines, for models carrying the `systemone` label.
 5. Build each engine with its framework's full default operator set. The curated operator sets on the Netstatz fork refuse zero-shot models such as GLiClass.
+6. Exit cleanly on `SIGTERM`. The engine is PID 1 in its container, and both Podman and LCM send `SIGTERM`, wait 10 seconds, then send `SIGKILL`, so an engine without a handler adds 10 seconds to every unload.
 
 ## Build Provenance
 
@@ -168,7 +169,7 @@ This section lists the configuration changes a gateway needs. Each is a separate
 
 This section explains how the container format maps onto prplOS. It is context for the reviewers; the beta adds nothing for it.
 
-prplOS installs and runs containers through LCM. An install request (`SoftwareModules.InstallDU` in the TR-181 data model) pulls an OCI image (the `Rlyeh` component), and `Cthulhu` runs it as an LXC container on an LCM bridge. Netstatz has deployed an application container this way on a prplWare v5 x86_64 gateway.
+prplOS installs and runs containers through LCM. An install request (`SoftwareModules.InstallDU` in the TR-181 data model) pulls an OCI image (the `Rlyeh` component), and `Cthulhu` runs it as an LXC container on an LCM bridge. Netstatz has deployed a privileged application container this way on a prplWare v5 x86_64 gateway; an unprivileged container has not been tested.
 
 | Container Backends Spec concept | prplOS LCM counterpart |
 | --- | --- |
@@ -176,13 +177,14 @@ prplOS installs and runs containers through LCM. An install request (`SoftwareMo
 | `ContainerManager` runs `podman run` or `docker run` | A container tool that starts and stops an installed unit through the LCM data model |
 | `--env` for engine settings | `InstallDU` `EnvVariable` |
 | Private network per container | An LCM bridge |
-| Models mounted read-only | Not yet mapped |
+| Models mounted read-only | An `InstallDU` `HostObject` bind of the model store directory, read-only by default. The bind is fixed at install, so the whole store is bound once and the engine selects the model by argument, rather than one mount per file |
+| `--cap-drop=all`, `no-new-privileges` | `Privileged:false`, Cthulhu's seccomp profile and the sandbox's run user |
 
-One known LCM limit: `InstallDU` takes no CA file, and Rlyeh's libcurl has no default CA store, so a fresh install cannot pull an image over TLS (fault 7002). Netstatz's deployment pre-pulled the image with a CA file.
+Two LCM limits affect the images. Rlyeh requests single-image manifests and never an index, so an LCM install pins each architecture's manifest digest rather than the multi-arch index digest. And a pull fails with fault 7002 when `SoftwareModules.Config.CABundle` names the stock CA bundle, whose directory URI lacks the trailing slash Rlyeh requires; left empty (the prplWare v5.2 default), libcurl uses its compiled-in CA bundle, which covers public registries such as `ghcr.io`.
 
 A prpl LCM container tool in `ContainerManager` is a follow-up RFC, written once Netstatz has run it on its fork. The beta's images are the same images prplOS would install, so the engine work is shared.
 
-Each image is `FROM scratch` with the engine's musl build, so one build per architecture serves three paths: the native package prplOS installs today, a container under Podman or Docker on any Linux host, and a container under LCM. `lemond` itself stays native on prplOS; its aarch64 musl build is released on the Netstatz fork. Not yet verified: a `scratch` musl engine image running under LCM on an aarch64 prplOS gateway.
+Each image is `FROM scratch` with the engine's musl build, so one build per architecture serves three paths: the native package prplOS installs today, a container under Podman or Docker on any Linux host, and a container under LCM. `lemond` itself stays native on prplOS; its aarch64 musl build is released on the Netstatz fork. Not yet verified: a `scratch` musl engine image running under LCM on any prplOS gateway, and how `lemond` reaches the container's address on the LCM bridge.
 
 ## Breaking Changes
 
