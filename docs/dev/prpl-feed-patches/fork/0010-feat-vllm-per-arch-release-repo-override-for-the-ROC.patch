@@ -1,7 +1,7 @@
-From b6f24a2449cccc450ecf215e9af3036482a743f9 Mon Sep 17 00:00:00 2001
+From 27979d50196ebe9ad306a0a2a799f6c5237cc22e Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 27 Sep 2026 13:04:13 -0400
-Subject: [PATCH 10/71] feat(vllm): per-arch release repo override for the ROCm
+Subject: [PATCH 10/77] feat(vllm): per-arch release repo override for the ROCm
  backend
 
 backend_versions.json vllm.rocm_arch_repos maps an asset family to the GitHub

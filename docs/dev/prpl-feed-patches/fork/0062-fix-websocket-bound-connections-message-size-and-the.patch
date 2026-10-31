@@ -1,7 +1,7 @@
-From 058d299b4d319b81f2e92a4cc74c49fa16e0eb77 Mon Sep 17 00:00:00 2001
+From 21c7f9be2baf856046ffb1d521de0ce97f03ccc8 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 14:59:52 -0400
-Subject: [PATCH 62/71] fix(websocket): bound connections, message size and the
+Subject: [PATCH 62/77] fix(websocket): bound connections, message size and the
  spans auth wait
 
 An upgrade hands its socket to the WebSocket server, which released the

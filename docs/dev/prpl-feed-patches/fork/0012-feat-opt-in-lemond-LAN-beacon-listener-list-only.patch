@@ -1,7 +1,7 @@
-From 4a88d24a0a180d957ba29acdc21765ea9e5a1c8f Mon Sep 17 00:00:00 2001
+From 2721ca8ad064d33f40ab6ab48ac5af4f7f0bcf52 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:36:32 -0400
-Subject: [PATCH 12/71] feat: opt-in lemond LAN beacon listener, list-only
+Subject: [PATCH 12/77] feat: opt-in lemond LAN beacon listener, list-only
 
 Add a beacon_listen config key (default false). When enabled, lemond binds
 UDP 13305 on each local RFC1918 interface's directed-broadcast address plus

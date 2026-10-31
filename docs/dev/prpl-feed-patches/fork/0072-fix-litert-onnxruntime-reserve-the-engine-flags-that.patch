@@ -1,0 +1,181 @@
+From ab73c61a4c038251576ca6d0883e9ec443520633 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 17:55:12 -0400
+Subject: [PATCH 72/77] fix(litert,onnxruntime): reserve the engine flags that
+ bind or write files
+
+litert_args and onnxruntime_args come from the /load request body.
+litert-lm-server takes --cache-dir, which sets where it writes the XNNPACK
+weight cache, and ort-server takes --host, which would publish the engine
+on the LAN without lemond's API key. Both are now refused, through a
+reserved_custom_arg_flags() in each descriptor header as tflite and
+executorch already do, and EngineReservedArgsTest covers all four engines.
+
+Assisted-by: claude:opus-5.5
+---
+ .../include/lemon/backends/litert/litert.h    | 14 +++++++++++
+ .../lemon/backends/onnxruntime/onnxruntime.h  | 11 +++++++++
+ .../server/backends/litert/litert_server.cpp  |  7 +-----
+ .../onnxruntime/onnxruntime_server.cpp        |  5 ++--
+ test/cpp/test_engine_reserved_args.cpp        | 24 +++++++++++++------
+ 5 files changed, 45 insertions(+), 16 deletions(-)
+
+diff --git a/src/cpp/include/lemon/backends/litert/litert.h b/src/cpp/include/lemon/backends/litert/litert.h
+index f228cf35c..cff7e611b 100644
+--- a/src/cpp/include/lemon/backends/litert/litert.h
++++ b/src/cpp/include/lemon/backends/litert/litert.h
+@@ -2,10 +2,24 @@
+ 
+ #include "lemon/backends/backend_descriptor.h"
+ 
++#include <set>
++#include <string>
++
+ namespace lemon {
+ namespace backends {
+ namespace litert {
+ 
++// Arguments litert_args must not carry. litert_args comes from the /load
++// request body: --host would publish the engine on the LAN without lemond's
++// API key, and --cache-dir would make the engine write its weight cache at a
++// path the caller chooses.
++inline const std::set<std::string>& reserved_custom_arg_flags() {
++    static const std::set<std::string> flags = {
++        "--model", "--port", "--host", "--cache-dir",
++    };
++    return flags;
++}
++
+ // The LiteRT backend descriptor (plain data). Header-only `inline const` so it
+ // links into both the lemonade CLI and lemond without a separate source file.
+ // Runs Google's LiteRT-LM runtime as a litert-lm-server subprocess serving an
+diff --git a/src/cpp/include/lemon/backends/onnxruntime/onnxruntime.h b/src/cpp/include/lemon/backends/onnxruntime/onnxruntime.h
+index fbd21dcac..e0c196247 100644
+--- a/src/cpp/include/lemon/backends/onnxruntime/onnxruntime.h
++++ b/src/cpp/include/lemon/backends/onnxruntime/onnxruntime.h
+@@ -2,10 +2,21 @@
+ 
+ #include "lemon/backends/backend_descriptor.h"
+ 
++#include <set>
++#include <string>
++
+ namespace lemon {
+ namespace backends {
+ namespace onnxruntime {
+ 
++// Arguments onnxruntime_args must not carry. onnxruntime_args comes from the
++// /load request body, and --host would publish the engine on the LAN without
++// lemond's API key.
++inline const std::set<std::string>& reserved_custom_arg_flags() {
++    static const std::set<std::string> flags = {"--model-path", "--port", "--host"};
++    return flags;
++}
++
+ // The ONNX Runtime backend descriptor (plain data). A generic ORT model server
+ // (see lemonade-sdk/ort-server); v1 serves text classification for the router's
+ // `classifier` condition type (issue #2592) on the CPU EP. The subprocess is a
+diff --git a/src/cpp/server/backends/litert/litert_server.cpp b/src/cpp/server/backends/litert/litert_server.cpp
+index d61ba8934..301b07f65 100644
+--- a/src/cpp/server/backends/litert/litert_server.cpp
++++ b/src/cpp/server/backends/litert/litert_server.cpp
+@@ -12,7 +12,6 @@
+ #include <algorithm>
+ #include <filesystem>
+ #include <optional>
+-#include <set>
+ #include <string>
+ #include <vector>
+ #include <lemon/utils/aixlog.hpp>
+@@ -88,12 +87,8 @@ void LiteRtServer::load(const std::string& model_name,
+         "--port", std::to_string(port_),
+     };
+ 
+-    // --host is reserved: litert-lm-server binds loopback by design (it is
+-    // reached only by this in-process forwarder), and a recipe must not be able
+-    // to widen that to the gateway LAN.
+-    std::set<std::string> reserved_flags = {"--model", "--port", "--host"};
+     if (!extra_args.empty()) {
+-        std::string validation_error = validate_custom_args(extra_args, reserved_flags);
++        std::string validation_error = validate_custom_args(extra_args, litert::reserved_custom_arg_flags());
+         if (!validation_error.empty()) {
+             throw std::invalid_argument("Invalid custom litert-lm-server arguments:\n" + validation_error);
+         }
+diff --git a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+index 05f043021..e47f447e4 100644
+--- a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
++++ b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+@@ -13,7 +13,6 @@
+ #include "lemon/utils/process_manager.h"
+ #include <algorithm>
+ #include <filesystem>
+-#include <set>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+@@ -201,9 +200,9 @@ void OnnxRuntimeServer::load(const std::string& model_name,
+         "--port", std::to_string(port_),
+     };
+ 
+-    std::set<std::string> reserved_flags = {"--model-path", "--port"};
+     if (!extra_args.empty()) {
+-        std::string validation_error = validate_custom_args(extra_args, reserved_flags);
++        std::string validation_error =
++            validate_custom_args(extra_args, onnxruntime::reserved_custom_arg_flags());
+         if (!validation_error.empty()) {
+             throw std::invalid_argument("Invalid custom ort-server arguments:\n" + validation_error);
+         }
+diff --git a/test/cpp/test_engine_reserved_args.cpp b/test/cpp/test_engine_reserved_args.cpp
+index 580ca4e33..d326bc8e0 100644
+--- a/test/cpp/test_engine_reserved_args.cpp
++++ b/test/cpp/test_engine_reserved_args.cpp
+@@ -1,8 +1,11 @@
++#include <initializer_list>
+ #include <iostream>
+ #include <set>
+ #include <string>
+ 
+ #include "lemon/backends/executorch/executorch.h"
++#include "lemon/backends/litert/litert.h"
++#include "lemon/backends/onnxruntime/onnxruntime.h"
+ #include "lemon/backends/tflite/tflite.h"
+ #include "lemon/utils/custom_args.h"
+ 
+@@ -19,11 +22,12 @@ void expect(bool condition, const std::string& label) {
+     }
+ }
+ 
+-// tflite_args and executorch_args come from the /load request body, so every
+-// flag that moves the engine's bind address, port, model or files it writes
+-// must be refused in both spellings.
+-void check_engine(const std::string& name, const std::set<std::string>& reserved) {
+-    for (const char* flag : {"--model-path", "--port", "--host", "--weight-cache"}) {
++// The engine *_args come from the /load request body, so every flag that moves
++// the engine's bind address, port, model or files it writes must be refused in
++// both spellings.
++void check_engine(const std::string& name, const std::set<std::string>& reserved,
++                  std::initializer_list<const char*> must_refuse) {
++    for (const char* flag : must_refuse) {
+         expect(!lemon::utils::validate_custom_args(std::string(flag) + " x", reserved).empty(),
+                name + " rejects " + flag);
+         expect(!lemon::utils::validate_custom_args(std::string(flag) + "=x", reserved).empty(),
+@@ -38,8 +42,14 @@ void check_engine(const std::string& name, const std::set<std::string>& reserved
+ }  // namespace
+ 
+ int main() {
+-    check_engine("tflite", lemon::backends::tflite::reserved_custom_arg_flags());
+-    check_engine("executorch", lemon::backends::executorch::reserved_custom_arg_flags());
++    check_engine("tflite", lemon::backends::tflite::reserved_custom_arg_flags(),
++                 {"--model-path", "--port", "--host", "--weight-cache"});
++    check_engine("executorch", lemon::backends::executorch::reserved_custom_arg_flags(),
++                 {"--model-path", "--port", "--host", "--weight-cache"});
++    check_engine("litert", lemon::backends::litert::reserved_custom_arg_flags(),
++                 {"--model", "--port", "--host", "--cache-dir"});
++    check_engine("onnxruntime", lemon::backends::onnxruntime::reserved_custom_arg_flags(),
++                 {"--model-path", "--port", "--host"});
+ 
+     if (failures == 0) {
+         std::cout << "All engine reserved-argument tests passed" << std::endl;
+-- 
+2.53.0
+

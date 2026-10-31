@@ -7,7 +7,7 @@ on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 71 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0071). |
+| Series: `fork/` | 77 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0077). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -60,11 +60,10 @@ generic build fixes that musl just happens to exercise:
 | 0047-0050 | gateway limits: body limit, receive deadline, per-client cap (B179) |
 | 0051 | `/pull` `revision` pinning (B174), ported from 22 commits as one |
 | 0052-0058 | port to upstream's ServerProcess API, build fixes, regenerated docs, shutdown fix, test allowlists |
+| 0059-0076 | fixes from the branch's review rounds |
+| 0077 | route spec fixes and the regenerated API reference |
 
 ## Not carried
 
 - The fork's change to the old Electron renderer `src/app/src/renderer/utils/modelLabels.ts`
   (an `image-classification` label): upstream deleted that file in the GUI3 rewrite.
-- Generated API reference regions in `docs/api/*.md` for the fork routes are not
-  regenerated: `gen_api_boilerplate.py` records live responses and needs real models
-  for the new examples. The fork routes' docs live in their `RouteSpec`s.

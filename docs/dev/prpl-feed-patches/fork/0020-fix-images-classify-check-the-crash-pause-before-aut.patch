@@ -1,7 +1,7 @@
-From da4f265944f0b3b4c8ff431921b2703e13340a9c Mon Sep 17 00:00:00 2001
+From 84ed7b8b4e49451a8e328f1f8e31786ae29eba49 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:43:46 -0400
-Subject: [PATCH 20/71] fix(images/classify): check the crash pause before
+Subject: [PATCH 20/77] fix(images/classify): check the crash pause before
  auto-loading the model
 
 A named model whose backend had crashed was reloaded by

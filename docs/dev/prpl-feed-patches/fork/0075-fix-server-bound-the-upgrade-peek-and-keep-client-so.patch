@@ -1,0 +1,217 @@
+From 68930d73f95f947ba935bf7dab1fc6e064c8d759 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 18:11:29 -0400
+Subject: [PATCH 75/77] fix(server): bound the upgrade peek and keep client
+ sockets out of children
+
+The front server peeks every accepted connection for a WebSocket upgrade
+before httplib sees it. The first recv had no timeout and nothing sets
+SO_RCVTIMEO on accepted sockets, so with request_receive_timeout off (the
+default) each peer that connects and sends nothing held a worker forever,
+and enough of them blocked every HTTP endpoint. Each of the peek's 50
+attempts now waits at most 10 ms for data; a peer that sends nothing in
+that time goes to httplib, whose read timeout applies.
+
+Accepted sockets, the connection guard's watch duplicate and the beacon
+socket were inheritable, so every backend forked while a connection was
+open kept that connection alive after lemond closed it. All three are now
+close-on-exec. httplib still accepts without SOCK_CLOEXEC, so a fork that
+lands between accept and the start of the worker can still inherit one.
+
+Assisted-by: claude:opus-5.5
+---
+ .../include/lemon/upgradable_http_server.h    | 29 +++++++++
+ src/cpp/server/connection_guard.cpp           |  4 +-
+ src/cpp/server/utils/beacon_listener.cpp      |  2 +
+ test/cpp/test_connection_guard.cpp            | 65 +++++++++++++++++++
+ 4 files changed, 99 insertions(+), 1 deletion(-)
+
+diff --git a/src/cpp/include/lemon/upgradable_http_server.h b/src/cpp/include/lemon/upgradable_http_server.h
+index e458cebca..17ce3421c 100644
+--- a/src/cpp/include/lemon/upgradable_http_server.h
++++ b/src/cpp/include/lemon/upgradable_http_server.h
+@@ -40,6 +40,12 @@
+ #include <utility>
+ #include <vector>
+ 
++#ifndef _WIN32
++#include <cerrno>
++#include <fcntl.h>
++#include <poll.h>
++#endif
++
+ #include "lemon/connection_guard.h"
+ #include "lemon/utils/aixlog.hpp"
+ #include "lemon/utils/network_utils.h"
+@@ -124,6 +130,24 @@ httplib::TaskQueue* new_bounded_thread_pool(size_t threads, size_t max_queued) {
+ inline bool peek_websocket_upgrade(socket_t sock) {
+     char buf[4096];
+     for (int attempt = 0; attempt < 50; ++attempt) {  // up to ~500 ms for headers
++        // The socket is blocking and nothing has set a receive timeout yet, so
++        // a recv on a silent peer would hold this worker forever.
++#ifdef _WIN32
++        WSAPOLLFD pfd{sock, POLLRDNORM, 0};
++        const int ready = ::WSAPoll(&pfd, 1, 10);
++#else
++        pollfd pfd{sock, POLLIN, 0};
++        const int ready = ::poll(&pfd, 1, 10);
++        if (ready < 0 && errno == EINTR) {
++            continue;
++        }
++#endif
++        if (ready < 0) {
++            return false;
++        }
++        if (ready == 0) {
++            continue;
++        }
+ #ifdef _WIN32
+         int n = ::recv(sock, buf, static_cast<int>(sizeof(buf)), MSG_PEEK);
+ #else
+@@ -197,6 +221,11 @@ public:
+ 
+ private:
+     bool process_and_close_socket(socket_t sock) override {
++#ifndef _WIN32
++        // httplib accepts without SOCK_CLOEXEC; a backend forked while this
++        // connection is open would otherwise keep it open after lemond closes it.
++        ::fcntl(sock, F_SETFD, FD_CLOEXEC);
++#endif
+         ConnectionGuard::Ticket ticket;
+         if (guard_) {
+             const std::string client = ConnectionGuard::peer_address(sock);
+diff --git a/src/cpp/server/connection_guard.cpp b/src/cpp/server/connection_guard.cpp
+index 59f213807..6b8879981 100644
+--- a/src/cpp/server/connection_guard.cpp
++++ b/src/cpp/server/connection_guard.cpp
+@@ -9,6 +9,7 @@
+ #include <ws2tcpip.h>
+ #else
+ #include <arpa/inet.h>
++#include <fcntl.h>
+ #include <netinet/in.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+@@ -34,7 +35,8 @@ socket_t duplicate_socket(socket_t sock) {
+     (void)sock;
+     return kInvalidSocket;
+ #else
+-    return ::dup(sock);
++    // Close-on-exec, or every backend launched later keeps the client connection open.
++    return ::fcntl(sock, F_DUPFD_CLOEXEC, 0);
+ #endif
+ }
+ 
+diff --git a/src/cpp/server/utils/beacon_listener.cpp b/src/cpp/server/utils/beacon_listener.cpp
+index 74620e0d6..a639182f0 100644
+--- a/src/cpp/server/utils/beacon_listener.cpp
++++ b/src/cpp/server/utils/beacon_listener.cpp
+@@ -13,6 +13,7 @@
+ 
+ #ifndef _WIN32
+     #include <arpa/inet.h>
++    #include <fcntl.h>
+     #include <net/if.h>
+     #include <netinet/in.h>
+     #include <poll.h>
+@@ -953,6 +954,7 @@ void BeaconListener::refresh_sockets() {
+             existing->error = std::string("socket: ") + std::strerror(errno);
+             continue;
+         }
++        fcntl(fd, F_SETFD, FD_CLOEXEC);
+         int one = 1;
+         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+ #ifdef IP_PKTINFO
+diff --git a/test/cpp/test_connection_guard.cpp b/test/cpp/test_connection_guard.cpp
+index 9c4ef4698..916776cd3 100644
+--- a/test/cpp/test_connection_guard.cpp
++++ b/test/cpp/test_connection_guard.cpp
+@@ -2,6 +2,7 @@
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstdio>
++#include <cstring>
+ #include <memory>
+ #include <mutex>
+ #include <string>
+@@ -204,6 +205,66 @@ static void test_untrackable_fails_closed() {
+     ::close(fds[0]);
+     ::close(fds[1]);
+ }
++
++#ifdef __linux__
++static int inheritable_descriptors() {
++    int n = 0;
++    for (int fd = 0; fd < 1024; ++fd) {
++        const int flags = ::fcntl(fd, F_GETFD);
++        if (flags >= 0 && !(flags & FD_CLOEXEC)) {
++            ++n;
++        }
++    }
++    return n;
++}
++
++static void test_watch_socket_is_close_on_exec() {
++    ConnectionGuard::Limits limits;
++    limits.receive_timeout = 30s;
++    ConnectionGuard guard(limits);
++    int fds[2];
++    check(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0, "socketpair");
++    const int before = inheritable_descriptors();
++    {
++        ConnectionGuard::Ticket t;
++        check(admitted(guard.admit(fds[0], "192.0.2.5", t)), "connection admitted");
++        check(inheritable_descriptors() == before,
++              "the watchdog's duplicate is not inherited by child processes");
++    }
++    ::close(fds[0]);
++    ::close(fds[1]);
++}
++#endif
++
++// A peer that connects and sends nothing, or stops mid-headers, must not hold
++// the worker: the peek gives up and leaves the socket to httplib's timeouts.
++static void check_peek_returns(const char* sent, const char* label) {
++    int fds[2];
++    check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
++    if (*sent) {
++        check(::send(fds[1], sent, std::strlen(sent), 0) > 0, "send partial request");
++    }
++    auto done = std::make_shared<std::atomic<bool>>(false);
++    std::thread peek([fd = fds[0], done] {
++        lemon::detail::peek_websocket_upgrade(fd);
++        *done = true;
++    });
++    const auto t0 = std::chrono::steady_clock::now();
++    while (!*done && std::chrono::steady_clock::now() - t0 < 3s) {
++        std::this_thread::sleep_for(10ms);
++    }
++    check(*done, label);
++    ::shutdown(fds[0], SHUT_RDWR);
++    peek.join();
++    ::close(fds[0]);
++    ::close(fds[1]);
++}
++
++static void test_peek_is_bounded() {
++    check_peek_returns("", "the upgrade peek returns for a silent peer");
++    check_peek_returns("GET /realtime HTTP/1.1\r\nHost: x\r\n",
++                       "the upgrade peek returns for headers that never finish");
++}
+ #endif
+ 
+ int main() {
+@@ -216,6 +277,10 @@ int main() {
+     test_watchdog_shuts_down_socket();
+     test_received_request_is_not_shut_down();
+     test_untrackable_fails_closed();
++    test_peek_is_bounded();
++#ifdef __linux__
++    test_watch_socket_is_close_on_exec();
++#endif
+ #endif
+     return report_results("connection guard");
+ }
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
-From 4704d36e2a76be36ec8a89dc37a715c8187885d1 Mon Sep 17 00:00:00 2001
+From addfa00fed2d82bd5d0980361956f9d1c133ddd3 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:00:34 -0400
-Subject: [PATCH 66/71] fix(models): serialize writes to repository provenance
+Subject: [PATCH 66/77] fix(models): serialize writes to repository provenance
  files
 
 Pulls of different models hold different repository locks but can record

@@ -1,7 +1,7 @@
-From b150916e87918612b7e2ecd7418eb7b765787bf2 Mon Sep 17 00:00:00 2001
+From ef680f9723894b3a672859f9d5db9a4acdeb8827 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:00:10 -0400
-Subject: [PATCH 65/71] fix(config): refuse mistyped gateway limits in
+Subject: [PATCH 65/77] fix(config): refuse mistyped gateway limits in
  config.json
 
 A request_receive_timeout, max_connections_per_client or

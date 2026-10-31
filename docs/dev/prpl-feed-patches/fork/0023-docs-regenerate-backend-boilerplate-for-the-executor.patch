@@ -1,7 +1,7 @@
-From ad87c8e9db6822abcb36fdaa64aed2c4b0419546 Mon Sep 17 00:00:00 2001
+From 6b114c616f9b15a09a3445f732afad04b450bc31 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:27:52 -0400
-Subject: [PATCH 23/71] docs: regenerate backend boilerplate for the executorch
+Subject: [PATCH 23/77] docs: regenerate backend boilerplate for the executorch
  recipe
 
 Assisted-by: claude:opus-5.5

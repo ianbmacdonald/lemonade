@@ -1,7 +1,7 @@
-From d1ad7a2f6f6f09cbab345c30482cc1bbe4111e1a Mon Sep 17 00:00:00 2001
+From a3a9a5d66aab07084d093d29beb787953de39483 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 18:58:39 -0400
-Subject: [PATCH 42/71] test(beacon): fail closed on an unknown arrival
+Subject: [PATCH 42/77] test(beacon): fail closed on an unknown arrival
  interface and report unmatched allow-list entries
 
 Factors the arrival-interface decision into beacon_arrival_accepted() with

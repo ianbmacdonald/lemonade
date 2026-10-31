@@ -1,7 +1,7 @@
-From c052ae7a8f343fc947330136c834811f506072d4 Mon Sep 17 00:00:00 2001
+From cde6ae000584d2ee15ba4d271e03de386f3b4c06 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 03:26:41 -0400
-Subject: [PATCH 58/71] test: let the beacon socket test spawn ip(8); keep
+Subject: [PATCH 58/77] test: let the beacon socket test spawn ip(8); keep
  partial-file names out of http_client.h
 
 Assisted-by: claude:opus-5.5

@@ -1,7 +1,7 @@
-From a36deffc3db7243dd7e049fb251550a6f80b41e4 Mon Sep 17 00:00:00 2001
+From 0bf47f443f766dac08e7a96b17c87abf797de885 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Thu, 23 Jul 2026 09:01:29 -0400
-Subject: [PATCH 02/71] fix(litert): reserve --host so a recipe cannot widen
+Subject: [PATCH 02/77] fix(litert): reserve --host so a recipe cannot widen
  the backend bind
 
 The litert-lm-server binds loopback by design (reached only by the

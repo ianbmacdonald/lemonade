@@ -1,0 +1,137 @@
+From 2e3074a8a2f4bcbc202bb4eaa2814d2e88817358 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 18:11:29 -0400
+Subject: [PATCH 76/77] fix(download): trust only a 2xx HEAD on 416, credit
+ only the resumable prefix
+
+A resume answered 416 is checked with a HEAD whose Content-Length must
+equal the partial. The HEAD's status was never read, so an error page of
+the right length marked the partial complete, and without a digest it was
+published. Only a 2xx HEAD is trusted now.
+
+The disk pre-flight credited the raw size of a .partial, while a resumed
+parallel download cuts it back to the journaled prefix first, so the check
+could pass and the pull then fill the disk. It now credits the same
+resumable_partial_bytes() the progress accounting uses.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/models/artifact_transfer.cpp | 18 ++++++--------
+ src/cpp/server/utils/http_client.cpp        |  5 ++++
+ test/cpp/test_download_plan.cpp             |  8 ++++++
+ test/cpp/test_parallel_download.cpp         | 27 +++++++++++++++++++++
+ 4 files changed, 48 insertions(+), 10 deletions(-)
+
+diff --git a/src/cpp/server/models/artifact_transfer.cpp b/src/cpp/server/models/artifact_transfer.cpp
+index b5043433e..8175f26ca 100644
+--- a/src/cpp/server/models/artifact_transfer.cpp
++++ b/src/cpp/server/models/artifact_transfer.cpp
+@@ -144,16 +144,14 @@ std::vector<FilesystemRequirement> plan_filesystem_requirements(const DownloadPl
+         if (safe_exists(output_path_fs) && !safe_exists(partial_path_fs)) {
+             bytes_needed = 0;
+         } else if (safe_exists(partial_path_fs)) {
+-            // Cap credit to the manifest size: a partial cannot save more than
+-            // the file costs, and a manifest can carry size=0 entries while
+-            // partials exist.
+-            std::error_code ec;
+-            std::uintmax_t partial_size = fs::file_size(partial_path_fs, ec);
+-            if (!ec) {
+-                const std::uint64_t credited =
+-                    (std::min)(static_cast<std::uint64_t>(partial_size), file.size);
+-                bytes_needed = file.size > credited ? file.size - credited : 0;
+-            }
++            // Credit only what a resume keeps (a parallel partial is cut back
++            // to its journaled prefix), capped at the manifest size: a partial
++            // cannot save more than the file costs, and a manifest can carry
++            // size=0 entries while partials exist.
++            const std::uint64_t kept =
++                static_cast<std::uint64_t>(HttpClient::resumable_partial_bytes(output_path));
++            const std::uint64_t credited = (std::min)(kept, file.size);
++            bytes_needed = file.size > credited ? file.size - credited : 0;
+         }
+ 
+         if (bytes_needed > 0) {
+diff --git a/src/cpp/server/utils/http_client.cpp b/src/cpp/server/utils/http_client.cpp
+index fe070a401..d2847d6b2 100644
+--- a/src/cpp/server/utils/http_client.cpp
++++ b/src/cpp/server/utils/http_client.cpp
+@@ -1602,7 +1602,12 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
+ 
+                 CURLcode head_res = curl_easy_perform(head_curl);
+ 
++                long head_status = 0;
+                 if (head_res == CURLE_OK) {
++                    curl_easy_getinfo(head_curl, CURLINFO_RESPONSE_CODE, &head_status);
++                }
++                // CURLE_OK covers any HTTP status; an error page's length proves nothing.
++                if (head_res == CURLE_OK && head_status >= 200 && head_status < 300) {
+                     curl_off_t remote_size = 0;
+                     curl_easy_getinfo(head_curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &remote_size);
+ 
+diff --git a/test/cpp/test_download_plan.cpp b/test/cpp/test_download_plan.cpp
+index 9fdd8deee..9f8a3aba8 100644
+--- a/test/cpp/test_download_plan.cpp
++++ b/test/cpp/test_download_plan.cpp
+@@ -153,6 +153,14 @@ static void test_space_accounting() {
+     write_file(dir / "missing.bin.partial", std::string(400, 'x'));
+     check_num("a partial is credited", total_needed(plan_filesystem_requirements(one)), 600);
+ 
++    // A parallel partial is cut back to its journaled prefix on resume, so
++    // only the prefix is credited.
++    write_file(dir / "missing.bin.partial", std::string(800, 'x'));
++    write_file(dir / "missing.bin.partial.ranges", "200\n");
++    check_num("a parallel partial is credited its journaled prefix",
++              total_needed(plan_filesystem_requirements(one)), 800);
++    fs::remove(dir / "missing.bin.partial.ranges");
++
+     // Credit is capped at the manifest size, never negative.
+     write_file(dir / "missing.bin.partial", std::string(1500, 'x'));
+     check_num("credit is capped at the file size", total_needed(plan_filesystem_requirements(one)),
+diff --git a/test/cpp/test_parallel_download.cpp b/test/cpp/test_parallel_download.cpp
+index b3927b804..64fae028c 100644
+--- a/test/cpp/test_parallel_download.cpp
++++ b/test/cpp/test_parallel_download.cpp
+@@ -209,6 +209,20 @@ int main() {
+         }
+         res.set_content(payload, "application/octet-stream");
+     });
++    // Every resume is refused with 416, and HEAD answers 404 with a body the
++    // size of the partial: an error page whose length happens to match.
++    server.Get("/head404.bin", [&](const httplib::Request& req, httplib::Response& res) {
++        log.add(req);
++        if (req.method == "HEAD") {
++            res.status = 404;
++            res.set_content(small, "text/plain");
++        } else if (!req.get_header_value("Range").empty()) {
++            res.status = 416;
++            res.set_content("", "text/plain");
++        } else {
++            res.set_content(small, "application/octet-stream");
++        }
++    });
+     // Upper-half ranges are refused with 416, as by an inconsistent CDN edge.
+     server.Get("/reject416.bin", [&](const httplib::Request& req, httplib::Response& res) {
+         log.add(req);
+@@ -637,6 +651,19 @@ int main() {
+                 "a partial longer than the remote file is never accepted as complete");
+     }
+ 
++    {
++        const fs::path f = dir / "head404.bin";
++        const std::string garbage(small.size(), 'x');
++        write_all(partial_of(f), garbage);
++        auto options = parallel_options();
++        options.allow_parallel = false;
++        auto result = HttpClient::download_file(base + "/head404.bin", f.string(), nullptr, {},
++                                                options, policy);
++        log.take();
++        r.check(!(result.success && read_all(f) == garbage),
++                "a 404 HEAD whose length matches the partial does not complete the download");
++    }
++
+     server.stop();
+     server_thread.join();
+ 
+-- 
+2.53.0
+

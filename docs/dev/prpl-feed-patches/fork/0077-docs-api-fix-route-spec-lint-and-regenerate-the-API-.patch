@@ -1,0 +1,652 @@
+From b02d6356b56789e1a9a3e49162ffddb97d88e794 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 18:28:02 -0400
+Subject: [PATCH 77/77] docs(api): fix route spec lint and regenerate the API
+ reference
+
+gen_api_boilerplate.py --check failed on this branch: the API pages had
+not been regenerated since the pull revision, beacon, health memory,
+routing classify and images/classify changes, and several route specs
+broke its rules. Statuses named in descriptions and notes move to the
+errors tables, the classify, images/classify and routing/validate texts
+fit the length limits, images/classify reads its arguments through their
+RouteArg constants and gains a recorded example (MobileNetV2 on the image
+fixture), routing/validate stops listing missing_argument, which its base
+class no longer writes, and the generator's DISTINCT_ARGUMENTS and body
+rules match the routes as they are.
+
+Assisted-by: claude:opus-5.5
+---
+ docs/api/internal.md                          |  10 ++
+ docs/api/lemonade.md                          | 162 +++++++++++++++++-
+ docs/api/openai.md                            |   2 +
+ docs/api/router.md                            |  23 ++-
+ docs/tools/api_examples_cache.json            |  52 ++++++
+ docs/tools/gen_api_boilerplate.py             |   9 +-
+ .../routes/lemonade/inference/classify.cpp    |   7 +-
+ .../lemonade/inference/images_classify.cpp    |  26 +--
+ .../server/routes/lemonade/models/pull.cpp    |   4 +-
+ .../server/routes/router/routing_validate.cpp |   4 +-
+ 10 files changed, 270 insertions(+), 29 deletions(-)
+
+diff --git a/docs/api/internal.md b/docs/api/internal.md
+index def46ace0..1100d7e25 100644
+--- a/docs/api/internal.md
++++ b/docs/api/internal.md
+@@ -185,14 +185,19 @@ Requires `LEMONADE_ADMIN_API_KEY` when it is set, otherwise `LEMONADE_API_KEY` w
+ | `auto_evict` | No | Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `auto_evict_threshold_pct` | No | Defaults to `0.9`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `auto_update_models` | No | Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `beacon_listen` | No | Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `beacon_listen_interfaces` | No | Defaults to `[]`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `beacon_trusted_relays` | No | Defaults to `[]`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `broadcast` | No | Defaults to `true`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `config_version` | No | Defaults to `2`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `ctx_size` | No | Defaults to `-1`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `default_model_source` | No | Defaults to `"huggingface"`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `disable_model_filtering` | No | Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `download_connections` | No | Defaults to `8`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `download_rate_limit` | No | Defaults to `""`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `ds4` | No | `ds4` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `enable_dgpu_gtt` | No | Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `executorch` | No | `executorch` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `extra_models_dir` | No | Defaults to `""`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `flm` | No | `flm` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `global_timeout` | No | Defaults to `600`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+@@ -200,12 +205,15 @@ Requires `LEMONADE_ADMIN_API_KEY` when it is set, otherwise `LEMONADE_API_KEY` w
+ | `hrx` | No | `hrx` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `inhibit_suspend` | No | Defaults to `true`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `kokoro` | No | `kokoro` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `litert` | No | `litert` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `llamacpp` | No | `llamacpp` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `log_file` | No | Defaults to `"auto"`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `log_level` | No | Defaults to `"info"`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `log_max_file_size_mb` | No | Defaults to `10`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `log_max_files` | No | Defaults to `5`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `max_connections_per_client` | No | Defaults to `0`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `max_loaded_models` | No | Defaults to `1`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `max_request_body_mb` | No | Defaults to `100`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `model_catalogs` | No | Defaults to `[]`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `models_dir` | No | Defaults to `"auto"`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `moonshine` | No | `moonshine` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+@@ -214,11 +222,13 @@ Requires `LEMONADE_ADMIN_API_KEY` when it is set, otherwise `LEMONADE_API_KEY` w
+ | `onnxruntime` | No | `onnxruntime` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `openmoss` | No | `openmoss` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `port` | No | Defaults to `13305`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `request_receive_timeout` | No | Defaults to `0`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `rocm_channel` | No | Defaults to `"stable"`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `rocm_install_method` | No | Defaults to `"auto"`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `ryzenai` | No | `ryzenai` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `sdcpp` | No | `sdcpp` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `telemetry` | No | `telemetry` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `tflite` | No | `tflite` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `thenoise` | No | `thenoise` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `thinksound` | No | `thinksound` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `trellis` | No | `trellis` settings; send only the keys to change. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+diff --git a/docs/api/lemonade.md b/docs/api/lemonade.md
+index 24f54f177..34344bbe5 100644
+--- a/docs/api/lemonade.md
++++ b/docs/api/lemonade.md
+@@ -11,6 +11,7 @@ We have designed a set of Lemonade-specific endpoints to enable client applicati
+ | Method | Endpoint | Description |
+ |--------|----------|-------------|
+ | `POST` | [`/v1/classify`](#post-v1classify) | Score text against a classifier model's labels |
++| `POST` | [`/v1/images/classify`](#post-v1imagesclassify) | Classify an image |
+ | `POST` | [`/v1/models/check-updates`](#post-v1modelscheck-updates) | Manually check downloaded models for upstream updates |
+ | `POST` | [`/v1/models/register`](#post-v1modelsregister) | Register or update a user model definition without downloading it |
+ | `POST` | [`/v1/pull`](#post-v1pull) | Install a model |
+@@ -52,7 +53,7 @@ Some Lemonade endpoints live on other pages: the per-model [`/v1/models/{id}/fil
+ ## `POST /v1/classify`
+ <sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
+ 
+-Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on a string and returns a score for each label. It serves `onnxruntime` sequence classifiers (one label set), token classifiers (aggregated span labels) and zero-shot models (labels sent with each request). It provides the classification that the router's `classifier` and `zero_shot` conditions use.
++Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on a string and returns a score for each label. It serves `onnxruntime` sequence classifiers (one label set), token classifiers (aggregated span labels) and zero-shot models (labels sent with each request), and `tflite` text classifiers; image models are served by [`POST /v1/images/classify`](#post-v1imagesclassify). It provides the classification that the router's `classifier` and `zero_shot` conditions use.
+ 
+ Requires `LEMONADE_API_KEY` when it is set.
+ 
+@@ -130,6 +131,7 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
+ | `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `model` is omitted and not exactly one classification model is loaded |
++| `400` | `model_not_applicable` | `model` is an image-classification model, served by `POST /v1/images/classify` |
+ | `400` |  | The backend rejects the request, for example because `model` is not a classification model, which is found only after it loads, or because `labels` is sent to a fixed-label model or left out for a zero-shot one |
+ | `404` |  | The model is unloaded while the request waits for it |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+@@ -140,8 +142,123 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
+ | `500` |  | The backend's response lacks a field the route returns, such as `choices` or `labels` |
+ | `500` |  | The request fails unexpectedly |
+ | `500` | `model_load_error` | Loading the requested model fails for another reason, such as a failed download or a backend that does not start |
++| `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
++| `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
+ <!-- END GENERATED: lemonade.classify -->
+ 
++<!-- BEGIN GENERATED: lemonade.images_classify -->
++## `POST /v1/images/classify`
++<sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
++
++Classifies one image and returns the top-scoring labels. The model must be labeled `image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` (0.2.0 or newer) subprocess on the CPU. The request is either `multipart/form-data` (the same shape as `/v1/images/edits`) or `application/json`, and only JPEG and PNG are accepted, with EXIF orientation not applied.
++
++Requires `LEMONADE_API_KEY` when it is set.
++
++### Parameters
++
++| Parameter | Required | Description | Status |
++|-----------|----------|-------------|--------|
++| `model` | No | The image-classification model to use. Optional when exactly one is loaded. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `image` or `file` | Yes | Multipart: exactly one file part named `image` (or `file`). JSON: a base64 string, or a `data:image/jpeg;base64,...` / `data:image/png;base64,...` URL. Remote `http(s)` URLs are not fetched. At most 16 MiB decoded. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `top_k` | No | Number of labels to return. Defaults to 5; the backend caps it at the model's label count. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++
++`data` is sorted by descending score and is authoritative. `labels` has the same shape as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` classes), so a repeated name keeps only its highest score there; use `data[].index` to tell classes apart.
++
++The body is checked before it is read: it needs a `Content-Length` of at most 23 MiB, and no `Transfer-Encoding` or `Content-Encoding`. At most two requests run at once.
++
++An image that crashes the backend is never replayed, because replaying it would crash the restarted backend too: this request fails with `backend_crashed_on_input` and the next request restarts the backend.
++
++### Model Directory
++
++An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the task and preprocessing:
++
++```json
++{
++  "task": "image-classification",
++  "labels_file": "labels.txt",
++  "score_normalization": "none",
++  "preprocess": {
++    "resize": "stretch",
++    "mean": [127.5, 127.5, 127.5],
++    "std": [127.5, 127.5, 127.5],
++    "channel_order": "RGB",
++    "layout": "auto"
++  },
++  "top_k_default": 5
++}
++```
++
++A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps serving `/v1/classify`. Loading fails with a message naming both layouts when a model's label and its directory disagree, and when the installed `tflite-server` is too old to report the image-classification task. The per-model `tflite_args` option passes flags such as `--max-image-pixels` through to `tflite-server`.
++
++### Example
++
++=== "PowerShell"
++
++    ```powershell
++    curl.exe http://localhost:13305/v1/images/classify `
++      -F "model=MobileNetV2-1.0-224-TFLite" `
++      -F "top_k=3" `
++      -F image=@image.png
++    ```
++
++=== "Bash"
++
++    ```bash
++    curl http://localhost:13305/v1/images/classify \
++      -F "model=MobileNetV2-1.0-224-TFLite" \
++      -F "top_k=3" \
++      -F image=@image.png
++    ```
++
++**Response:** `200 OK`
++
++```json
++{
++  "object": "image_classification",
++  "model": "MobileNetV2-1.0-224-TFLite",
++  "data": [{"index": 418, "label": "balloon", "score": 0.5941151976585388}, ... 2 more],
++  "labels": {"balloon": 0.5941151976585388, ... 2 more},
++  "timings": {"decode_ms": 0.37189, "inference_ms": 4.289716, "preprocess_ms": 1.0587}
++}
++```
++
++### Response format
++
++- `object` - Always `image_classification`.
++- `model` - The model that classified the image.
++- `data` - The highest-scoring classes, best first.
++  - `index` - The class index in the model's output.
++  - `label` - The class name, or the index as a string when the model has no label file.
++  - `score` - The class score.
++- `labels` - Each class's score keyed by label; a repeated label keeps its highest score, and `data` is authoritative.
++  - The label's highest score.
++- `timings` - Backend timings, when the backend reports them.
++
++### Errors
++
++| Status | Code | When |
++|--------|------|------|
++| `400` |  | `Content-Type` is neither `multipart/form-data` nor `application/json` |
++| `400` |  | Malformed request: zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG image, a bad `top_k`, or an image the backend cannot decode |
++| `400` | `model_not_applicable` | `model` is not an image-classification model |
++| `400` |  | `model` is omitted and not exactly one image-classification model is loaded |
++| `404` |  | The model is unloaded while the request waits for it |
++| `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
++| `404` | `model_not_found` | The requested model is not in the registry |
++| `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
++| `409` | `slots_pinned_error` | Every loaded model of the requested model's type is pinned, so none can be unloaded to make room |
++| `411` | `length_required` | No `Content-Length`, or any `Transfer-Encoding` header, even alongside a `Content-Length`; refused before the body is read |
++| `413` | `payload_too_large` | The decoded image exceeds 16 MiB, or the body exceeds 23 MiB |
++| `415` | `unsupported_content_encoding` | Any `Content-Encoding` header, such as a gzip-compressed body; refused before the body is read |
++| `500` |  | The backend reports an error; the backend's own status replaces this one when it sends one |
++| `500` |  | The backend's response lacks a field the route returns, such as `choices` or `labels` |
++| `500` |  | The request fails unexpectedly |
++| `500` | `model_load_error` | Loading the requested model fails for another reason, such as a failed download or a backend that does not start |
++| `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
++| `503` | `server_busy` | Two image-classification requests are already in progress (`Retry-After: 1`) |
++| `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
++<!-- END GENERATED: lemonade.images_classify -->
++
+ <!-- BEGIN GENERATED: lemonade.models_check_updates -->
+ ## `POST /v1/models/check-updates`
+ <sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>
+@@ -290,6 +407,7 @@ Requires `LEMONADE_API_KEY` when it is set.
+   - `max_completion_tokens` - Cloud models only: `max_output_tokens` under its OpenAI name.
+   - `downloaded` - Whether the model is downloaded.
+   - `update_available` - Whether the model's registry has a newer commit; `false` except for downloaded registry models.
++  - `pinned_revision` - The commit a `/v1/pull` with `revision` pinned the model to; absent when the model follows its default branch.
+   - `suggested` - Whether the model is recommended for general use.
+   - `labels` - The model's capabilities and characteristics; see [Model Labels](./openai.md#model-labels).
+   - `image_defaults` - Image models only: default generation parameters.
+@@ -330,6 +448,7 @@ Requires `LEMONADE_API_KEY` when it is set.
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | The definition is malformed and nothing is registered, for example a name outside the `user.` namespace or with a reserved `extra.`/`builtin.` prefix, an empty `recipe` where one is required, `checkpoints` without `main`, an unsupported `source`, `components` that are empty or name the collection itself, another collection or an unregistered model, or an invalid routing policy |
+ | `400` |  | A field not listed above has the wrong JSON type |
++| `400` |  | `revision` is sent; it applies to `/pull` only, since registering downloads nothing |
+ | `500` |  | The definition is invalid in another way and nothing is registered, for example a GGUF `checkpoint` without a variant, a recipe this system cannot run, or labels that name two deployment modes |
+ <!-- END GENERATED: lemonade.models_register -->
+ 
+@@ -363,6 +482,7 @@ Requires `LEMONADE_API_KEY` when it is set.
+ | `registry_source` | No | Same as `source`; when both are given they must name the same registry. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `do_not_upgrade` | No | `true` skips checking an already-downloaded model's registry for updates. Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `local_import` | No | Register model files a client already copied into the Hugging Face cache, without downloading. Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `revision` | No | Pin the download to an exact Hugging Face revision of the model's main checkpoint repository: a 40-character commit sha, or a branch or tag name. Omitted or empty pulls the registry's default branch, and an explicit pull without it releases an existing pin. See Pin a Revision below. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ 
+ Pulling an already-downloaded model downloads any newer commit from its registry. Loading a model never checks for updates, and [`POST /v1/models/check-updates`](#post-v1modelscheck-updates) only reports them.
+ 
+@@ -370,6 +490,20 @@ With `stream`, the error event or the job reports an unknown model.
+ 
+ In offline mode a new definition is still registered, but nothing is downloaded.
+ 
++### Pin a Revision
++
++A client can look up a model's commits on the Hub (for example `https://huggingface.co/api/models/<owner>/<repo>/commits/main`) and download exactly one of them by passing `revision`; the non-streaming response then carries the resolved commit as `revision`.
++
++- `revision` must be a 40-character hexadecimal commit sha, or a branch/tag name of at most 128 characters made of `A-Z a-z 0-9 . _ / -` that does not contain `..` and does not start with `/` or `-` (for example `main` or `refs/pr/1`). Anything else is rejected before any registration or network request.
++- A branch or tag is resolved to its commit when the pull runs; the model stays on that commit even if the branch moves later.
++- The pin applies to the main checkpoint's repository only. Auxiliary checkpoints in other repositories follow their default branch; auxiliary files in the main repository come from the pinned commit.
++- Files are stored under `snapshots/<commit sha>/`. A pinned pull never moves `refs/main`, so other models that share the repository keep loading the default-branch snapshot.
++- The model records the pinned commit in the repository's `.lemonade_registry.json`, and every later load of that model uses the pinned snapshot. [`GET /v1/models/{id}`](./openai.md#get-v1modelsid) reports it as `pinned_revision`. A pinned model is excluded from update checks and auto-update.
++- An explicit pull with `revision` always fetches and pins that revision, even with `do_not_upgrade` and an already-downloaded model, so it also moves an existing pin. Pulling again without `revision` removes the pin.
++- `revision` is rejected for collections, local imports, models from a non-Hugging Face registry, backends that manage their own downloads (`flm`, `cloud`), a request that also changes an existing model's recipe or source, and in offline mode. [`POST /v1/models/register`](#post-v1modelsregister) does not download and rejects `revision`.
++- Streaming and server-owned job responses do not carry the resolved sha; read `pinned_revision` after the download completes.
++- If a repository's `.lemonade_registry.json` is corrupt, models in that repository that are not on the `refs/main` snapshot (pinned models included) report not downloaded. A later download of that repository rewrites the file and drops the pins it held.
++
+ ### Register and Install a Model
+ 
+ Registering writes the model to `user_models.json` in the Lemonade config directory (`~/.config/lemonade` by default), after which [`GET /v1/models`](./openai.md#get-v1models) lists it beside the built-in models. The definition needs a `main` checkpoint, given as `checkpoint` or as the `main` key of `checkpoints`.
+@@ -571,6 +705,7 @@ Without `stream`, or with `local_import`: the model is installed or registered.
+ 
+ - `status` - Always `success`.
+ - `model_name` - The installed model.
++- `revision` - Only with `revision`: the commit sha the model is pinned to.
+ - `message` - Only with `local_import`: a confirmation that the files were registered.
+ 
+ ##### Download job
+@@ -622,6 +757,8 @@ A `progress` event reports one file; a `complete` event follows the last one, an
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `source` or `registry_source` names an unsupported source, or the checkpoint URLs disagree with it or with each other |
+ | `400` |  | The definition is malformed and nothing is registered, for example a name outside the `user.` namespace or with a reserved `extra.`/`builtin.` prefix, an empty `recipe` where one is required, `checkpoints` without `main`, an unsupported `source`, `components` that are empty or name the collection itself, another collection or an unregistered model, or an invalid routing policy |
++| `400` |  | `revision` is malformed, or cannot pin this model: a collection, a local import, a non-Hugging Face registry, a backend that manages its own downloads, or a request that also changes an existing model's recipe or source |
++| `400` | `lemond_offline` | `revision` is sent while the server is in offline mode |
+ | `400` | `lemond_offline` | `offline` is set to `true` |
+ | `400` | `unknown_model` | Without `stream`, the model is not registered and its name has no `user.` prefix |
+ | `400` |  | Labels or `embedding`/`reranking` flags name a deployment mode the recipe cannot serve, or name two |
+@@ -1748,6 +1885,8 @@ This endpoint does not take any parameters.
+   - `is_streaming` - Whether the model is generating output tokens: `true` from the first chunk until every streaming request completes.
+   - `backend_url` - URL of the backend process serving the model.
+   - `pid` - Process ID of the backend process serving the model.
++  - `rss_mib` - Resident memory of the backend process in MiB (`VmRSS`, rounded to one decimal). Includes memory-mapped model weights and shared libraries, so pages shared between backends can be counted more than once. Linux only; a best-effort sample, omitted when it can't be read. Only the direct backend process is measured, not its children.
++  - `anon_mib` - Private anonymous memory of the backend process in MiB (`RssAnon`, rounded to one decimal): the part of `rss_mib` not backed by files. Same availability as `rss_mib`.
+   - `launch_command` - The command that started the model's backend, program first, with the values actually used: an automatic `ctx_size` appears as a number, and flags Lemonade added are included. Absent for cloud models.
+   - `recipe` - Recipe used to load the model, e.g. `llamacpp` or `flm`.
+   - `recipe_options` - Options the model was loaded with, such as `ctx_size` or `llamacpp_args`.
+@@ -1778,6 +1917,27 @@ This endpoint does not take any parameters.
+   - `captures` - The parts of each request telemetry captures, present when `enabled` is `true`.
+ - `pinned_helper_models` - Loaded pinned routing-helper models, counted per model type.
+   - How many pinned routing-helper models of this type are loaded.
++- `beacon_listener` - State of the LAN beacon listener, controlled by the `beacon_listen` setting in [Server Configuration](../guide/configuration/README.md). The list is display-only: Lemonade never contacts a heard host, sends it credentials, or routes requests to it. When the listener is off, this is `{"enabled": false}`.
++  - `enabled` - Whether the listener is running.
++  - `supported` - `false` on Windows, where the listener is not available in this release.
++  - `listening` - Whether at least one UDP socket is bound.
++  - `error` - Platform-level error, or `null`. If the listener thread could not be started, `listening` is `false`, `sockets` is empty and `error` says why; toggling `beacon_listen` retries.
++  - `sockets` - One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each listened interface's subnet broadcast address (worked out from its address and netmask) plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on.
++  - `interfaces` - The interfaces being listened on: `name`, `address`, `netmask` and `broadcast`. By default this is every interface with an RFC1918 address. The `beacon_listen_interfaces` setting narrows it; on a gateway whose WAN side is also RFC1918, set it to the LAN bridges or WAN-side hosts are listed too.
++  - `interface_allowlist` - The `beacon_listen_interfaces` setting, or `[]` when every RFC1918 interface is heard.
++  - `trusted_relays` - The `beacon_trusted_relays` setting, with each `allow_hosts` entry written as a CIDR (`192.168.79.20` becomes `192.168.79.20/32`).
++  - `unmatched_interfaces` - Entries of `beacon_listen_interfaces` that name no interface with an RFC1918 address. When none match, `listening` is `false` and `error` names them.
++  - `self_instance_id` - This server's beacon `instance_id`, used to drop its own beacons.
++  - `self_port` - This server's HTTP port, used to drop its own beacons.
++  - `ttl_seconds` - Seconds a host stays listed after its last beacon.
++  - `max_hosts` - Maximum listed hosts.
++  - `distinct_instances` - Number of distinct servers heard; a multi-homed server has one row per interface.
++  - `hosts` - Heard servers, sorted by hostname: `hostname` (sanitised to `[A-Za-z0-9._-]`), `url`, `source_ip` (the datagram's sender), `via` (the relay's address when the host was heard through a `beacon_trusted_relays` entry, else `null`), `instance_id` (or `null` for older servers), `first_seen` and `last_seen` (Unix seconds), `age_seconds`.
++  - `stats` - Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch`, `rate_limited`, `table_full`, `wrong_interface` (arrived on an interface that is not being listened on), `unknown_interface` (the arrival interface could not be determined while `beacon_listen_interfaces` is set), `evicted`. With trusted relays also `relayed_accepted` and `relayed_refreshed` (as `accepted` and `refreshed`, for hosts heard through a trusted relay) and `relay_host_refused` (a trusted relay advertised a host outside its `allow_hosts`, or a non-RFC1918 host); `url_mismatch` then excludes trusted relays, and `table_full` also counts a relay that already vouches for 16 hosts.
++- `server_process` - The Lemonade Server process itself.
++  - `pid` - Process ID of the server.
++  - `rss_mib` - Resident memory of the server in MiB, with the same meaning and availability as the per-model field.
++  - `anon_mib` - Private anonymous memory of the server in MiB, with the same meaning and availability as the per-model field.
+ <!-- END GENERATED: lemonade.health -->
+ 
+ <!-- BEGIN GENERATED: lemonade.stats -->
+diff --git a/docs/api/openai.md b/docs/api/openai.md
+index 6ef9aa4e6..32fc477a8 100644
+--- a/docs/api/openai.md
++++ b/docs/api/openai.md
+@@ -1729,6 +1729,7 @@ With cloud providers configured, their models are listed too, with `recipe: "clo
+   - `max_completion_tokens` - Cloud models only: `max_output_tokens` under its OpenAI name.
+   - `downloaded` - Whether the model is downloaded.
+   - `update_available` - Whether the model's registry has a newer commit; `false` except for downloaded registry models.
++  - `pinned_revision` - The commit a `/v1/pull` with `revision` pinned the model to; absent when the model follows its default branch.
+   - `suggested` - Whether the model is recommended for general use.
+   - `labels` - The model's capabilities and characteristics; see [Model Labels](./openai.md#model-labels).
+   - `image_defaults` - Image models only: default generation parameters.
+@@ -1917,6 +1918,7 @@ Requires `LEMONADE_API_KEY` when it is set.
+ - `max_completion_tokens` - Cloud models only: `max_output_tokens` under its OpenAI name.
+ - `downloaded` - Whether the model is downloaded.
+ - `update_available` - Whether the model's registry has a newer commit; `false` except for downloaded registry models.
++- `pinned_revision` - The commit a `/v1/pull` with `revision` pinned the model to; absent when the model follows its default branch.
+ - `suggested` - Whether the model is recommended for general use.
+ - `labels` - The model's capabilities and characteristics; see [Model Labels](./openai.md#model-labels).
+ - `image_defaults` - Image models only: default generation parameters.
+diff --git a/docs/api/router.md b/docs/api/router.md
+index 2d4699651..dadc3f54f 100644
+--- a/docs/api/router.md
++++ b/docs/api/router.md
+@@ -5,7 +5,7 @@ A `collection.router` model is a virtual model whose routing policy picks one of
+ <!-- BEGIN GENERATED: router.summary -->
+ | Method | Endpoint | Description |
+ |--------|----------|-------------|
+-| `POST` | [`/v1/routing/validate`](#post-v1routingvalidate) | Test a routing policy against a prompt without registering it |
++| `POST` | [`/v1/routing/validate`](#post-v1routingvalidate) | Test a routing policy or registered router against a prompt |
+ <!-- END GENERATED: router.summary -->
+ 
+ ## Routing (`collection.router`)
+@@ -33,7 +33,7 @@ See [Router Policies](../dev/router-policy.md) for authoring the policy.
+ ## `POST /v1/routing/validate`
+ <sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
+ 
+-Returns the decision a routing policy makes for a prompt, without registering the policy or sending the request to the chosen candidate. The Router Builder's **Test Prompt** tab uses it to iterate on a policy before attaching it to a `collection.router` model.
++Returns the decision a routing policy makes for a prompt, without registering the policy or sending the request to the chosen candidate. The Router Builder's **Test Prompt** tab uses it to iterate on a policy before attaching it to a `collection.router` model. Sent `model` instead of `policy`, it returns the decision a registered router would make for the request body, without dispatching it.
+ 
+ Requires `LEMONADE_API_KEY` when it is set.
+ 
+@@ -41,12 +41,19 @@ Requires `LEMONADE_API_KEY` when it is set.
+ 
+ | Parameter | Required | Description | Status |
+ |-----------|----------|-------------|--------|
+-| `policy` | Yes | A `collection.router` policy document. `model_name` is accepted but is not required for validation. See [Router Policies](../dev/router-policy.md). | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+-| `prompt` | No | The prompt text to route. Defaults to `""`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `policy` | No | A `collection.router` policy document. `model_name` is accepted but is not required for validation. See [Router Policies](../dev/router-policy.md). Required unless `model` is sent, and refused alongside it. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `model` | No | A registered `collection.router` model, by public or `user.` name, to classify against instead of `policy`. The rest of the body is then read exactly as a chat, completions or responses request to that router would be: `messages`, `prompt`, `input`, `tools`, `metadata` and `max_tokens` build the routing context, and `has_images`/`has_tools` are refused, since they come from the body itself. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
++| `prompt` | No | The prompt text to route. Defaults to `""`. With `model`, an array of strings or token ids is accepted too, as on completions. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `has_images` | No | Simulate a request carrying image input. Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `has_tools` | No | Simulate a request carrying tool definitions. Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ | `metadata` | No | String-valued metadata pairs matched by `metadata` conditions. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+ 
++### Classify Against a Registered Router
++
++Send `model` naming a registered `collection.router` model, instead of `policy`, to ask where that router would send a request without dispatching it. The router's registered policy is evaluated by the same code path dispatch uses, so the returned `decision` is the one a real request with the same body would get, and it equals the `x_lemonade_route` object a routed completion of that body returns with `route_trace: true`. The trace is always included, and the response carries the router's public name as `model` instead of `normalized_policy`.
++
++No candidate is loaded and nothing is forwarded to a backend. Deterministic rules are evaluated locally; model-backed conditions load and run their helper models as they do on dispatch, which can evict other models to make room. Classify-only requests are not counted in the routing metrics. Unlike dispatch, which falls back to the collection itself when routing fails, a failure here is an error.
++
+ Validation is structural: every `candidates` entry, `default_model`, rule `route_to` and classifier model must be listed in `components`. Component names are not looked up in the model registry, so a policy can be tested before its candidates are downloaded, and registration's model-type checks, such as whether a `semantic_similarity` model can embed, do not run.
+ 
+ Deterministic conditions (`keywords_any`, `regex`, `min_chars`, `metadata`, etc.) are evaluated locally. Model-backed conditions (`semantic_similarity`, `classifier`, `zero_shot` and `llm`, including `routing.router`) may load and run their models. A model failure follows the classifier's `on_error` policy (`match_false` by default), so routing continues to a later rule or to `default_model`. A residency conflict is the exception: when the classifier model cannot be resident alongside the models already loaded, the request returns 409 and no decision is made, because the policy cannot run on this machine in this combination.
+@@ -187,15 +194,19 @@ Match `decision.matched_rule` against this document: a policy written with only
+ ### Response format
+ 
+ - `decision` - The routing decision for the prompt, with the per-condition `trace` included. See [Routing](#routing-collectionrouter) for the decision object.
+-- `normalized_policy` - The policy as evaluated, with any `routing.router` shorthand expanded.
++- `normalized_policy` - The policy as evaluated, with any `routing.router` shorthand expanded. Present with `policy`.
++- `model` - The router's public name. Present with `model`.
+ 
+ ### Errors
+ 
+ | Status | Code | When |
+ |--------|------|------|
+ | `400` | `invalid_json` | The body is not a JSON object |
+-| `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `policy` is invalid or internally inconsistent |
++| `400` |  | Neither or both of `policy` and `model` are sent |
++| `400` |  | With `model`: the model is not a `collection.router`, `has_images`/`has_tools` are sent, `prompt` is not a string or an array of strings or token ids, `input` is not a string or array, or `messages` is not an array |
++| `404` |  | With `model`: no model by that name is registered |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
++| `500` |  | With `model`: the router's registered policy failed to parse, or a helper model failed in a way its `on_error` policy does not absorb |
+ <!-- END GENERATED: router.routing_validate -->
+diff --git a/docs/tools/api_examples_cache.json b/docs/tools/api_examples_cache.json
+index 98df568ca..29ff64311 100644
+--- a/docs/tools/api_examples_cache.json
++++ b/docs/tools/api_examples_cache.json
+@@ -1452,6 +1452,58 @@
+       }
+     }
+   },
++  "5e4f45411731a6b534045ea8818a2d1e48c012b5629986fb153d81e192ee4bea": {
++    "route": "lemonade.images_classify",
++    "format": "Json",
++    "request": {
++      "method": "POST",
++      "path": "/v1/images/classify",
++      "query": {},
++      "json": null,
++      "form": {
++        "model": "MobileNetV2-1.0-224-TFLite",
++        "top_k": 3
++      },
++      "files": {
++        "image": "@fixtures/image.png"
++      }
++    },
++    "response": {
++      "status": 200,
++      "content_type": "application/json",
++      "body": {
++        "data": [
++          {
++            "index": 418,
++            "label": "balloon",
++            "score": 0.5941151976585388
++          },
++          {
++            "index": 723,
++            "label": "ping-pong ball",
++            "score": 0.2999834716320038
++          },
++          {
++            "index": 853,
++            "label": "tennis ball",
++            "score": 0.008562449365854263
++          }
++        ],
++        "labels": {
++          "balloon": 0.5941151976585388,
++          "ping-pong ball": 0.2999834716320038,
++          "tennis ball": 0.008562449365854263
++        },
++        "model": "MobileNetV2-1.0-224-TFLite",
++        "object": "image_classification",
++        "timings": {
++          "decode_ms": 0.37189,
++          "inference_ms": 4.289716,
++          "preprocess_ms": 1.0587
++        }
++      }
++    }
++  },
+   "1745dcfda3bde7f0ca399fa264071c682f0e78fb5121bb7a426946f70dcfc7c3": {
+     "route": "lemonade.install",
+     "format": "EventStream",
+diff --git a/docs/tools/gen_api_boilerplate.py b/docs/tools/gen_api_boilerplate.py
+index 53f72eba1..bd6cacce2 100644
+--- a/docs/tools/gen_api_boilerplate.py
++++ b/docs/tools/gen_api_boilerplate.py
+@@ -578,10 +578,10 @@ DISTINCT_ARGUMENTS = {
+             ],
+         ),
+         (
+-            "Text to continue or an image to generate, versus text to route",
++            "A classifier, optional when one is loaded, versus a registered router to classify against",
+             [
+-                "routes/ollama/generate.cpp:kPrompt",
+-                "routes/router/routing_validate.cpp:kPrompt",
++                "routes/lemonade/inference/classify.cpp:kModel",
++                "routes/router/routing_validate.cpp:kModel",
+             ],
+         ),
+         (
+@@ -848,10 +848,13 @@ def lint_sources() -> list[str]:
+         lists = " ".join(m.group(0) for m in ERROR_LISTS.finditer(text))
+         inherited = "ModelLoader::errors()" in lists
+         # MCP's JSON-RPC endpoint answers its own parse errors, in-band with a 200.
++        # images/classify takes JSON or multipart and checks the body's size and
++        # encoding headers before httplib reads it.
+         if (
+             not RECEIVES_BODY.search(text)
+             and "http.body" in text
+             and path.parent.name != "mcp"
++            and path.name != "images_classify.cpp"
+         ):
+             problems.append(
+                 f"{where} reads its request body, which its RequestFormat skips"
+diff --git a/src/cpp/server/routes/lemonade/inference/classify.cpp b/src/cpp/server/routes/lemonade/inference/classify.cpp
+index 2ce6d6a61..42a40405a 100644
+--- a/src/cpp/server/routes/lemonade/inference/classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/classify.cpp
+@@ -61,10 +61,9 @@ public:
+             "Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on "
+             "a string and returns a score for each label. It serves `onnxruntime` sequence "
+             "classifiers (one label set), token classifiers (aggregated span labels) and zero-shot "
+-            "models (labels sent with each request), and `tflite` text classifiers. "
+-            "Image-classification models are refused with `400`; they are served by "
+-            "[`POST /v1/images/classify`](#post-v1imagesclassify). It provides the classification "
+-            "that the router's `classifier` and `zero_shot` conditions use.";
++            "models (labels sent with each request), and `tflite` text classifiers; image models "
++            "are served by [`POST /v1/images/classify`](#post-v1imagesclassify). It provides the "
++            "classification that the router's `classifier` and `zero_shot` conditions use.";
+         s.notes = {
+             "A malformed request, such as one with a blank `input`, a non-positive `top_k`, or a "
+             "`labels` entry that is blank, repeated or holds a control character, is rejected "
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index 821383e10..c4301365e 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -97,19 +97,18 @@ public:
+             "Classifies one image and returns the top-scoring labels. The model must be labeled "
+             "`image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` "
+             "(0.2.0 or newer) subprocess on the CPU. The request is either `multipart/form-data` "
+-            "(the same shape as `/v1/images/edits`) or `application/json`. Only JPEG and PNG are "
+-            "accepted, and EXIF orientation is not applied.";
++            "(the same shape as `/v1/images/edits`) or `application/json`, and only JPEG and PNG "
++            "are accepted, with EXIF orientation not applied.";
+         s.notes = {
+             "`data` is sorted by descending score and is authoritative. `labels` has the same shape "
+             "as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` "
+             "classes), so a repeated name keeps only its highest score there; use `data[].index` "
+             "to tell classes apart.",
+-            "The body is capped before it is read: a request without `Content-Length`, or with any "
+-            "`Transfer-Encoding`, gets `411`; any `Content-Encoding` gets `415`; and a "
+-            "`Content-Length` over 23 MiB gets `413`. At most two requests run at once.",
++            "The body is checked before it is read: it needs a `Content-Length` of at most 23 MiB, "
++            "and no `Transfer-Encoding` or `Content-Encoding`. At most two requests run at once.",
+             "An image that crashes the backend is never replayed, because replaying it would crash "
+-            "the restarted backend too: this request fails with `502` `backend_crashed_on_input` "
+-            "and the next request restarts the backend.",
++            "the restarted backend too: this request fails with `backend_crashed_on_input` and the "
++            "next request restarts the backend.",
+             "### Model Directory\n\n"
+             "An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 "
+             "output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the "
+@@ -161,12 +160,17 @@ public:
+                 "labels": {
+                     "type": "object",
+                     "description": "Each class's score keyed by label; a repeated label keeps its highest score, and `data` is authoritative.",
+-                    "additionalProperties": {"type": "number"}
++                    "additionalProperties": {"type": "number", "description": "The label's highest score."}
+                 },
+                 "timings": {"type": "object", "description": "Backend timings, when the backend reports them."}
+             }
+         })");
+         s.responses = {response};
++
++        RouteExample example;
++        example.format = ResponseFormat::Json;
++        example.args = {{"model", "MobileNetV2-1.0-224-TFLite"}, {"image", "@fixtures/image.png"}, {"top_k", 3}};
++        s.examples = {example};
+         s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired, kContentEncoding,
+                                  kServerBusy, kCrashCooldown,
+                                  kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput,
+@@ -183,7 +187,7 @@ public:
+         auto send_if_paused = [this, &res](const std::string& model) {
+             auto paused = ctx_.router->classify_cooldown_error(model);
+             if (!paused) return false;
+-            res.status = 503;
++            res.status = kCrashCooldown.status;
+             res.set_header("Retry-After",
+                            std::to_string((*paused)["error"]["retry_after"].get<long long>()));
+             res.set_content(paused->dump(), "application/json");
+@@ -205,8 +209,8 @@ public:
+             if (http.is_multipart_form_data()) {
+                 std::optional<std::string> model;
+                 std::optional<std::string> top_k;
+-                if (http.form.has_field("model")) model = http.form.get_field("model");
+-                if (http.form.has_field("top_k")) top_k = http.form.get_field("top_k");
++                if (http.form.has_field(kModel.name)) model = http.form.get_field(kModel.name);
++                if (http.form.has_field(kTopK.name)) top_k = http.form.get_field(kTopK.name);
+                 std::vector<std::string_view> parts;
+                 for (const auto& [name, file] : http.form.files) {
+                     if (name == "image" || name == "file") parts.emplace_back(file.content);
+diff --git a/src/cpp/server/routes/lemonade/models/pull.cpp b/src/cpp/server/routes/lemonade/models/pull.cpp
+index f2d3501f5..248a6992e 100644
+--- a/src/cpp/server/routes/lemonade/models/pull.cpp
++++ b/src/cpp/server/routes/lemonade/models/pull.cpp
+@@ -150,7 +150,7 @@ public:
+             "- `revision` must be a 40-character hexadecimal commit sha, or a branch/tag name of at "
+             "most 128 characters made of `A-Z a-z 0-9 . _ / -` that does not contain `..` and does "
+             "not start with `/` or `-` (for example `main` or `refs/pr/1`). Anything else is "
+-            "rejected with `400` before any registration or network request.\n"
++            "rejected before any registration or network request.\n"
+             "- A branch or tag is resolved to its commit when the pull runs; the model stays on that "
+             "commit even if the branch moves later.\n"
+             "- The pin applies to the main checkpoint's repository only. Auxiliary checkpoints in "
+@@ -166,7 +166,7 @@ public:
+             "- An explicit pull with `revision` always fetches and pins that revision, even with "
+             "`do_not_upgrade` and an already-downloaded model, so it also moves an existing pin. "
+             "Pulling again without `revision` removes the pin.\n"
+-            "- `revision` is rejected with `400` for collections, local imports, models from a "
++            "- `revision` is rejected for collections, local imports, models from a "
+             "non-Hugging Face registry, backends that manage their own downloads (`flm`, `cloud`), "
+             "a request that also changes an existing model's recipe or source, and in offline "
+             "mode. [`POST /v1/models/register`](#post-v1modelsregister) does not download and "
+diff --git a/src/cpp/server/routes/router/routing_validate.cpp b/src/cpp/server/routes/router/routing_validate.cpp
+index 5fc29e898..6d4977bdd 100644
+--- a/src/cpp/server/routes/router/routing_validate.cpp
++++ b/src/cpp/server/routes/router/routing_validate.cpp
+@@ -63,7 +63,7 @@ public:
+         s.id = "router.routing_validate";
+         s.methods = {"POST"};
+         s.paths = {"routing/validate"};
+-        s.summary = "Test an ad-hoc or registered routing policy against a prompt without dispatching it";
++        s.summary = "Test a routing policy or registered router against a prompt";
+         s.experimental = true;
+         s.description =
+             "Returns the decision a routing policy makes for a prompt, without registering the "
+@@ -193,7 +193,7 @@ public:
+             "prompt": "please write a def to reverse a list"
+         })");
+         s.examples = {example};
+-        s.errors = {kBodyNotJson, kArgMissing, kArgInvalid, kInvalidPolicy, kPolicyOrModel,
++        s.errors = {kBodyNotJson, kArgInvalid, kInvalidPolicy, kPolicyOrModel,
+                     kRegisteredInvalid, kRouterNotFound, kRouterEvaluationFailed,
+                     ModelLoader::kRouterResidencyConflict};
+         s.request_format = RequestFormat::Json;
+-- 
+2.53.0
+

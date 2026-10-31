@@ -1,7 +1,7 @@
-From 79fbaf606ea9f16a9e5c78da2a24c087e22bd3b6 Mon Sep 17 00:00:00 2001
+From 513cc3e99eede0bf56caca6dbbbd9aa5d26ba8a1 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:32:56 -0400
-Subject: [PATCH 71/71] fix(routing): validate nested token arrays in a
+Subject: [PATCH 71/77] fix(routing): validate nested token arrays in a
  registered validate prompt
 
 With a registered model, /routing/validate accepted any array as a prompt

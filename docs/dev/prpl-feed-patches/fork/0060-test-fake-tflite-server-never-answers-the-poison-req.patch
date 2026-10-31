@@ -1,7 +1,7 @@
-From 882045109667465414a70715e79f73d6c3c2b60e Mon Sep 17 00:00:00 2001
+From 84ace51b44ef2168542d60a335fe2d84f1a62afc Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 14:39:41 -0400
-Subject: [PATCH 60/71] test: fake tflite-server never answers the poison
+Subject: [PATCH 60/77] test: fake tflite-server never answers the poison
  request
 
 os.kill on its own pid is delivered asynchronously, so the request

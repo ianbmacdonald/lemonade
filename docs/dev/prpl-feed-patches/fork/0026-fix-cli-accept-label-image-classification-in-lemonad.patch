@@ -1,7 +1,7 @@
-From dda9da3669d64337398f9dfc90b966825c060d34 Mon Sep 17 00:00:00 2001
+From 68382053ea1756297853802887cb1c5a614f05c0 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:39:24 -0400
-Subject: [PATCH 26/71] fix(cli): accept --label image-classification in
+Subject: [PATCH 26/77] fix(cli): accept --label image-classification in
  lemonade pull
 
 A tflite model deploys as a text classifier unless its labels say

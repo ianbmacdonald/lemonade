@@ -1,7 +1,7 @@
-From a8931e63f3e138a00bb1ed9d8ba225f3a04c38ff Mon Sep 17 00:00:00 2001
+From 3f0fa87478a3c473fd6fd004a35e2963fb8b24cb Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 21:29:23 -0400
-Subject: [PATCH 46/71] docs(config): regenerate the config example for
+Subject: [PATCH 46/77] docs(config): regenerate the config example for
  beacon_trusted_relays
 
 Assisted-by: claude:opus-5.5

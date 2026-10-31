@@ -1,0 +1,582 @@
+From 6ffd965d6ed9564f0982ddf8eeeaee5c70671cac Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 17:55:22 -0400
+Subject: [PATCH 73/77] fix(classify): no replay after a crash on text, refuse
+ labels, no linked cache
+
+Text classification replayed an input once after it crashed the backend,
+and had no crash breaker, so an input that kills a CPU engine could keep
+it in a crash-and-reload loop. It now takes the image route's path: the
+input is not retried (502 backend_crashed_on_input), and three crashes in
+60 seconds pause the model for 60 seconds (503 backend_crash_cooldown,
+checked before any auto-load). Text and image share one breaker per model.
+This also covers ort-server text classification and the router's
+classifier helpers, which call Router::classify.
+
+The tflite and executorch text adapters dropped a request's labels and
+returned the model's fixed classes with 200. They now refuse labels with
+400, as the classify route documents.
+
+tflite-server writes its weight cache through a symlink, which in an HF
+snapshot points into the shared blob store, so lemond passes
+--weight-cache only when that path is missing or a plain file.
+
+The fake tflite-server gains a text mode and logs its arguments, for the
+new tests.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/router.h                |  11 +-
+ .../backends/executorch/executorch_server.cpp |   9 ++
+ .../server/backends/tflite/tflite_server.cpp  |  26 +++-
+ src/cpp/server/router.cpp                     |  32 +++--
+ .../routes/lemonade/inference/classify.cpp    |  22 ++-
+ .../lemonade/inference/images_classify.cpp    |   4 +-
+ test/server_image_classify.py                 | 133 ++++++++++++++++++
+ test/utils/fake_tflite_server.py              |  55 ++++++--
+ 8 files changed, 255 insertions(+), 37 deletions(-)
+
+diff --git a/src/cpp/include/lemon/router.h b/src/cpp/include/lemon/router.h
+index af2d67c39..89989f575 100644
+--- a/src/cpp/include/lemon/router.h
++++ b/src/cpp/include/lemon/router.h
+@@ -234,10 +234,10 @@ public:
+     json reranking(const json& request);
+     json classify(const json& request);
+     json classify_image(const json& params, std::string image_bytes);
+-    // The 503 error to return while image classification for this model is
+-    // paused after repeated backend crashes; checked before any auto-load so a
+-    // paused model is not reloaded either.
+-    std::optional<json> image_classify_cooldown_error(const std::string& model_name);
++    // The 503 error to return while classification (text or image) for this
++    // model is paused after repeated backend crashes; checked before any
++    // auto-load so a paused model is not reloaded either.
++    std::optional<json> classify_cooldown_error(const std::string& model_name);
+     json get_slots();
+     json slots_action(int slot_id, const std::string& action, const json& request_body);
+     json tokenize(const json& request);
+@@ -318,7 +318,7 @@ private:
+ 
+     // Concurrency control for load operations
+     mutable std::mutex load_mutex_;              // Protects loading state and loaded_servers_
+-    CrashBreaker image_crash_breaker_{3, std::chrono::seconds(60), std::chrono::seconds(60)};
++    CrashBreaker classify_crash_breaker_{3, std::chrono::seconds(60), std::chrono::seconds(60)};
+     bool is_loading_ = false;                    // True when a load operation is in progress
+     std::condition_variable load_cv_;            // Signals when load completes
+ 
+@@ -421,6 +421,7 @@ private:
+     ModelTelemetryIdentity get_telemetry_identity(WrappedServer* server) const;
+     void record_request_telemetry_for_model(const ModelTelemetryIdentity& identity,
+                                             const StreamingProxy::TelemetryData& telemetry);
++    void record_classify_crash(const json& response, const std::string& requested_model);
+ 
+     // retry_after_watchdog_reset=false is for requests whose input may itself be
+     // what crashed the backend: replaying it would crash the fresh one too, so
+diff --git a/src/cpp/server/backends/executorch/executorch_server.cpp b/src/cpp/server/backends/executorch/executorch_server.cpp
+index 608705a5f..611d6ce70 100644
+--- a/src/cpp/server/backends/executorch/executorch_server.cpp
++++ b/src/cpp/server/backends/executorch/executorch_server.cpp
+@@ -239,6 +239,15 @@ json ExecutorchServer::forward_classify(const std::string& text, const json& par
+ }
+ 
+ json ExecutorchServer::classify(const json& request) {
++    if (request.contains("labels")) {
++        return json{
++            {"error", {
++                {"message", "This model has a fixed label set and does not take 'labels'"},
++                {"type", "invalid_request_error"},
++                {"status_code", 400},
++            }}
++        };
++    }
+     // Accept either OpenAI-style "input" or plain "text".
+     std::string text;
+     if (request.contains("text") && request["text"].is_string()) {
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index 2f660bde3..376194921 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -217,9 +217,20 @@ void TfliteServer::load(const std::string& model_name,
+     };
+ 
+     // XNNPACK otherwise packs the weights into anonymous memory once per
+-    // signature; a cache file holds one packed copy, mapped and shared.
+-    args.push_back("--weight-cache");
+-    args.push_back(path_to_utf8(path_from_utf8(model_path) / "model.tflite.xnnpack_cache"));
++    // signature; a cache file holds one packed copy, mapped and shared. The
++    // engine writes through a symlink, which in an HF snapshot points into the
++    // shared blob store, so only a missing path or a plain file is used.
++    const fs::path weight_cache = path_from_utf8(model_path) / "model.tflite.xnnpack_cache";
++    // A missing path sets the error code too, so only file_type::none is an error.
++    std::error_code cache_ec;
++    const fs::file_type cache_type = fs::symlink_status(weight_cache, cache_ec).type();
++    if (cache_type == fs::file_type::not_found || cache_type == fs::file_type::regular) {
++        args.push_back("--weight-cache");
++        args.push_back(path_to_utf8(weight_cache));
++    } else {
++        LOG(WARNING, "TfliteServer") << "Not using weight cache " << path_to_utf8(weight_cache)
++                                     << ": it is not a regular file" << std::endl;
++    }
+ 
+     if (!extra_args.empty()) {
+         std::string validation_error =
+@@ -301,6 +312,15 @@ json TfliteServer::classify(const json& request) {
+             }}
+         };
+     }
++    if (request.contains("labels")) {
++        return json{
++            {"error", {
++                {"message", "This model has a fixed label set and does not take 'labels'"},
++                {"type", "invalid_request_error"},
++                {"status_code", 400},
++            }}
++        };
++    }
+     // Accept either OpenAI-style "input" or plain "text".
+     std::string text;
+     if (request.contains("text") && request["text"].is_string()) {
+diff --git a/src/cpp/server/router.cpp b/src/cpp/server/router.cpp
+index 2219c899b..712a7458c 100644
+--- a/src/cpp/server/router.cpp
++++ b/src/cpp/server/router.cpp
+@@ -2150,6 +2150,9 @@ json Router::reranking(const json& request) {
+ 
+ json Router::classify(const json& request) {
+     std::string requested_model = request.value("model", "");
++    if (auto paused = classify_cooldown_error(requested_model)) {
++        return *paused;
++    }
+     std::shared_ptr<telemetry::InferenceSpan> span = telemetry::TelemetryTracker::start_span("CLASSIFIER", "classify", requested_model, request);
+ 
+     try {
+@@ -2168,7 +2171,8 @@ json Router::classify(const json& request) {
+                 );
+             }
+             return classification_server->classify(request);
+-        });
++        }, /*retry_after_watchdog_reset=*/false);
++        record_classify_crash(response, requested_model);
+ 
+         if (span) {
+             if (response.contains("error")) {
+@@ -2189,15 +2193,25 @@ json Router::classify(const json& request) {
+     }
+ }
+ 
+-std::optional<json> Router::image_classify_cooldown_error(const std::string& model_name) {
+-    const long long wait = image_crash_breaker_.blocked_seconds(
++void Router::record_classify_crash(const json& response, const std::string& requested_model) {
++    if (response.contains("error") && response["error"].is_object() &&
++        response["error"].value("code", "") == "backend_crashed_on_input" &&
++        classify_crash_breaker_.record_crash(resolve_model_name(requested_model),
++                                             CrashBreaker::Clock::now())) {
++        LOG(WARNING, "Router") << "Classification for '" << requested_model
++                               << "' paused after repeated backend crashes" << std::endl;
++    }
++}
++
++std::optional<json> Router::classify_cooldown_error(const std::string& model_name) {
++    const long long wait = classify_crash_breaker_.blocked_seconds(
+         resolve_model_name(model_name), CrashBreaker::Clock::now());
+     if (wait == 0) {
+         return std::nullopt;
+     }
+     return json{{"error", {
+         {"message", "The backend for model '" + model_name +
+-                        "' crashed repeatedly on recent inputs; image classification is paused"},
++                        "' crashed repeatedly on recent inputs; classification is paused"},
+         {"type", ErrorType::BACKEND_ERROR},
+         {"code", "backend_crash_cooldown"},
+         {"status_code", 503},
+@@ -2207,7 +2221,7 @@ std::optional<json> Router::image_classify_cooldown_error(const std::string& mod
+ 
+ json Router::classify_image(const json& params, std::string image_bytes) {
+     std::string requested_model = params.value("model", "");
+-    if (auto paused = image_classify_cooldown_error(requested_model)) {
++    if (auto paused = classify_cooldown_error(requested_model)) {
+         return *paused;
+     }
+     std::shared_ptr<telemetry::InferenceSpan> span = telemetry::TelemetryTracker::start_span(
+@@ -2231,13 +2245,7 @@ json Router::classify_image(const json& params, std::string image_bytes) {
+             return image_server->classify_image(params, std::move(image_bytes));
+         }, /*retry_after_watchdog_reset=*/false);
+ 
+-        if (response.contains("error") && response["error"].is_object() &&
+-            response["error"].value("code", "") == "backend_crashed_on_input" &&
+-            image_crash_breaker_.record_crash(resolve_model_name(requested_model),
+-                                              CrashBreaker::Clock::now())) {
+-            LOG(WARNING, "Router") << "Image classification for '" << requested_model
+-                                   << "' paused after repeated backend crashes" << std::endl;
+-        }
++        record_classify_crash(response, requested_model);
+ 
+         if (span) {
+             if (response.contains("error")) {
+diff --git a/src/cpp/server/routes/lemonade/inference/classify.cpp b/src/cpp/server/routes/lemonade/inference/classify.cpp
+index fbc9e03c1..2ce6d6a61 100644
+--- a/src/cpp/server/routes/lemonade/inference/classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/classify.cpp
+@@ -24,6 +24,14 @@ const RouteError kBackendRejected{
+     "model, which is found only after it loads, or because `labels` is sent to a fixed-label "
+     "model or left out for a zero-shot one"};
+ 
++const RouteError kCrashCooldown{
++    503, "backend_crash_cooldown",
++    "The model's backend crashed on 3 inputs within 60 seconds, which pauses classification "
++    "for that model for 60 seconds (with `Retry-After`)"};
++const RouteError kCrashedOnInput{
++    502, "backend_crashed_on_input",
++    "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
++
+ const RouteArg kModel{"model", ArgIn::JsonBody, {{"type", "string"}}, false, Support::Available,
+                       "The classifier model. Optional when exactly one classification model is loaded; that "
+                       "model is used."};
+@@ -111,8 +119,8 @@ public:
+         })");
+         s.examples = {example};
+         s.errors = join_errors({{kBodyNotJson, kArgMissing, kArgInvalid,
+-                                 kNoSoleClassifier, kImageModel,
+-                                 kBackendRejected, kModelUnloaded, kBackendError,
++                                 kNoSoleClassifier, kImageModel, kCrashCooldown,
++                                 kBackendRejected, kCrashedOnInput, kModelUnloaded, kBackendError,
+                                  kMalformedBackendResponse, kUnexpectedException},
+                                 ModelLoader::errors()});
+         s.error_format = ErrorFormat::OpenAi;
+@@ -169,6 +177,13 @@ protected:
+                 "POST /v1/images/classify");
+             return false;
+         }
++
++        if (auto paused = ctx_.router->classify_cooldown_error(req.model)) {
++            res.status = kCrashCooldown.status;
++            res.set_header("Retry-After", std::to_string((*paused)["error"]["retry_after"].get<long long>()));
++            res.set_content(paused->dump(), "application/json");
++            return false;
++        }
+         return true;
+     }
+ 
+@@ -194,6 +209,9 @@ protected:
+             } else {
+                 res.status = kBackendError.status;
+             }
++            if (err.contains("retry_after") && err["retry_after"].is_number_integer()) {
++                res.set_header("Retry-After", std::to_string(err["retry_after"].get<long long>()));
++            }
+             res.set_content(response.dump(), "application/json");
+             return;
+         }
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index 758deca94..821383e10 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -38,7 +38,7 @@ const RouteError kServerBusy{
+     "Two image-classification requests are already in progress (`Retry-After: 1`)"};
+ const RouteError kCrashCooldown{
+     503, "backend_crash_cooldown",
+-    "The model's backend crashed on 3 inputs within 60 seconds, which pauses image classification "
++    "The model's backend crashed on 3 inputs within 60 seconds, which pauses classification "
+     "for that model for 60 seconds (with `Retry-After`)"};
+ const RouteError kNotImageClassifier{400, "model_not_applicable", "`model` is not an image-classification model"};
+ const RouteError kNoSoleImageClassifier{
+@@ -181,7 +181,7 @@ public:
+     void handle(RouteRequest& req, httplib::Response& res) override {
+         const httplib::Request& http = req.http;
+         auto send_if_paused = [this, &res](const std::string& model) {
+-            auto paused = ctx_.router->image_classify_cooldown_error(model);
++            auto paused = ctx_.router->classify_cooldown_error(model);
+             if (!paused) return false;
+             res.status = 503;
+             res.set_header("Retry-After",
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index dc9c03d76..3b1e8a62a 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -55,6 +55,8 @@ from utils.test_models import PORT, TIMEOUT_DEFAULT
+ TIMEOUT_CLASSIFY = 300
+ 
+ MODEL = "user.MobileNetV2-1.0-224-TFLite"
++TEXT_MODEL = "user.B194-Text-TFLite"
++POISON_TEXT = "B194-POISON-TEXT"
+ FIXTURE = os.path.join(
+     os.path.dirname(os.path.abspath(__file__)), "test_image_grace_hopper.jpg"
+ )
+@@ -149,6 +151,26 @@ def _write_stub_model_dir(path):
+     return os.path.abspath(path)
+ 
+ 
++def _write_stub_text_model_dir(path):
++    """A text model dir for the fake backend, which never reads the model."""
++    os.makedirs(path, exist_ok=True)
++    for name, content in (
++        ("model.tflite", "stub"),
++        ("tokenizer.json", "{}"),
++        ("config.json", "{}"),
++    ):
++        with open(os.path.join(path, name), "w", encoding="utf-8") as f:
++            f.write(content)
++    return os.path.abspath(path)
++
++
++def _line_count(path):
++    if not os.path.exists(path):
++        return 0
++    with open(path, encoding="utf-8") as f:
++        return len(f.read().splitlines())
++
++
+ def _vm_rss_kb(pid):
+     with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+         for line in f:
+@@ -161,6 +183,7 @@ class ImageClassifyTests(ServerTestBase):
+     """Tests for the /images/classify endpoint."""
+ 
+     _registered = False
++    _text_registered = False
+ 
+     def _url(self, prefix="/api/v1"):
+         return f"http://localhost:{PORT}{prefix}/images/classify"
+@@ -499,6 +522,38 @@ class ImageClassifyTests(ServerTestBase):
+         finally:
+             load_model(MODEL, tflite_args="")
+ 
++    def test_507c_weight_cache_symlink_not_used(self):
++        # The engine would write its weight cache through the link, which in an
++        # HF snapshot points into the shared blob store.
++        if not _opts.fake_backend or not _opts.fake_state_dir:
++            self.skipTest("needs --fake-backend and --fake-state-dir")
++        self._require_model()
++        args_log = os.path.join(_opts.fake_state_dir, "args.log")
++        cache = os.path.join(
++            _opts.hf_cache,
++            "models--" + MODEL[len("user.") :],
++            "model.tflite.xnnpack_cache",
++        )
++        outside = os.path.join(_opts.fake_state_dir, "outside-cache")
++
++        def last_args():
++            with open(args_log, encoding="utf-8") as f:
++                return json.loads(f.read().splitlines()[-1])
++
++        try:
++            if os.path.lexists(cache):
++                os.remove(cache)
++            os.symlink(outside, cache)
++            unload_model(MODEL)
++            self.assertEqual(load_model(MODEL).status_code, 200)
++            self.assertNotIn("--weight-cache", last_args())
++        finally:
++            if os.path.lexists(cache):
++                os.remove(cache)
++        unload_model(MODEL)
++        self.assertEqual(load_model(MODEL).status_code, 200)
++        self.assertIn(cache, last_args())
++
+     def test_508_crash_is_not_replayed(self):
+         if not _opts.fake_backend or not _opts.fake_state_dir:
+             self.skipTest("needs --fake-backend and --fake-state-dir")
+@@ -629,6 +684,84 @@ class ImageClassifyTests(ServerTestBase):
+             lines(starts) - starts_before, 1, "expected one reload after the pause"
+         )
+ 
++    # ---- text classification on the same engine (fake backend only) ----
++
++    def _require_text_model(self):
++        if not _opts.fake_backend or not _opts.fake_state_dir or not _opts.hf_cache:
++            self.skipTest("needs --fake-backend, --fake-state-dir and --hf-cache")
++        if ImageClassifyTests._text_registered:
++            return
++        dest = os.path.join(_opts.hf_cache, "models--" + TEXT_MODEL[len("user.") :])
++        if os.path.isdir(dest):
++            shutil.rmtree(dest)
++        _write_stub_text_model_dir(dest)
++        response = requests.post(
++            f"{self.base_url}/pull",
++            json={
++                "model_name": TEXT_MODEL,
++                "recipe": "tflite",
++                "labels": ["classification"],
++                "local_import": True,
++            },
++            timeout=TIMEOUT_DEFAULT,
++        )
++        self.assertEqual(response.status_code, 200, response.text[:500])
++        ImageClassifyTests._text_registered = True
++
++    def _classify_text(self, text, **extra):
++        return requests.post(
++            f"{self.base_url}/classify",
++            json={"model": TEXT_MODEL, "input": text, **extra},
++            timeout=TIMEOUT_CLASSIFY,
++        )
++
++    def test_511_text_labels_refused_by_fixed_label_model(self):
++        self._require_text_model()
++        self._assert_status(self._classify_text("hello"), 200, "text classify")
++        response = self._classify_text("hello", labels=["caller-category"])
++        self._assert_status(response, 400, "labels sent to a fixed-label model")
++
++    def test_512_text_crash_is_not_replayed(self):
++        self._require_text_model()
++        crashes = os.path.join(_opts.fake_state_dir, "crashes.log")
++        starts = os.path.join(_opts.fake_state_dir, "starts.log")
++        self._assert_status(self._classify_text("hello"), 200, "warm-up")
++        crashes_before, starts_before = _line_count(crashes), _line_count(starts)
++
++        response = self._classify_text(POISON_TEXT)
++        self._assert_status(response, 502, "poison text")
++        self.assertEqual(response.json()["error"]["code"], "backend_crashed_on_input")
++        self.assertEqual(
++            _line_count(crashes) - crashes_before, 1, "the poison text was replayed"
++        )
++
++        self._assert_status(self._classify_text("hello"), 200, "after the crash")
++        self.assertEqual(
++            _line_count(starts) - starts_before, 1, "expected exactly one reload"
++        )
++
++    def test_513_repeated_text_crashes_pause_the_model(self):
++        self._require_text_model()
++        crashes = os.path.join(_opts.fake_state_dir, "crashes.log")
++        starts = os.path.join(_opts.fake_state_dir, "starts.log")
++        response = None
++        for _ in range(4):
++            response = self._classify_text(POISON_TEXT)
++            if response.status_code != 502:
++                break
++        self._assert_status(response, 503, "poison text after repeated crashes")
++        self.assertEqual(response.json()["error"]["code"], "backend_crash_cooldown")
++        self.assertTrue(1 <= int(response.headers["Retry-After"]) <= 60)
++
++        crashes_before, starts_before = _line_count(crashes), _line_count(starts)
++        self._assert_status(self._classify_text("hello"), 503, "good text while paused")
++        self.assertEqual(
++            _line_count(crashes), crashes_before, "paused model crashed again"
++        )
++        self.assertEqual(
++            _line_count(starts), starts_before, "paused model was reloaded"
++        )
++
+ 
+ if __name__ == "__main__":
+     _opts = _parse_own_args()
+diff --git a/test/utils/fake_tflite_server.py b/test/utils/fake_tflite_server.py
+index 8b8106d73..81bfc424c 100644
+--- a/test/utils/fake_tflite_server.py
++++ b/test/utils/fake_tflite_server.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ """
+-Stand-in for tflite-server's image-classification contract, for exercising
+-lemond's /v1/images/classify forwarding without a LiteRT build.
++Stand-in for tflite-server's classification contract, for exercising lemond's
++/v1/images/classify and /v1/classify forwarding without a LiteRT build.
+ 
+ Install it on PATH as `tflite-server` (see server_image_classify.py). It
+ accepts the flags lemond passes, answers GET /health with
+@@ -15,8 +15,13 @@ task=image-classification, and serves POST /classify/image:
+   is truncated, gets 400 like the real decoder;
+ - anything else gets a fixed ranked prediction list.
+ 
++A model dir with tokenizer.json and config.json and no manifest.json is served
++as a text classifier instead: POST /classify takes {"text"}, crashes on text
++containing POISON_TEXT, and otherwise returns fixed label scores.
++
+ When FAKE_TFLITE_STATE_DIR is set, each start and each crash appends a line to
+-starts.log / crashes.log there.
++starts.log / crashes.log there, and each start writes its arguments as a JSON
++list to args.log.
+ """
+ 
+ import argparse
+@@ -32,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ 
+ POISON = b"B169-POISON-IMAGE"
+ SLOW = b"B169-SLOW-IMAGE"
++POISON_TEXT = "B194-POISON-TEXT"
+ SLOW_SECONDS = 4
+ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+ 
+@@ -70,7 +76,14 @@ def _image_part(handler, body):
+     return image, top_k
+ 
+ 
+-def make_handler(args):
++def _crash():
++    _log("crashes.log", str(os.getpid()))
++    os.kill(os.getpid(), signal.SIGSEGV)
++    # The signal can land on another thread; never answer this request.
++    time.sleep(60)
++
++
++def make_handler(args, task):
+     class Handler(BaseHTTPRequestHandler):
+         def log_message(self, *a):
+             pass
+@@ -87,13 +100,22 @@ def make_handler(args):
+             if self.path == "/health":
+                 self._send(
+                     200,
+-                    {"status": "ok", "engine": "fake", "task": "image-classification"},
++                    {"status": "ok", "engine": "fake", "task": task},
+                 )
+             else:
+                 self._send(404, {"error": "not found"})
+ 
+         def do_POST(self):
+             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
++            if task == "text-classification":
++                if self.path != "/classify":
++                    self._send(404, {"error": "not found"})
++                    return
++                text = json.loads(body or b"{}").get("text", "")
++                if POISON_TEXT in text:
++                    _crash()
++                self._send(200, {"labels": {"safe": 0.9, "unsafe": 0.1}})
++                return
+             if self.path == "/classify":
+                 self._send(
+                     400,
+@@ -111,10 +133,7 @@ def make_handler(args):
+                 self._send(400, {"error": "exactly one image part required"})
+                 return
+             if POISON in image:
+-                _log("crashes.log", str(os.getpid()))
+-                os.kill(os.getpid(), signal.SIGSEGV)
+-                # The signal can land on another thread; never answer this request.
+-                time.sleep(60)
++                _crash()
+             if SLOW in image:
+                 time.sleep(SLOW_SECONDS)
+             if image.startswith(PNG_SIGNATURE):
+@@ -148,12 +167,22 @@ def main():
+     parser.add_argument("--weight-cache")
+     parser.add_argument("--max-image-pixels", type=int, default=4_000_000)
+     args, _ = parser.parse_known_args()
+-    manifest = os.path.join(args.model_path, "manifest.json")
+-    if not os.path.exists(manifest):
+-        print("tflite-server: fake supports image models only", file=sys.stderr)
++
++    def has(name):
++        return os.path.exists(os.path.join(args.model_path, name))
++
++    if has("manifest.json"):
++        task = "image-classification"
++    elif has("tokenizer.json") and has("config.json"):
++        task = "text-classification"
++    else:
++        print("tflite-server: fake found no image or text model", file=sys.stderr)
+         sys.exit(1)
+     _log("starts.log", str(os.getpid()))
+-    ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(args)).serve_forever()
++    _log("args.log", json.dumps(sys.argv[1:]))
++    ThreadingHTTPServer(
++        ("127.0.0.1", args.port), make_handler(args, task)
++    ).serve_forever()
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.53.0
+

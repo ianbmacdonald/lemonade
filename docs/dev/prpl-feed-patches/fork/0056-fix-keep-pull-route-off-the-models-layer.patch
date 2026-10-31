@@ -1,7 +1,7 @@
-From 91ea44d64e93be0181e3d0340c2c4c9b7567a10f Mon Sep 17 00:00:00 2001
+From d321af6e85742cac8b1b77c155a3f62180fcdf1f Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 02:41:57 -0400
-Subject: [PATCH 56/71] fix: keep pull route off the models layer
+Subject: [PATCH 56/77] fix: keep pull route off the models layer
 
 FacadeShapeTest keeps routes off models-layer headers: name the Hugging Face
 registry through registry_types.h instead of registry_descriptors.h.
