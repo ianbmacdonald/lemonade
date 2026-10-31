@@ -100,30 +100,22 @@ void LiteRtServer::load(const std::string& model_name,
     }
 
     bool inherit_output = (log_level_ == "info") || is_debug();
-    ProcessHandle started_handle = utils::ProcessManager::start_process(
-        executable, args, "", inherit_output, false, {});
-    set_process_handle(started_handle, executable, args);
-
-    if (!has_process_handle(started_handle)) {
-        throw std::runtime_error("Failed to start litert-lm-server process");
-    }
-    LOG(INFO, "LiteRtServer") << "Process started with PID: " << started_handle.pid << std::endl;
-
-    if (!wait_for_ready("/health")) {
-        unload();
+    ServerCommand command;
+    command.program = executable;
+    command.args = args;
+    command.port = port_;
+    try {
+        start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
+                     command);
+    } catch (const std::runtime_error&) {
+        if (load_cancelled()) throw;
         throw std::runtime_error("litert-lm-server failed to start or become ready");
     }
-    start_backend_watchdog("/health");
     LOG(INFO, "LiteRtServer") << "Server is ready!" << std::endl;
 }
 
 void LiteRtServer::unload() {
-    stop_backend_watchdog();
-    const ProcessHandle handle = consume_process_handle_for_cleanup();
-    if (has_process_handle(handle)) {
-        LOG(INFO, "LiteRtServer") << "Stopping server (PID: " << handle.pid << ")" << std::endl;
-        utils::ProcessManager::stop_process(handle);
-    }
+    stop_server();
 }
 
 json LiteRtServer::chat_completion(const json& request) {

@@ -602,6 +602,11 @@ protected:
 
     bool load_cancelled() const { return load_cancel_ && load_cancel_->load(); }
 
+    // The exit status of a server that exited before its ready endpoint answered, as
+    // start_server() found it; -1 when it was still running (timeout, cancel) or never
+    // started. A backend uses it to tell a signal death apart.
+    int startup_exit_code() const { return startup_exit_code_; }
+
     // Choose an available port
     int choose_port();
 
@@ -671,6 +676,7 @@ protected:
     long load_duration_ms_;
     bool pinned_ = false;
     std::atomic<bool>* load_cancel_ = nullptr;
+    int startup_exit_code_ = -1;
 
 private:
     static uint64_t next_instance_id() {
