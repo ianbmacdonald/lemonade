@@ -113,6 +113,8 @@ def make_handler(args):
             if POISON in image:
                 _log("crashes.log", str(os.getpid()))
                 os.kill(os.getpid(), signal.SIGSEGV)
+                # The signal can land on another thread; never answer this request.
+                time.sleep(60)
             if SLOW in image:
                 time.sleep(SLOW_SECONDS)
             if image.startswith(PNG_SIGNATURE):
