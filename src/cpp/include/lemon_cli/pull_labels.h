@@ -10,6 +10,7 @@ inline const std::vector<std::string>& pull_labels() {
     static const std::vector<std::string> labels = {
         "audio-generation",
         "chat",
+        "classification",
         "coding",
         "dflash",
         "embeddings",
