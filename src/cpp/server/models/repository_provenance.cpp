@@ -109,10 +109,16 @@ std::string processed_snapshot_id(const fs::path& repo_cache_dir, const ModelInf
 // say: which checkpoint of the model landed here. An auxiliary repository
 // records only its own checkpoint, so a shared side cache knows every model
 // that filled it without any of them claiming the whole model.
+std::mutex& provenance_file_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 void record_processed_model(const fs::path& repo_cache_dir, const ModelInfo& info,
                               const Provenance& provenance, const std::string& checkpoint_type) {
     const fs::path provenance_path = repo_cache_dir / kProvenanceFile;
     const bool is_main = checkpoint_type.empty() || checkpoint_type == "main";
+    std::lock_guard<std::mutex> lock(provenance_file_mutex());
 
     json previous;
     json processed = json::object();

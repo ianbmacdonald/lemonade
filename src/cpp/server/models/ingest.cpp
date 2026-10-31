@@ -21,6 +21,7 @@
 #include <lemon/models/registry_descriptors.h>
 #include <lemon/models/routing_parse_options.h>
 #include <lemon/models/registry_documents.h>
+#include <lemon/models/repository_provenance.h>
 #include <lemon/models/store.h>
 #include <lemon/registry_files.h>
 #include <lemon/runtime_config.h>
@@ -942,6 +943,7 @@ void ModelIngest::forget_registry_provenance(const ModelInfo& info) {
         path_from_utf8(artifacts().root()) /
         backends::hf_cache::repo_id_to_cache_dir_name(main_repo_id, registry_source_of(info)) /
         ".lemonade_registry.json";
+    std::lock_guard<std::mutex> provenance_lock(models::provenance_file_mutex());
     if (!safe_exists(provenance_path)) {
         return;
     }

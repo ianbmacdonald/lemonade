@@ -3,6 +3,7 @@
 #include <lemon/models/artifact_store.h>
 
 #include <filesystem>
+#include <mutex>
 #include <string>
 
 namespace lemon {
@@ -25,6 +26,12 @@ void remove_unused_snapshot(const std::filesystem::path& repo_cache_dir,
 // there is none, or when what was processed is not this selection.
 std::string processed_snapshot_id(const std::filesystem::path& repo_cache_dir,
                                   const ModelInfo& info);
+
+// Held across every read-modify-write of a provenance file. Pulls of different
+// models hold different repository locks yet share auxiliary repositories, so
+// without it one pull's write can drop another's pin. A leaf lock: take no
+// other lock while holding it.
+std::mutex& provenance_file_mutex();
 
 // checkpoint_type names the slot whose bytes landed in this repository; empty means main.
 void record_processed_model(const std::filesystem::path& repo_cache_dir, const ModelInfo& info,

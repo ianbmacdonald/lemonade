@@ -9,10 +9,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 using lemon::ModelInfo;
@@ -166,6 +168,45 @@ void test_a_moved_main_snapshot_keeps_the_one_it_left_named() {
           "the checkpoint slot moves to the new snapshot");
 }
 
+// Pulls of different models hold different repository locks, so two of them
+// can record into one shared repository at the same moment.
+void test_concurrent_writes_to_a_shared_file_keep_every_entry() {
+    ModelArtifactStore store = make_store();
+    const fs::path aux_dir = lemon::test::make_scratch_dir("concurrent-aux");
+
+    ModelInfo first = two_checkpoint_model();
+    ModelInfo second = first;
+    second.model_name = "user.Other-Part";
+    Provenance pin = provenance("vendor/aux", "snap-aux-1");
+    pin.pinned = true;
+
+    bool every_round_kept_both = true;
+    for (int round = 0; round < 200 && every_round_kept_both; ++round) {
+        fs::remove(aux_dir / ".lemonade_registry.json");
+        std::atomic<int> ready{0};
+        auto writer = [&](const ModelInfo& info, const Provenance& p, const std::string& type) {
+            ++ready;
+            while (ready.load() < 2) {
+            }
+            store.record_processed_model(aux_dir, info, p, type);
+        };
+        std::thread a(writer, std::cref(first), provenance("vendor/aux", "snap-aux-1"), "side");
+        std::thread b(writer, std::cref(second), pin, "main");
+        a.join();
+        b.join();
+        try {
+            const nlohmann::json file = read(aux_dir);
+            every_round_kept_both = file["processed_models"].contains("user.Two-Part") &&
+                                    file["processed_models"].contains("user.Other-Part") &&
+                                    file["processed_models"]["user.Other-Part"].value(
+                                        "pinned_revision", "") == "snap-aux-1";
+        } catch (const std::exception&) {
+            every_round_kept_both = false;
+        }
+    }
+    check(every_round_kept_both, "concurrent writers to one file keep both entries and the pin");
+}
+
 }  // namespace
 
 int main() {
@@ -175,6 +216,7 @@ int main() {
     test_a_v2_write_records_each_checkpoint_where_it_lands();
     test_two_models_share_an_auxiliary_file_without_quarrelling();
     test_a_moved_main_snapshot_keeps_the_one_it_left_named();
+    test_concurrent_writes_to_a_shared_file_keep_every_entry();
 
     if (!g_failures.empty()) {
         std::cerr << g_failures.size() << " failure(s)" << std::endl;
