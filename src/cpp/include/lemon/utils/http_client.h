@@ -219,7 +219,7 @@ public:
                                         HttpSecurityPolicy policy = HttpSecurityPolicy::ExternalHttpsOnly,
                                         const CancelToken& cancel = CancelToken());
 
-    // Bytes of output_path + ".partial" that a resumed download_file will keep.
+    // Bytes of output_path's partial file that a resumed download_file will keep.
     // Differs from the partial's file size while an interrupted parallel
     // download has left out-of-order ranges past its contiguous prefix.
     static size_t resumable_partial_bytes(const std::string& output_path);
@@ -247,7 +247,7 @@ private:
                                            const CancelToken& cancel);
 
     // One attempt over concurrent Range requests for bytes
-    // [resume_from, total_size) of the .partial file. Sets
+    // [resume_from, total_size) of the partial file. Sets
     // fall_back_single_stream when a server ignored or rejected (416) a
     // ranged request.
     static DownloadResult parallel_download_attempt(const std::string& url,

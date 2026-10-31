@@ -533,6 +533,7 @@ int main() {
         }
     }
     const std::vector<std::string> allowed_spawners = {
+        "test/cpp/test_beacon_listener_socket.cpp",  // ip(8) builds dummy links in its own netns
         "test/cpp/test_process_manager.cpp",  // process management is the subject
     };
     check("only the named test spawns a process", spawners == allowed_spawners);
