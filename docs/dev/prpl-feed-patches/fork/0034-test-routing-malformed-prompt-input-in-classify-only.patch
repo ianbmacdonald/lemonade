@@ -1,0 +1,50 @@
+From e144452da38de95c976c34909d3a2a76d117b8a5 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 18:34:03 -0400
+Subject: [PATCH 34/58] test(routing): malformed prompt/input in classify-only
+ validate return 400
+
+Assisted-by: claude:opus-5.5
+---
+ test/server_endpoints.py | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/test/server_endpoints.py b/test/server_endpoints.py
+index 7ec217cf3..ca51cc3bf 100644
+--- a/test/server_endpoints.py
++++ b/test/server_endpoints.py
+@@ -5735,6 +5735,31 @@ class EndpointTests(ServerTestBase):
+                 self.assertEqual(flagged.status_code, 400, flagged.text)
+                 self.assertIn(flag, flagged.json()["error"])
+ 
++            for bad_field in (
++                {"prompt": [{"text": "hi"}]},
++                {"prompt": [None]},
++                {"input": 42},
++            ):
++                malformed = requests.post(
++                    f"{self.base_url}/routing/validate",
++                    json={"model": canonical_name, **bad_field},
++                    timeout=TIMEOUT_DEFAULT,
++                )
++                self.assertEqual(malformed.status_code, 400, malformed.text)
++                self.assertIn(next(iter(bad_field)), malformed.json()["error"])
++
++            for accepted in (
++                {"prompt": [1, 2, 3]},
++                {"prompt": ["def f", "code"]},
++                {"input": [{"role": "user", "content": "code"}]},
++            ):
++                ok = requests.post(
++                    f"{self.base_url}/routing/validate",
++                    json={"model": canonical_name, **accepted},
++                    timeout=TIMEOUT_DEFAULT,
++                )
++                self.assertEqual(ok.status_code, 200, ok.text)
++
+             bad_model = requests.post(
+                 f"{self.base_url}/routing/validate",
+                 json={"model": 42, "prompt": "hi"},
+-- 
+2.53.0
+

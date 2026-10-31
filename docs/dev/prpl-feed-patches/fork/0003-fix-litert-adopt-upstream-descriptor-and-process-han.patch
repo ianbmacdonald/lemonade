@@ -1,0 +1,61 @@
+From 656710c79e02125fd06818abe1f6b6d9b067d769 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 26 Sep 2026 21:00:03 -0400
+Subject: [PATCH 03/58] fix(litert): adopt upstream descriptor and
+ process-handle APIs
+
+supported_modes/default_capabilities replace default_labels/modality,
+litert::capabilities() feeds the generated capability table, and
+set_process_handle now records the executable and args.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/backends/litert/litert.h        | 4 ++--
+ src/cpp/include/lemon/backends/litert/litert_server.h | 1 +
+ src/cpp/server/backends/litert/litert_server.cpp      | 2 +-
+ 3 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/cpp/include/lemon/backends/litert/litert.h b/src/cpp/include/lemon/backends/litert/litert.h
+index a95a585eb..d734cb4b0 100644
+--- a/src/cpp/include/lemon/backends/litert/litert.h
++++ b/src/cpp/include/lemon/backends/litert/litert.h
+@@ -29,9 +29,9 @@ inline const BackendDescriptor descriptor = {
+     /*support*/ {
+         {"system", {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
+     },
+-    /*default_labels*/  {},
++    /*supported_modes*/ {"chat"},
+     /*required_checkpoints*/ {"main"},
+-    /*modality*/        "Text generation",
++    /*default_capabilities*/ {},
+     /*experimental*/    true,
+     /*web_display_name*/ "",
+     /*rocm_channels*/   {},
+diff --git a/src/cpp/include/lemon/backends/litert/litert_server.h b/src/cpp/include/lemon/backends/litert/litert_server.h
+index 38087136f..27f2d0a16 100644
+--- a/src/cpp/include/lemon/backends/litert/litert_server.h
++++ b/src/cpp/include/lemon/backends/litert/litert_server.h
+@@ -42,6 +42,7 @@ namespace litert {
+ std::unique_ptr<WrappedServer> create(const BackendContext& ctx);
+ const BackendSpec* spec();
+ const BackendOps* ops();
++constexpr uint32_t capabilities() { return capability_mask_of<LiteRtServer>(); }
+ }  // namespace litert
+ }  // namespace backends
+ }  // namespace lemon
+diff --git a/src/cpp/server/backends/litert/litert_server.cpp b/src/cpp/server/backends/litert/litert_server.cpp
+index 29148aa5b..821ea3fb4 100644
+--- a/src/cpp/server/backends/litert/litert_server.cpp
++++ b/src/cpp/server/backends/litert/litert_server.cpp
+@@ -102,7 +102,7 @@ void LiteRtServer::load(const std::string& model_name,
+     bool inherit_output = (log_level_ == "info") || is_debug();
+     ProcessHandle started_handle = utils::ProcessManager::start_process(
+         executable, args, "", inherit_output, false, {});
+-    set_process_handle(started_handle);
++    set_process_handle(started_handle, executable, args);
+ 
+     if (!has_process_handle(started_handle)) {
+         throw std::runtime_error("Failed to start litert-lm-server process");
+-- 
+2.53.0
+

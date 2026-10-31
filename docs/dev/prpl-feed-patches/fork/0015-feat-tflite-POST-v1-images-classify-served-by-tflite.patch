@@ -1,0 +1,1807 @@
+From e5663cf8ec89ca5e89e3dbb0159de379095d4b97 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:19:59 -0400
+Subject: [PATCH 15/58] feat(tflite): POST /v1/images/classify served by
+ tflite-server image models
+
+Adds an image-classification deployment mode: ModelType::IMAGE_CLASSIFICATION,
+the IImageClassificationServer capability, Router::classify_image and the
+images/classify route under all four prefixes. The tflite backend detects a
+text or image model directory, checks it against the model's type, confirms
+the subprocess task over /health, and forwards raw image bytes as multipart
+to tflite-server's /classify/image.
+
+Image requests are capped before the body is read (411/413 from the
+pre-routing handler), validated strictly (JPEG/PNG magic, strict base64,
+16 MiB decoded), and never replayed after a backend crash: the backend is
+reloaded and the client gets 502 backend_crashed_on_input. Backend 4xx
+statuses nested under error.details now reach the client.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                                |  39 +++
+ .../include/lemon/backends/tflite/tflite.h    |   8 +-
+ .../lemon/backends/tflite/tflite_layout.h     |  25 ++
+ .../lemon/backends/tflite/tflite_server.h     |  17 +-
+ .../include/lemon/image_classify_request.h    |  59 +++++
+ src/cpp/include/lemon/model_types.h           |  10 +-
+ src/cpp/include/lemon/router.h                |   6 +-
+ src/cpp/include/lemon/server_capabilities.h   |  16 +-
+ .../backends/backend_descriptor_registry.cpp  |   1 +
+ .../server/backends/tflite/tflite_layout.cpp  | 108 ++++++++
+ .../server/backends/tflite/tflite_server.cpp  | 153 ++++++++---
+ src/cpp/server/core/request_middleware.cpp    |  29 +-
+ src/cpp/server/image_classify_request.cpp     | 200 ++++++++++++++
+ src/cpp/server/router.cpp                     |  67 ++++-
+ .../routes/lemonade/inference/classify.cpp    |  13 +-
+ .../routes/openai/images/images_classify.cpp  | 249 ++++++++++++++++++
+ .../server/routes/openai/images/routes.cpp    |   2 +
+ test/cpp/test_backend_mode_contract.cpp       |   5 +
+ test/cpp/test_image_classify_request.cpp      | 193 ++++++++++++++
+ test/cpp/test_model_type_classifier.cpp       |  13 +-
+ test/cpp/test_tflite_layout.cpp               | 121 +++++++++
+ 21 files changed, 1283 insertions(+), 51 deletions(-)
+ create mode 100644 src/cpp/include/lemon/backends/tflite/tflite_layout.h
+ create mode 100644 src/cpp/include/lemon/image_classify_request.h
+ create mode 100644 src/cpp/server/backends/tflite/tflite_layout.cpp
+ create mode 100644 src/cpp/server/image_classify_request.cpp
+ create mode 100644 src/cpp/server/routes/openai/images/images_classify.cpp
+ create mode 100644 test/cpp/test_image_classify_request.cpp
+ create mode 100644 test/cpp/test_tflite_layout.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6156f4686..d3c39610f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1109,6 +1109,7 @@ set(SOURCES_CORE
+     src/cpp/server/models/routing_parse_options.cpp
+     src/cpp/server/models/registry_repository.cpp
+     src/cpp/server/hf_variants.cpp
++    src/cpp/server/image_classify_request.cpp
+     src/cpp/server/wrapped_server.cpp
+     src/cpp/server/server_process.cpp
+     src/cpp/server/streaming_proxy.cpp
+@@ -2702,6 +2703,44 @@ if(BUILD_TESTING AND EXISTS "${_MODEL_TYPE_CLASSIFIER_TEST_SRC}")
+     add_cpp_ci_test(ModelTypeClassifierTest CI ON COMMAND test_model_type_classifier)
+ endif()
+ 
++# Request parsing and size limits for POST /v1/images/classify. Pure functions,
++# so the test compiles the one source it needs.
++set(_IMAGE_CLASSIFY_REQUEST_TEST_SRC
++    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_image_classify_request.cpp"
++)
++if(BUILD_TESTING AND EXISTS "${_IMAGE_CLASSIFY_REQUEST_TEST_SRC}")
++    add_executable(test_image_classify_request
++        test/cpp/test_image_classify_request.cpp
++        src/cpp/server/image_classify_request.cpp
++    )
++    target_include_directories(test_image_classify_request PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
++    )
++    target_link_libraries(test_image_classify_request PRIVATE nlohmann_json::nlohmann_json)
++
++    include(CTest)
++    add_cpp_ci_test(ImageClassifyRequestTest CI ON COMMAND test_image_classify_request)
++endif()
++
++# tflite model-directory layout detection (text vs image classifier).
++set(_TFLITE_LAYOUT_TEST_SRC
++    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_tflite_layout.cpp"
++)
++if(BUILD_TESTING AND EXISTS "${_TFLITE_LAYOUT_TEST_SRC}")
++    add_executable(test_tflite_layout
++        test/cpp/test_tflite_layout.cpp
++    )
++    target_include_directories(test_tflite_layout PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
++        ${CMAKE_CURRENT_BINARY_DIR}/include
++    )
++    target_link_libraries(test_tflite_layout PRIVATE lemonade-server-core)
++    add_dependencies(test_tflite_layout copy_resources)
++
++    include(CTest)
++    add_cpp_ci_test(TfliteLayoutTest CI ON COMMAND test_tflite_layout)
++endif()
++
+ set(_DOCS_ENDPOINT_TEST_SRC
+     "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_docs_endpoint.cpp"
+ )
+diff --git a/src/cpp/include/lemon/backends/tflite/tflite.h b/src/cpp/include/lemon/backends/tflite/tflite.h
+index 74ed328a0..bda92493f 100644
+--- a/src/cpp/include/lemon/backends/tflite/tflite.h
++++ b/src/cpp/include/lemon/backends/tflite/tflite.h
+@@ -9,8 +9,10 @@ namespace tflite {
+ // The TFLite backend descriptor (plain data). Serves text classification on
+ // /v1/classify through a tflite-server subprocess: the ort-server /classify
+ // contract on a LiteRT engine, so the same model directory layout (plus
+-// model.tflite) and the same scores. Like litert, the binary is a pre-built
+-// executable on PATH; there is nothing to download or install.
++// model.tflite) and the same scores. Image models go to /v1/images/classify and
++// need tflite-server >= 0.2.0. Like litert, the binary is a pre-built executable
++// on PATH; there is nothing to download or install. "classification" stays first:
++// it is the default mode the generated docs describe.
+ inline const BackendDescriptor descriptor = {
+     /*recipe*/          "tflite",
+     /*display_name*/    "TFLite",
+@@ -28,7 +30,7 @@ inline const BackendDescriptor descriptor = {
+     /*support*/ {
+         {"system", {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
+     },
+-    /*supported_modes*/ {"classification"},
++    /*supported_modes*/ {"classification", "image-classification"},
+     /*required_checkpoints*/ {"main"},
+     /*default_capabilities*/ {},
+     /*experimental*/    true,
+diff --git a/src/cpp/include/lemon/backends/tflite/tflite_layout.h b/src/cpp/include/lemon/backends/tflite/tflite_layout.h
+new file mode 100644
+index 000000000..83714043b
+--- /dev/null
++++ b/src/cpp/include/lemon/backends/tflite/tflite_layout.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <filesystem>
++#include <vector>
++
++namespace lemon {
++namespace backends {
++namespace tflite {
++
++enum class TfliteLayout { None, Text, Image };
++
++// Text:  model.tflite + tokenizer.json + config.json (manifest.json optional).
++// Image: model.tflite + manifest.json {"task": "image-classification"} + the
++//        labels file the manifest names.
++// Runs during bulk model listing, so it never throws.
++TfliteLayout detect_tflite_layout(const std::filesystem::path& dir) noexcept;
++
++const char* tflite_layout_name(TfliteLayout layout) noexcept;
++
++// Every directory under root that holds a servable model, sorted.
++std::vector<std::filesystem::path> find_complete_model_dirs(const std::filesystem::path& root);
++
++}  // namespace tflite
++}  // namespace backends
++}  // namespace lemon
+diff --git a/src/cpp/include/lemon/backends/tflite/tflite_server.h b/src/cpp/include/lemon/backends/tflite/tflite_server.h
+index 43da39daa..1e7cc1a6f 100644
+--- a/src/cpp/include/lemon/backends/tflite/tflite_server.h
++++ b/src/cpp/include/lemon/backends/tflite/tflite_server.h
+@@ -10,11 +10,12 @@
+ namespace lemon {
+ namespace backends {
+ 
+-// Runs an exported TFLite model as a tflite-server subprocess. v1 serves text
+-// classification (/v1/classify): input text -> {label: score}, CPU EP. The
+-// server is generic; embeddings/reranking are future capabilities on the same
+-// backend (issue #2592).
+-class TfliteServer : public WrappedServer, public IClassificationServer {
++// Runs an exported TFLite model as a tflite-server subprocess on the CPU. A text
++// model serves /v1/classify (text -> {label: score}); an image model serves
++// /v1/images/classify (image -> ranked labels), which needs tflite-server >= 0.2.0.
++class TfliteServer : public WrappedServer,
++                     public IClassificationServer,
++                     public IImageClassificationServer {
+ public:
+     static InstallParams get_install_params(const std::string& backend, const std::string& version);
+ 
+@@ -34,7 +35,13 @@ public:
+     // IClassificationServer
+     json classify(const json& request) override;
+ 
++    // IImageClassificationServer
++    json classify_image(const json& params, std::string image_bytes) override;
++
+ private:
++    // The /health "task" the loaded subprocess must report.
++    std::string expected_task_;
++
+     // Forward a classify request to the subprocess and normalize its response.
+     json forward_classify(const std::string& text, const json& params);
+ };
+diff --git a/src/cpp/include/lemon/image_classify_request.h b/src/cpp/include/lemon/image_classify_request.h
+new file mode 100644
+index 000000000..0ecebcb8a
+--- /dev/null
++++ b/src/cpp/include/lemon/image_classify_request.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <nlohmann/json.hpp>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace lemon {
++namespace image_classify {
++
++using json = nlohmann::json;
++
++constexpr std::size_t kMaxImageBytes = 16u * 1024u * 1024u;
++// Base64 of kMaxImageBytes plus room for the JSON or multipart framing.
++constexpr std::uint64_t kMaxImageClassifyRequestBytes = 23ull * 1024ull * 1024ull;
++
++constexpr int kDefaultTopK = 5;
++constexpr long long kMaxTopK = 1000000;
++
++// A validated /v1/images/classify request. On failure status is the HTTP status
++// to return and error says why; params and bytes are then meaningless.
++struct ParsedRequest {
++    json params = json::object();  // "model" and "top_k" when given; never the image
++    std::string bytes;
++    std::string mime;
++    int status = 200;
++    std::string error;
++
++    bool ok() const { return status == 200; }
++};
++
++ParsedRequest parse_json(const std::string& body);
++
++// Multipart input: form fields as sent, and every file part named "image" or
++// "file". Anything but exactly one such part is a 400.
++ParsedRequest from_form(const std::optional<std::string>& model,
++                        const std::optional<std::string>& top_k,
++                        const std::vector<std::string_view>& file_parts);
++
++// Standard alphabet only, '=' padding, ASCII whitespace ignored, length a
++// multiple of 4. Needed because JsonUtils::base64_decode stops silently at the
++// first invalid character instead of failing.
++bool strict_base64_decode(std::string_view in, std::string& out);
++
++// "image/jpeg", "image/png", or "" for anything else.
++std::string sniff_image_mime(std::string_view bytes);
++
++// True for POST targets of this route under any of its four prefixes.
++bool is_image_classify_path(const std::string& path);
++
++// Checked before the body is read: 0 to proceed, 411 when there is no
++// Content-Length (chunked), 413 when it exceeds kMaxImageClassifyRequestBytes.
++int precheck_content_length(bool has_length, std::uint64_t length);
++
++}  // namespace image_classify
++}  // namespace lemon
+diff --git a/src/cpp/include/lemon/model_types.h b/src/cpp/include/lemon/model_types.h
+index 77bcd873b..e3a7925c6 100644
+--- a/src/cpp/include/lemon/model_types.h
++++ b/src/cpp/include/lemon/model_types.h
+@@ -56,7 +56,10 @@ enum class ModelType {
+     TTS,
+     AUDIO_GENERATION,  // text -> audio clip (music, sound effects)
+     CLASSIFICATION,    // text -> {label: score} (router classifier models)
+-    MESH               // image -> 3D mesh (glTF-binary)
++    MESH,              // image -> 3D mesh (glTF-binary)
++    // image -> ranked labels. Kept apart from CLASSIFICATION so image models never
++    // join the text-classifier pool the router's `classifier` condition reads.
++    IMAGE_CLASSIFICATION
+ };
+ 
+ // Bitmask pattern for models that use multiple devices
+@@ -91,6 +94,7 @@ inline std::string model_type_to_string(ModelType type) {
+         case ModelType::AUDIO_GENERATION: return "audio-generation";
+         case ModelType::CLASSIFICATION: return "classification";
+         case ModelType::MESH: return "mesh";
++        case ModelType::IMAGE_CLASSIFICATION: return "image-classification";
+         default: return "unknown";
+     }
+ }
+@@ -171,6 +175,10 @@ inline bool find_deployment_mode(const Labels& labels, ModelType& out) {
+             out = ModelType::MESH;
+             return true;
+         }
++        if (label == "image-classification") {
++            out = ModelType::IMAGE_CLASSIFICATION;
++            return true;
++        }
+     }
+     return false;
+ }
+diff --git a/src/cpp/include/lemon/router.h b/src/cpp/include/lemon/router.h
+index a16f19e1a..7c59c6e2a 100644
+--- a/src/cpp/include/lemon/router.h
++++ b/src/cpp/include/lemon/router.h
+@@ -226,6 +226,7 @@ public:
+     json embeddings(const json& request);
+     json reranking(const json& request);
+     json classify(const json& request);
++    json classify_image(const json& params, std::string image_bytes);
+     json get_slots();
+     json slots_action(int slot_id, const std::string& action, const json& request_body);
+     json tokenize(const json& request);
+@@ -408,8 +409,11 @@ private:
+     void record_request_telemetry_for_model(const ModelTelemetryIdentity& identity,
+                                             const StreamingProxy::TelemetryData& telemetry);
+ 
++    // retry_after_watchdog_reset=false is for requests whose input may itself be
++    // what crashed the backend: replaying it would crash the fresh one too.
+     template<typename Func>
+-    auto execute_inference(const json& request, Func&& inference_func) -> decltype(inference_func(nullptr));
++    auto execute_inference(const json& request, Func&& inference_func,
++                           bool retry_after_watchdog_reset = true) -> decltype(inference_func(nullptr));
+ 
+     template<typename Func>
+     void execute_streaming(const std::string& request_body, httplib::DataSink& sink, Func&& streaming_func, std::shared_ptr<telemetry::InferenceSpan> span = nullptr);
+diff --git a/src/cpp/include/lemon/server_capabilities.h b/src/cpp/include/lemon/server_capabilities.h
+index d3f44d358..4503840c8 100644
+--- a/src/cpp/include/lemon/server_capabilities.h
++++ b/src/cpp/include/lemon/server_capabilities.h
+@@ -84,6 +84,15 @@ public:
+     virtual json classify(const json& request) = 0;
+ };
+ 
++// Image-classification capability. The image travels as raw bytes, never inside
++// a json: nlohmann's dump() throws on non-UTF-8 strings and telemetry spans
++// serialize request json.
++class IImageClassificationServer : public virtual ICapability {
++public:
++    virtual ~IImageClassificationServer() = default;
++    virtual json classify_image(const json& params, std::string image_bytes) = 0;
++};
++
+ class IImageServer : public virtual ICapability {
+ public:
+     virtual ~IImageServer() = default;
+@@ -154,9 +163,10 @@ enum CapabilityMask : uint32_t {
+     CAP_AUDIO_GENERATION        = 1u << 7,
+     CAP_MODEL_3D                = 1u << 8,
+     CAP_UPSCALE                 = 1u << 9,
++    CAP_IMAGE_CLASSIFICATION    = 1u << 10,
+     // Every bit above. BackendModeContractTest sweeps this so a capability added
+     // without being classified fails the test instead of going unchecked.
+-    CAP_ALL                     = (1u << 10) - 1,
++    CAP_ALL                     = (1u << 11) - 1,
+ };
+ 
+ template<typename T>
+@@ -171,7 +181,9 @@ constexpr uint32_t capability_mask_of() {
+            (std::is_base_of<IImageServer, T>::value ? CAP_IMAGE : 0u) |
+            (std::is_base_of<IAudioGenerationServer, T>::value ? CAP_AUDIO_GENERATION : 0u) |
+            (std::is_base_of<IModel3DServer, T>::value ? CAP_MODEL_3D : 0u) |
+-           (std::is_base_of<IUpscaleServer, T>::value ? CAP_UPSCALE : 0u);
++           (std::is_base_of<IUpscaleServer, T>::value ? CAP_UPSCALE : 0u) |
++           (std::is_base_of<IImageClassificationServer, T>::value
++                ? CAP_IMAGE_CLASSIFICATION : 0u);
+ }
+ 
+ } // namespace lemon
+diff --git a/src/cpp/server/backends/backend_descriptor_registry.cpp b/src/cpp/server/backends/backend_descriptor_registry.cpp
+index 9b1f75cce..ec153f193 100644
+--- a/src/cpp/server/backends/backend_descriptor_registry.cpp
++++ b/src/cpp/server/backends/backend_descriptor_registry.cpp
+@@ -81,6 +81,7 @@ std::string modality_display_for(const BackendDescriptor& descriptor) {
+         {ModelType::AUDIO_GENERATION, "Audio generation"},
+         {ModelType::CLASSIFICATION, "Text classification"},
+         {ModelType::MESH, "3D generation"},
++        {ModelType::IMAGE_CLASSIFICATION, "Image classification"},
+     };
+     if (descriptor.supported_modes.empty()) return "";
+     ModelType mode = ModelType::LLM;
+diff --git a/src/cpp/server/backends/tflite/tflite_layout.cpp b/src/cpp/server/backends/tflite/tflite_layout.cpp
+new file mode 100644
+index 000000000..6c62008ea
+--- /dev/null
++++ b/src/cpp/server/backends/tflite/tflite_layout.cpp
+@@ -0,0 +1,108 @@
++#include "lemon/backends/tflite/tflite_layout.h"
++
++#include "lemon/backends/hf_cache_util.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <fstream>
++#include <iterator>
++#include <nlohmann/json.hpp>
++#include <string>
++#include <system_error>
++
++namespace fs = std::filesystem;
++
++namespace lemon {
++namespace backends {
++namespace tflite {
++
++namespace {
++
++constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
++
++// True only for a readable manifest declaring the image-classification task. A
++// text model's optional manifest carries no task, so it falls through to Text.
++bool read_image_manifest(const fs::path& dir, std::string& labels_file) {
++    std::error_code ec;
++    const fs::path manifest = dir / "manifest.json";
++    if (!fs::is_regular_file(manifest, ec) || ec) return false;
++    const auto size = fs::file_size(manifest, ec);
++    if (ec || size > kMaxManifestBytes) return false;
++
++    std::ifstream in(manifest, std::ios::binary);
++    if (!in) return false;
++    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    const nlohmann::json doc = nlohmann::json::parse(text, nullptr, false);
++    if (!doc.is_object()) return false;
++    const auto task = doc.find("task");
++    if (task == doc.end() || !task->is_string() ||
++        task->get<std::string>() != "image-classification") {
++        return false;
++    }
++    labels_file = "labels.txt";
++    const auto labels = doc.find("labels_file");
++    if (labels != doc.end()) {
++        if (!labels->is_string()) return false;
++        labels_file = labels->get<std::string>();
++    }
++    // The labels file must sit in the model dir; a path that climbs out of it
++    // would let a manifest point the backend anywhere on disk.
++    const fs::path rel(labels_file);
++    if (labels_file.empty() || rel.is_absolute() || rel.has_root_path()) return false;
++    for (const auto& part : rel) {
++        if (part == "..") return false;
++    }
++    return true;
++}
++
++}  // namespace
++
++TfliteLayout detect_tflite_layout(const fs::path& dir) noexcept {
++    try {
++        std::error_code ec;
++        if (!fs::exists(dir / "model.tflite", ec) || ec) return TfliteLayout::None;
++
++        std::string labels_file;
++        if (read_image_manifest(dir, labels_file)) {
++            return fs::is_regular_file(dir / fs::path(labels_file), ec) && !ec
++                       ? TfliteLayout::Image
++                       : TfliteLayout::None;
++        }
++        // The config is mandatory even when a manifest is present: the manifest
++        // describes the output contract only, and the backend checks the
++        // architecture in config.json against its supported input convention.
++        if (fs::exists(dir / "tokenizer.json", ec) && fs::exists(dir / "config.json", ec)) {
++            return TfliteLayout::Text;
++        }
++    } catch (...) {
++    }
++    return TfliteLayout::None;
++}
++
++const char* tflite_layout_name(TfliteLayout layout) noexcept {
++    switch (layout) {
++        case TfliteLayout::Text: return "text-classifier";
++        case TfliteLayout::Image: return "image-classifier";
++        default: return "unrecognized";
++    }
++}
++
++std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
++    std::vector<fs::path> dirs;
++    std::error_code ec;
++    fs::recursive_directory_iterator it(root, hf_cache::dir_options(), ec);
++    if (ec) return dirs;
++    for (auto end = fs::recursive_directory_iterator(); it != end; it.increment(ec)) {
++        if (ec) break;
++        if (it->is_regular_file(ec) && !ec && it->path().filename() == "model.tflite" &&
++            detect_tflite_layout(it->path().parent_path()) != TfliteLayout::None) {
++            dirs.push_back(it->path().parent_path());
++        }
++    }
++    std::sort(dirs.begin(), dirs.end());
++    return dirs;
++}
++
++}  // namespace tflite
++}  // namespace backends
++}  // namespace lemon
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index 3660459fe..015ee2728 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -1,10 +1,12 @@
+ #include "lemon/backends/tflite/tflite_server.h"
+ #include "lemon/backends/tflite/tflite.h"
++#include "lemon/backends/tflite/tflite_layout.h"
+ #include "lemon/backends/backend_registry.h"
+ #include "lemon/backends/backend_ops.h"
+ #include "lemon/backends/backend_utils.h"
+ #include "lemon/backends/hf_cache_util.h"
+ #include "lemon/backend_manager.h"
++#include "lemon/error_types.h"
+ #include "lemon/utils/path_utils.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
+@@ -24,16 +26,6 @@ namespace lemon {
+ namespace backends {
+ 
+ namespace {
+-// A directory tflite-server can actually serve: the graph, the HF tokenizer, and
+-// config.json. The config is mandatory even when a manifest is present — the
+-// manifest describes the output contract only, so the backend still needs the
+-// config to check the architecture against its supported input convention.
+-bool is_complete_model_dir(const fs::path& dir) {
+-    std::error_code ec;
+-    return fs::exists(dir / "model.tflite", ec) && fs::exists(dir / "tokenizer.json", ec) &&
+-           fs::exists(dir / "config.json", ec);
+-}
+-
+ // Relaunch tflite-server just long enough to read the error it prints before
+ // exiting. It refuses a model (unsupported architecture, bad manifest, corrupt
+ // tokenizer) by writing one "tflite-server: ..." line to stderr and exiting.
+@@ -89,28 +81,64 @@ std::string capture_startup_error(const std::string& executable,
+     return captured;
+ }
+ 
+-std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
+-    std::vector<fs::path> dirs;
+-    std::error_code ec;
+-    fs::recursive_directory_iterator it(root, hf_cache::dir_options(), ec);
+-    if (ec) return dirs;
+-    for (auto end = fs::recursive_directory_iterator(); it != end; it.increment(ec)) {
+-        if (ec) break;
+-        if (it->is_regular_file(ec) && !ec && it->path().filename() == "model.tflite" &&
+-            is_complete_model_dir(it->path().parent_path())) {
+-            dirs.push_back(it->path().parent_path());
++const char* task_for_type(ModelType type) {
++    return type == ModelType::IMAGE_CLASSIFICATION ? "image-classification"
++                                                   : "text-classification";
++}
++
++// JPEG and PNG are the only formats the route accepts; the handler has already
++// sniffed the magic, so this just names it for the multipart part.
++std::string image_mime(const std::string& bytes) {
++    if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xFF &&
++        static_cast<unsigned char>(bytes[1]) == 0xD8) {
++        return "image/jpeg";
++    }
++    return "image/png";
++}
++
++// forward_multipart_request nests the backend's status and body under
++// error.details. Lift the backend's own message, code and status to the top so
++// the client sees "image too large" with its 4xx, not a generic 500.
++json normalize_backend_error(json response) {
++    if (!response.contains("error") || !response["error"].is_object()) return response;
++    json& err = response["error"];
++    if (!err.contains("details") || !err["details"].is_object()) return response;
++    const json& details = err["details"];
++    if (!details.contains("status_code") || !details["status_code"].is_number_integer()) {
++        return response;
++    }
++    const int status = details["status_code"].get<int>();
++    err["status_code"] = status;
++    if (status >= 400 && status < 500) err["type"] = "invalid_request_error";
++    if (details.contains("response")) {
++        const json& body = details["response"];
++        if (body.is_object() && body.contains("error")) {
++            const json& backend_error = body["error"];
++            if (backend_error.is_string()) {
++                err["message"] = backend_error;
++            } else if (backend_error.is_object()) {
++                if (backend_error.contains("message") && backend_error["message"].is_string()) {
++                    err["message"] = backend_error["message"];
++                }
++                if (backend_error.contains("code") && backend_error["code"].is_string()) {
++                    err["code"] = backend_error["code"];
++                }
++            }
++        } else if (body.is_string() && !body.get<std::string>().empty()) {
++            err["message"] = body;
+         }
+     }
+-    std::sort(dirs.begin(), dirs.end());
+-    return dirs;
++    return response;
+ }
+ }  // namespace
+ 
+ // The tflite-server subprocess speaks ort-server's HTTP contract:
+-//   GET  /health             -> 200 when the model is loaded and ready
+-//   POST /classify {text}    -> 200 {"labels": {"<label>": <score in [0,1]>, ...}}
+-// It runs one exported .tflite model (seq- or token-classification) with LiteRT
+-// on the CPU. The binary is a pre-built executable on PATH.
++//   GET  /health               -> 200 {"status": "ok", "task": "<task>"} once ready
++//   POST /classify {text}      -> 200 {"labels": {"<label>": <score in [0,1]>, ...}}
++//   POST /classify/image       -> 200 {"predictions": [{index, label, score}], ...}
++// It runs one exported .tflite model with LiteRT on the CPU. /classify/image and
++// the "task" field arrive in tflite-server 0.2.0. The binary is a pre-built
++// executable on PATH.
+ InstallParams TfliteServer::get_install_params(const std::string& backend,
+                                                const std::string& version) {
+     (void)backend;
+@@ -152,12 +180,14 @@ void TfliteServer::load(const std::string& model_name,
+     // to the cache root when resolution is ambiguous, so a complete root that also
+     // contains a nested complete model must still be rejected here — never assume
+     // the resolved path is the only candidate.
+-    auto candidates = find_complete_model_dirs(path_from_utf8(model_path));
++    auto candidates = tflite::find_complete_model_dirs(path_from_utf8(model_path));
+     if (candidates.empty()) {
+         throw std::runtime_error(
+             "No servable model directory under '" + model_path +
+-            "': need model.tflite + tokenizer.json + config.json "
+-            "(manifest.json is optional and overrides the output contract)");
++            "': need model.tflite + tokenizer.json + config.json for a text classifier "
++            "(manifest.json is optional and overrides the output contract), or "
++            "model.tflite + manifest.json {\"task\": \"image-classification\"} + its "
++            "labels file for an image classifier");
+     }
+     if (candidates.size() > 1) {
+         std::string listing;
+@@ -170,6 +200,18 @@ void TfliteServer::load(const std::string& model_name,
+     model_path = path_to_utf8(candidates.front());
+     LOG(INFO, "TfliteServer") << "Using model: " << model_path << std::endl;
+ 
++    const bool wants_image = model_info.type == ModelType::IMAGE_CLASSIFICATION;
++    const tflite::TfliteLayout layout = tflite::detect_tflite_layout(candidates.front());
++    const tflite::TfliteLayout wanted =
++        wants_image ? tflite::TfliteLayout::Image : tflite::TfliteLayout::Text;
++    if (layout != wanted) {
++        throw std::runtime_error(
++            "Model '" + model_name + "' is labeled " + model_type_to_string(model_info.type) +
++            " and needs a " + tflite::tflite_layout_name(wanted) + " layout, but '" +
++            model_path + "' is a " + tflite::tflite_layout_name(layout) + " layout");
++    }
++    expected_task_ = task_for_type(model_info.type);
++
+     std::string executable = BackendUtils::get_backend_binary_path(*tflite::spec(), "system");
+     LOG(INFO, "TfliteServer") << "Using executable: " << executable << std::endl;
+ 
+@@ -220,6 +262,24 @@ void TfliteServer::load(const std::string& model_name,
+         throw std::runtime_error("tflite-server failed to start or become ready" +
+                                  (details.empty() ? "" : ": " + details));
+     }
++    // A tflite-server older than 0.2.0 reports no task and cannot serve images;
++    // it would otherwise load and then 404 on every request.
++    json health = forward_get_request("/health");
++    std::string reported_task = "text-classification";
++    if (health.is_object() && health.contains("task") && health["task"].is_string()) {
++        reported_task = health["task"].get<std::string>();
++    }
++    const bool task_ok = reported_task == expected_task_ ||
++                         (!wants_image && reported_task == "token-classification");
++    if (!task_ok) {
++        unload();
++        throw std::runtime_error(
++            wants_image ? "tflite-server >= 0.2.0 required for image-classification "
++                          "(it reported task '" + reported_task + "')"
++                        : "tflite-server reported task '" + reported_task +
++                              "' for a text-classification model");
++    }
++
+     start_backend_watchdog("/health");
+     LOG(INFO, "TfliteServer") << "Server is ready!" << std::endl;
+ }
+@@ -240,6 +300,15 @@ json TfliteServer::forward_classify(const std::string& text, const json& params)
+ }
+ 
+ json TfliteServer::classify(const json& request) {
++    if (expected_task_ == "image-classification") {
++        return json{
++            {"error", {
++                {"message", "This is an image-classification model; POST /v1/images/classify"},
++                {"type", "invalid_request_error"},
++                {"status_code", 400},
++            }}
++        };
++    }
+     // Accept either OpenAI-style "input" or plain "text".
+     std::string text;
+     if (request.contains("text") && request["text"].is_string()) {
+@@ -258,6 +327,27 @@ json TfliteServer::classify(const json& request) {
+     return forward_classify(text, request);
+ }
+ 
++json TfliteServer::classify_image(const json& params, std::string image_bytes) {
++    if (expected_task_ != "image-classification") {
++        return json{
++            {"error", {
++                {"message", "This is a text-classification model; POST /v1/classify"},
++                {"type", "invalid_request_error"},
++                {"status_code", 400},
++            }}
++        };
++    }
++    int top_k = 5;
++    if (params.contains("top_k") && params["top_k"].is_number_integer()) {
++        top_k = params["top_k"].get<int>();
++    }
++    std::vector<utils::MultipartField> fields;
++    std::string mime = image_mime(image_bytes);
++    fields.push_back({"image", std::move(image_bytes), "image", std::move(mime)});
++    fields.push_back({"top_k", std::to_string(top_k), "", ""});
++    return normalize_backend_error(forward_multipart_request("/classify/image", fields, 60));
++}
++
+ }  // namespace backends
+ }  // namespace lemon
+ 
+@@ -270,7 +360,8 @@ std::unique_ptr<WrappedServer> create(const BackendContext& ctx) {
+ }
+ 
+ namespace {
+-// tflite-server models are a directory (model.tflite + tokenizer.json + config.json).
++// tflite-server models are a directory: model.tflite plus either tokenizer.json +
++// config.json (text) or manifest.json + labels (image).
+ // The whole repo downloads by default; resolve to the directory that holds
+ // model.tflite so the subprocess is launched with --model-path <dir>.
+ class TfliteOps : public BackendOps {
+@@ -299,7 +390,7 @@ public:
+         if (!hf_cache::exists(dir)) {
+             return "";
+         }
+-        auto candidates = find_complete_model_dirs(dir);
++        auto candidates = tflite::find_complete_model_dirs(dir);
+         if (candidates.size() != 1) {
+             if (candidates.size() > 1) {
+                 LOG(WARNING, "TfliteServer")
+diff --git a/src/cpp/server/core/request_middleware.cpp b/src/cpp/server/core/request_middleware.cpp
+index ebc1e9fec..fe849983c 100644
+--- a/src/cpp/server/core/request_middleware.cpp
++++ b/src/cpp/server/core/request_middleware.cpp
+@@ -10,6 +10,7 @@
+ #include <nlohmann/json.hpp>
+ 
+ #include "../telemetry.h"
++#include "lemon/image_classify_request.h"
+ #include "lemon/runtime_config.h"
+ #include "lemon/server/route_registry.h"
+ #include "lemon/utils/origin_utils.h"
+@@ -177,7 +178,33 @@ httplib::Server::HandlerResponse RequestMiddleware::pre_route(const httplib::Req
+         }
+     }
+ 
+-    return authenticate(req, res);
++    const auto auth = authenticate(req, res);
++    if (auth == httplib::Server::HandlerResponse::Handled) {
++        return auth;
++    }
++
++    // Runs before httplib reads the body, so an oversized upload is refused
++    // without lemond ever buffering it (httplib's own cap is 100 MB).
++    if (req.method == "POST" && image_classify::is_image_classify_path(req.path)) {
++        const bool has_length = req.has_header("Content-Length");
++        const int status = image_classify::precheck_content_length(
++            has_length, has_length ? req.get_header_value_u64("Content-Length") : 0);
++        if (status != 0) {
++            res.status = status;
++            const bool too_large = status == 413;
++            nlohmann::json error = {{"error", {
++                {"message", too_large
++                    ? "Request body exceeds " +
++                          std::to_string(image_classify::kMaxImageClassifyRequestBytes /
++                                         (1024 * 1024)) + " MiB"
++                    : std::string("Content-Length required")},
++                {"type", "invalid_request_error"},
++                {"code", too_large ? "payload_too_large" : "length_required"}}}};
++            res.set_content(error.dump(), "application/json");
++            return httplib::Server::HandlerResponse::Handled;
++        }
++    }
++    return auth;
+ }
+ 
+ httplib::Server::HandlerResponse RequestMiddleware::authenticate(const httplib::Request& req,
+diff --git a/src/cpp/server/image_classify_request.cpp b/src/cpp/server/image_classify_request.cpp
+new file mode 100644
+index 000000000..cc3425138
+--- /dev/null
++++ b/src/cpp/server/image_classify_request.cpp
+@@ -0,0 +1,200 @@
++#include "lemon/image_classify_request.h"
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <iterator>
++#include <string>
++#include <utility>
++
++namespace lemon {
++namespace image_classify {
++
++namespace {
++
++ParsedRequest fail(int status, std::string message) {
++    ParsedRequest r;
++    r.status = status;
++    r.error = std::move(message);
++    return r;
++}
++
++const char* const kTopKError = "'top_k' must be an integer from 1 to 1000000";
++
++bool starts_with_ci(std::string_view s, std::string_view prefix) {
++    if (s.size() < prefix.size()) return false;
++    for (std::size_t i = 0; i < prefix.size(); ++i) {
++        if (std::tolower(static_cast<unsigned char>(s[i])) !=
++            std::tolower(static_cast<unsigned char>(prefix[i]))) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool is_ascii_space(char c) {
++    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v';
++}
++
++bool parse_top_k_text(const std::string& text, long long& out) {
++    if (text.empty() || text.size() > 7) return false;
++    long long value = 0;
++    for (char c : text) {
++        if (c < '0' || c > '9') return false;
++        value = value * 10 + (c - '0');
++    }
++    out = value;
++    return value >= 1 && value <= kMaxTopK;
++}
++
++// Shared tail of both input forms: size and format checks on decoded bytes.
++ParsedRequest finish(ParsedRequest r) {
++    if (r.bytes.empty()) return fail(400, "'image' is empty");
++    if (r.bytes.size() > kMaxImageBytes) {
++        return fail(413, "image exceeds the " + std::to_string(kMaxImageBytes / (1024 * 1024)) +
++                             " MiB limit");
++    }
++    r.mime = sniff_image_mime(r.bytes);
++    if (r.mime.empty()) return fail(400, "unsupported image format (JPEG or PNG)");
++    return r;
++}
++
++}  // namespace
++
++bool strict_base64_decode(std::string_view in, std::string& out) {
++    static const std::array<int, 256> kTable = [] {
++        std::array<int, 256> t{};
++        t.fill(-1);
++        const char* alphabet =
++            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++        for (int i = 0; i < 64; ++i) t[static_cast<unsigned char>(alphabet[i])] = i;
++        return t;
++    }();
++
++    std::string compact;
++    compact.reserve(in.size());
++    for (char c : in) {
++        if (!is_ascii_space(c)) compact.push_back(c);
++    }
++    if (compact.empty() || compact.size() % 4 != 0) return false;
++
++    std::size_t padding = 0;
++    if (compact.back() == '=') {
++        ++padding;
++        if (compact[compact.size() - 2] == '=') ++padding;
++    }
++    const std::size_t data_len = compact.size() - padding;
++    for (std::size_t i = 0; i < data_len; ++i) {
++        if (kTable[static_cast<unsigned char>(compact[i])] < 0) return false;
++    }
++
++    out.clear();
++    out.reserve(compact.size() / 4 * 3);
++    for (std::size_t i = 0; i < compact.size(); i += 4) {
++        const bool last = i + 4 == compact.size();
++        const int a = kTable[static_cast<unsigned char>(compact[i])];
++        const int b = kTable[static_cast<unsigned char>(compact[i + 1])];
++        const int c = (last && padding == 2) ? 0 : kTable[static_cast<unsigned char>(compact[i + 2])];
++        const int d = (last && padding >= 1) ? 0 : kTable[static_cast<unsigned char>(compact[i + 3])];
++        const unsigned triple = (static_cast<unsigned>(a) << 18) | (static_cast<unsigned>(b) << 12) |
++                                (static_cast<unsigned>(c) << 6) | static_cast<unsigned>(d);
++        out.push_back(static_cast<char>((triple >> 16) & 0xFF));
++        if (!(last && padding == 2)) out.push_back(static_cast<char>((triple >> 8) & 0xFF));
++        if (!(last && padding >= 1)) out.push_back(static_cast<char>(triple & 0xFF));
++    }
++    return true;
++}
++
++std::string sniff_image_mime(std::string_view bytes) {
++    static constexpr unsigned char kPng[] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
++    auto at = [&](std::size_t i) { return static_cast<unsigned char>(bytes[i]); };
++    if (bytes.size() >= 3 && at(0) == 0xFF && at(1) == 0xD8 && at(2) == 0xFF) {
++        return "image/jpeg";
++    }
++    if (bytes.size() >= sizeof(kPng) &&
++        std::equal(std::begin(kPng), std::end(kPng), bytes.begin(),
++                   [](unsigned char a, char b) { return a == static_cast<unsigned char>(b); })) {
++        return "image/png";
++    }
++    return "";
++}
++
++bool is_image_classify_path(const std::string& path) {
++    return path == "/api/v0/images/classify" || path == "/api/v1/images/classify" ||
++           path == "/v0/images/classify" || path == "/v1/images/classify";
++}
++
++int precheck_content_length(bool has_length, std::uint64_t length) {
++    if (!has_length) return 411;
++    if (length > kMaxImageClassifyRequestBytes) return 413;
++    return 0;
++}
++
++ParsedRequest parse_json(const std::string& body) {
++    json doc = json::parse(body, nullptr, false);
++    if (doc.is_discarded()) return fail(400, "Invalid JSON in request body");
++    if (!doc.is_object()) return fail(400, "Request body must be a JSON object");
++
++    if (doc.contains("model") && !doc["model"].is_string()) {
++        return fail(400, "'model' must be a string");
++    }
++    if (doc.contains("top_k")) {
++        const json& k = doc["top_k"];
++        if (!k.is_number_integer() || k.get<long long>() < 1 || k.get<long long>() > kMaxTopK) {
++            return fail(400, kTopKError);
++        }
++    }
++    if (!doc.contains("image") || !doc["image"].is_string()) {
++        return fail(400, "Missing 'image' (base64 or data: URL string)");
++    }
++
++    ParsedRequest r;
++    {
++        const std::string& image = doc["image"].get_ref<const std::string&>();
++        std::string_view view(image);
++        while (!view.empty() && is_ascii_space(view.front())) view.remove_prefix(1);
++
++        if (starts_with_ci(view, "http://") || starts_with_ci(view, "https://")) {
++            return fail(400, "remote image URLs are not supported; send base64 or a data: URL");
++        }
++        if (starts_with_ci(view, "data:")) {
++            const std::size_t comma = view.find(',');
++            if (comma == std::string_view::npos) return fail(400, "malformed data: URL");
++            std::string header(view.substr(5, comma - 5));
++            std::transform(header.begin(), header.end(), header.begin(),
++                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++            if (header != "image/jpeg;base64" && header != "image/jpg;base64" &&
++                header != "image/png;base64") {
++                return fail(400, "data: URL must be image/jpeg or image/png with base64 encoding");
++            }
++            view.remove_prefix(comma + 1);
++        }
++        if (!strict_base64_decode(view, r.bytes)) {
++            return fail(400, "'image' is not valid base64");
++        }
++    }
++
++    doc.erase("image");
++    r.params = std::move(doc);
++    return finish(std::move(r));
++}
++
++ParsedRequest from_form(const std::optional<std::string>& model,
++                        const std::optional<std::string>& top_k,
++                        const std::vector<std::string_view>& file_parts) {
++    if (file_parts.size() != 1) {
++        return fail(400, "exactly one image part ('image' or 'file') required");
++    }
++    ParsedRequest r;
++    if (model && !model->empty()) r.params["model"] = *model;
++    if (top_k) {
++        long long k = 0;
++        if (!parse_top_k_text(*top_k, k)) return fail(400, kTopKError);
++        r.params["top_k"] = k;
++    }
++    r.bytes.assign(file_parts.front().data(), file_parts.front().size());
++    return finish(std::move(r));
++}
++
++}  // namespace image_classify
++}  // namespace lemon
+diff --git a/src/cpp/server/router.cpp b/src/cpp/server/router.cpp
+index 4ba2b24d4..9cb94a8b7 100644
+--- a/src/cpp/server/router.cpp
++++ b/src/cpp/server/router.cpp
+@@ -1444,7 +1444,8 @@ json Router::get_max_model_limits() const {
+         {"transcription", max},
+         {"image", max},
+         {"tts", max},
+-        {"classification", max}
++        {"classification", max},
++        {"image-classification", max}
+     };
+ }
+ 
+@@ -1571,7 +1572,8 @@ std::string Router::get_streaming_transcription_address(const std::string& model
+ }
+ 
+ template<typename Func>
+-auto Router::execute_inference(const json& request, Func&& inference_func) -> decltype(inference_func(nullptr)) {
++auto Router::execute_inference(const json& request, Func&& inference_func,
++                               bool retry_after_watchdog_reset) -> decltype(inference_func(nullptr)) {
+     std::string requested_model;
+     if (request.contains("model") && request["model"].is_string()) {
+         requested_model = request["model"].get<std::string>();
+@@ -1651,11 +1653,23 @@ auto Router::execute_inference(const json& request, Func&& inference_func) -> de
+                 if (restart_model_name.empty()) {
+                     restart_model_name = requested_model;
+                 }
+-                if (reload_model_after_watchdog_reset(restart_model_name, restart_options, failed_instance_id)) {
++                const bool reloaded = reload_model_after_watchdog_reset(
++                    restart_model_name, restart_options, failed_instance_id);
++                if (reloaded && retry_after_watchdog_reset) {
+                     continue;
+                 }
+             }
+ 
++            if (watchdog_reset && !retry_after_watchdog_reset) {
++                return json{{"error", {
++                    {"message", "The backend for model '" + requested_model +
++                                    "' crashed while processing this input; it was not retried"},
++                    {"type", ErrorType::BACKEND_ERROR},
++                    {"code", "backend_crashed_on_input"},
++                    {"status_code", 502},
++                    {"retryable", false}}}};
++            }
++
+             return response;
+         } catch (...) {
+             server->release_inference();
+@@ -2148,6 +2162,47 @@ json Router::classify(const json& request) {
+     }
+ }
+ 
++json Router::classify_image(const json& params, std::string image_bytes) {
++    std::string requested_model = params.value("model", "");
++    std::shared_ptr<telemetry::InferenceSpan> span = telemetry::TelemetryTracker::start_span(
++        "CLASSIFIER", "image_classify", requested_model, params);
++
++    try {
++        json response = execute_inference(params, [&](WrappedServer* server) {
++            ModelTelemetryIdentity identity = get_telemetry_identity(server);
++            if (span) {
++                span->set_attribute("classifier.backend", identity.recipe);
++                span->set_attribute("classifier.device_type", identity.device);
++                span->set_attribute("classifier.checkpoint", identity.checkpoint);
++                span->set_attribute("classifier.recipe", identity.recipe);
++            }
++            auto image_server = dynamic_cast<IImageClassificationServer*>(server);
++            if (!image_server) {
++                return ErrorResponse::from_exception(UnsupportedOperationException(
++                    "Image classification", device_type_to_string(server->get_device_type())));
++            }
++            // Runs at most once: retry is disabled below, so the bytes can move.
++            return image_server->classify_image(params, std::move(image_bytes));
++        }, /*retry_after_watchdog_reset=*/false);
++
++        if (span) {
++            if (response.contains("error")) {
++                std::string error_msg = "Request failed";
++                if (response["error"].contains("message") && response["error"]["message"].is_string()) {
++                    error_msg = response["error"]["message"].get<std::string>();
++                }
++                span->end_with_error(error_msg);
++            } else {
++                span->end_with_success(nlohmann::json::object(), "");
++            }
++        }
++        return response;
++    } catch (const std::exception& e) {
++        if (span) span->end_with_error(e.what());
++        throw;
++    }
++}
++
+ json Router::get_slots() {
+     WrappedServer* server = nullptr;
+     ISlotsServer* slots_server = nullptr;
+@@ -3002,7 +3057,8 @@ json Router::get_pinned_model_counts() const {
+         {"transcription", count_pinned_servers_in_pool(ModelType::TRANSCRIPTION, ResidencyClass::Standard)},
+         {"image", count_pinned_servers_in_pool(ModelType::IMAGE, ResidencyClass::Standard)},
+         {"tts", count_pinned_servers_in_pool(ModelType::TTS, ResidencyClass::Standard)},
+-        {"classification", count_pinned_servers_in_pool(ModelType::CLASSIFICATION, ResidencyClass::Standard)}
++        {"classification", count_pinned_servers_in_pool(ModelType::CLASSIFICATION, ResidencyClass::Standard)},
++        {"image-classification", count_pinned_servers_in_pool(ModelType::IMAGE_CLASSIFICATION, ResidencyClass::Standard)}
+     };
+ }
+ 
+@@ -3015,7 +3071,8 @@ json Router::get_pinned_helper_counts() const {
+         {"transcription", count_pinned_servers_in_pool(ModelType::TRANSCRIPTION, ResidencyClass::RoutingHelper)},
+         {"image", count_pinned_servers_in_pool(ModelType::IMAGE, ResidencyClass::RoutingHelper)},
+         {"tts", count_pinned_servers_in_pool(ModelType::TTS, ResidencyClass::RoutingHelper)},
+-        {"classification", count_pinned_servers_in_pool(ModelType::CLASSIFICATION, ResidencyClass::RoutingHelper)}
++        {"classification", count_pinned_servers_in_pool(ModelType::CLASSIFICATION, ResidencyClass::RoutingHelper)},
++        {"image-classification", count_pinned_servers_in_pool(ModelType::IMAGE_CLASSIFICATION, ResidencyClass::RoutingHelper)}
+     };
+ }
+ 
+diff --git a/src/cpp/server/routes/lemonade/inference/classify.cpp b/src/cpp/server/routes/lemonade/inference/classify.cpp
+index 828afbdfa..c12e79d4c 100644
+--- a/src/cpp/server/routes/lemonade/inference/classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/classify.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "lemon/classification_labels.h"
+ #include "lemon/model_types.h"
++#include "lemon/models/model_info.h"
+ #include "lemon/router.h"
+ #include "lemon/server/api_route.h"
+ #include "lemon/server/model_loader.h"
+@@ -15,6 +16,8 @@ using ordered_json = nlohmann::ordered_json;
+ 
+ const RouteError kNoSoleClassifier{
+     400, "", "`model` is omitted and not exactly one classification model is loaded"};
++const RouteError kImageModel{
++    400, "model_not_applicable", "`model` is an image-classification model, served by `POST /v1/images/classify`"};
+ const RouteError kBackendRejected{
+     400, "",
+     "The backend rejects the request, for example because `model` is not a classification "
+@@ -106,7 +109,7 @@ public:
+         })");
+         s.examples = {example};
+         s.errors = join_errors({{kBodyNotJson, kArgMissing, kArgInvalid,
+-                                 kNoSoleClassifier,
++                                 kNoSoleClassifier, kImageModel,
+                                  kBackendRejected, kModelUnloaded, kBackendError,
+                                  kMalformedBackendResponse, kUnexpectedException},
+                                 ModelLoader::errors()});
+@@ -156,6 +159,14 @@ protected:
+             req.body[kModel.name] = req.model;
+             req.model_already_loaded = true;
+         }
++
++        if (const auto info = ctx_.router->try_get_model_info(req.model);
++            info && info->type == ModelType::IMAGE_CLASSIFICATION) {
++            write_openai_error(res, kImageModel,
++                "model '" + req.model + "' is an image-classification model; "
++                "POST /v1/images/classify");
++            return false;
++        }
+         return true;
+     }
+ 
+diff --git a/src/cpp/server/routes/openai/images/images_classify.cpp b/src/cpp/server/routes/openai/images/images_classify.cpp
+new file mode 100644
+index 000000000..419c152cf
+--- /dev/null
++++ b/src/cpp/server/routes/openai/images/images_classify.cpp
+@@ -0,0 +1,249 @@
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include <lemon/utils/aixlog.hpp>
++
++#include "lemon/image_classify_request.h"
++#include "lemon/model_types.h"
++#include "lemon/models/model_info.h"
++#include "lemon/router.h"
++#include "lemon/server/api_route.h"
++#include "lemon/server/model_loader.h"
++
++namespace lemon {
++namespace {
++
++using json = nlohmann::json;
++using ordered_json = nlohmann::ordered_json;
++
++const RouteError kBadContentType{400, "", "`Content-Type` is neither `multipart/form-data` nor `application/json`"};
++const RouteError kBadImageRequest{400, "", "The image is missing, not strict base64, not a JPEG or PNG, or `top_k` is invalid"};
++const RouteError kImageTooLarge{413, "payload_too_large", "The decoded image exceeds 16 MiB, or the body exceeds 23 MiB"};
++const RouteError kLengthRequired{411, "length_required", "The request carries no `Content-Length` (a chunked upload)"};
++const RouteError kNotImageClassifier{400, "model_not_applicable", "`model` is not an image-classification model"};
++const RouteError kNoSoleImageClassifier{
++    400, "", "`model` is omitted and not exactly one image-classification model is loaded"};
++const RouteError kCrashedOnInput{
++    502, "backend_crashed_on_input",
++    "The backend crashed on this input; it is reloaded and the request is not retried"};
++
++const RouteArg kModel{"model", ArgIn::Form, {{"type", "string"}}, false, Support::Available,
++                      "The image-classification model to use. Optional when exactly one is loaded."};
++const RouteArg kImage{"image", ArgIn::Form, {{"type", "string"}, {"format", "binary"}}, true, Support::Available,
++                      "The JPEG or PNG image, at most 16 MiB: a multipart file part named `image` (or "
++                      "`file`), or in a JSON body a base64 string or `data:` URL.", {"file"}};
++const RouteArg kTopK{"top_k", ArgIn::Form, {{"type", "integer"}, {"minimum", 1}, {"maximum", 1000000}}, false, Support::Available,
++                     "Return only the highest-scoring `k` classes. Defaults to 5."};
++
++int status_for_backend_error(const json& err) {
++    if (err.contains("status_code") && err["status_code"].is_number_integer()) {
++        return err["status_code"].get<int>();
++    }
++    // forward_multipart_request nests the backend's status under error.details.
++    if (err.contains("details") && err["details"].is_object() &&
++        err["details"].contains("status_code") &&
++        err["details"]["status_code"].is_number_integer()) {
++        return err["details"]["status_code"].get<int>();
++    }
++    if (err.contains("code") && err["code"].is_string()) {
++        return ModelLoader::load_error(err["code"].get<std::string>()).status;
++    }
++    if (err.contains("type") && err["type"].is_string()) {
++        const std::string type = err["type"].get<std::string>();
++        if (type == "invalid_request" || type == "invalid_request_error" ||
++            type == "unsupported_operation") {
++            return 400;
++        }
++        if (type == "model_not_loaded") {
++            return kModelUnloaded.status;
++        }
++    }
++    return kBackendError.status;
++}
++
++class ImagesClassifyRoute : public ApiRoute {
++public:
++    using ApiRoute::ApiRoute;
++
++    RouteSpec spec() const override {
++        RouteSpec s;
++        s.id = "openai.images_classify";
++        s.methods = {"POST"};
++        s.paths = {"images/classify"};
++        s.summary = "Classify an image";
++        s.modality = "image -> class scores";
++        s.experimental = true;
++        s.description =
++            "Runs an image-classification model, such as `MobileNetV2-1.0-224-TFLite` served by "
++            "`tflite-server`, on one JPEG or PNG image and returns the highest-scoring classes. The "
++            "image is sent as a multipart file part, or as base64 in a JSON body.";
++        s.notes = {
++            "The body is capped before it is read: a request without `Content-Length` gets `411`, "
++            "and one over 23 MiB gets `413`.",
++            "An image that crashes the backend is never replayed: the backend is reloaded and the "
++            "request fails with `502` `backend_crashed_on_input`.",
++        };
++        s.args = {kModel, kImage, kTopK};
++
++        RouteResponse response;
++        response.format = ResponseFormat::Json;
++        response.schema = ordered_json::parse(R"({
++            "type": "object",
++            "required": ["object", "model", "data", "labels"],
++            "properties": {
++                "object": {"const": "image_classification", "description": "Always `image_classification`."},
++                "model": {"type": "string", "description": "The model that classified the image."},
++                "data": {
++                    "type": "array",
++                    "description": "The highest-scoring classes, best first.",
++                    "items": {
++                        "type": "object",
++                        "required": ["index", "label", "score"],
++                        "properties": {
++                            "index": {"type": "integer", "description": "The class index in the model's output."},
++                            "label": {"type": "string", "description": "The class name, or the index as a string when the model has no label file."},
++                            "score": {"type": "number", "description": "The class score."}
++                        }
++                    }
++                },
++                "labels": {
++                    "type": "object",
++                    "description": "Each class's score keyed by label; a repeated label keeps its highest score, and `data` is authoritative.",
++                    "additionalProperties": {"type": "number"}
++                },
++                "timings": {"type": "object", "description": "Backend timings, when the backend reports them."}
++            }
++        })");
++        s.responses = {response};
++        s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired,
++                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput,
++                                 kModelUnloaded, kBackendError, kMalformedBackendResponse,
++                                 kUnexpectedException},
++                                ModelLoader::errors()});
++        s.error_format = ErrorFormat::OpenAi;
++        s.request_format = RequestFormat::Raw;
++        return s;
++    }
++
++    void handle(RouteRequest& req, httplib::Response& res) override {
++        const httplib::Request& http = req.http;
++        try {
++            image_classify::ParsedRequest parsed;
++            if (http.is_multipart_form_data()) {
++                std::optional<std::string> model;
++                std::optional<std::string> top_k;
++                if (http.form.has_field("model")) model = http.form.get_field("model");
++                if (http.form.has_field("top_k")) top_k = http.form.get_field("top_k");
++                std::vector<std::string_view> parts;
++                for (const auto& [name, file] : http.form.files) {
++                    if (name == "image" || name == "file") parts.emplace_back(file.content);
++                }
++                parsed = image_classify::from_form(model, top_k, parts);
++            } else {
++                const std::string content_type = http.get_header_value("Content-Type");
++                if (!content_type.empty() &&
++                    content_type.find("application/json") == std::string::npos) {
++                    write_openai_error(res, kBadContentType,
++                                       "Content-Type must be multipart/form-data or application/json");
++                    return;
++                }
++                parsed = image_classify::parse_json(http.body);
++            }
++            if (!parsed.ok()) {
++                const RouteError& error = parsed.status == 413 ? kImageTooLarge : kBadImageRequest;
++                RouteError sent = error;
++                sent.status = parsed.status;
++                write_openai_error(res, sent, parsed.error);
++                return;
++            }
++
++            json params = std::move(parsed.params);
++            std::string model;
++            if (params.contains("model") && params["model"].is_string()) {
++                model = canonical_model_name(ctx_, params["model"].get<std::string>());
++                params["model"] = model;
++            }
++
++            if (!model.empty()) {
++                if (auto info = ctx_.router->try_get_model_info(model);
++                    info && info->type != ModelType::IMAGE_CLASSIFICATION) {
++                    write_openai_error(res, kNotImageClassifier,
++                                       "model '" + model + "' is not an image-classification model");
++                    return;
++                }
++                try {
++                    ctx_.model_loader->ensure_loaded(model);
++                } catch (const std::exception& e) {
++                    LOG(ERROR, "Server") << "Failed to load image-classification model: "
++                                         << e.what() << std::endl;
++                    ctx_.model_loader->write_load_error(res, model, e.what());
++                    return;
++                }
++            } else {
++                model = ctx_.router->get_sole_loaded_model_of_type(ModelType::IMAGE_CLASSIFICATION);
++                if (model.empty()) {
++                    write_openai_error(res, kNoSoleImageClassifier,
++                        "No 'model' specified and no single image-classification model "
++                        "is loaded (load one, or name it in the request)");
++                    return;
++                }
++                params["model"] = model;
++            }
++
++            auto response = ctx_.router->classify_image(params, std::move(parsed.bytes));
++            if (response.contains("error") && response["error"].is_object()) {
++                res.status = status_for_backend_error(response["error"]);
++                res.set_content(response.dump(), "application/json");
++                return;
++            }
++
++            // The envelope is the public contract, not the backend's raw body.
++            auto malformed = [&res]() {
++                write_openai_error(res, kMalformedBackendResponse,
++                                   "backend returned malformed image classification",
++                                   "classification_error");
++            };
++            if (!response.contains("predictions") || !response["predictions"].is_array()) {
++                malformed();
++                return;
++            }
++            json data = json::array();
++            json labels = json::object();
++            for (const auto& p : response["predictions"]) {
++                if (!p.is_object() || !p.contains("index") || !p["index"].is_number_integer() ||
++                    !p.contains("score") || !p["score"].is_number()) {
++                    malformed();
++                    return;
++                }
++                const std::string label = p.contains("label") && p["label"].is_string()
++                                              ? p["label"].get<std::string>()
++                                              : std::to_string(p["index"].get<long long>());
++                data.push_back({{"index", p["index"]}, {"label", label}, {"score", p["score"]}});
++                if (!labels.contains(label)) labels[label] = p["score"];
++            }
++            json enveloped = {
++                {"object", "image_classification"},
++                {"model", model},
++                {"data", std::move(data)},
++                {"labels", std::move(labels)},
++            };
++            if (response.contains("timings") && response["timings"].is_object()) {
++                enveloped["timings"] = response["timings"];
++            }
++            res.set_content(enveloped.dump(), "application/json");
++        } catch (const std::exception& e) {
++            LOG(ERROR, "Server") << "ERROR in images/classify: " << e.what() << std::endl;
++            write_openai_error(res, kUnexpectedException, e.what(), "internal_error");
++        }
++    }
++};
++
++} // namespace
++
++std::unique_ptr<ApiRoute> make_images_classify_route(ServerContext& ctx) {
++    return std::make_unique<ImagesClassifyRoute>(ctx);
++}
++
++} // namespace lemon
+diff --git a/src/cpp/server/routes/openai/images/routes.cpp b/src/cpp/server/routes/openai/images/routes.cpp
+index a4e4e60b9..33e8162c4 100644
+--- a/src/cpp/server/routes/openai/images/routes.cpp
++++ b/src/cpp/server/routes/openai/images/routes.cpp
+@@ -6,12 +6,14 @@ std::unique_ptr<ApiRoute> make_images_generations_route(ServerContext& ctx);
+ std::unique_ptr<ApiRoute> make_images_edits_route(ServerContext& ctx);
+ std::unique_ptr<ApiRoute> make_images_variations_route(ServerContext& ctx);
+ std::unique_ptr<ApiRoute> make_images_upscale_route(ServerContext& ctx);
++std::unique_ptr<ApiRoute> make_images_classify_route(ServerContext& ctx);
+ 
+ void register_openai_images_routes(RouteRegistry& registry, ServerContext& ctx) {
+     registry.add(make_images_generations_route(ctx));
+     registry.add(make_images_edits_route(ctx));
+     registry.add(make_images_variations_route(ctx));
+     registry.add(make_images_upscale_route(ctx));
++    registry.add(make_images_classify_route(ctx));
+ }
+ 
+ } // namespace lemon
+diff --git a/test/cpp/test_backend_mode_contract.cpp b/test/cpp/test_backend_mode_contract.cpp
+index e074139ee..0719e05a3 100644
+--- a/test/cpp/test_backend_mode_contract.cpp
++++ b/test/cpp/test_backend_mode_contract.cpp
+@@ -41,6 +41,7 @@ const std::vector<std::pair<uint32_t, std::string>> kModeInterfaces = {
+     {lemon::CAP_IMAGE, "image"},
+     {lemon::CAP_AUDIO_GENERATION, "audio-generation"},
+     {lemon::CAP_MODEL_3D, "3d"},
++    {lemon::CAP_IMAGE_CLASSIFICATION, "image-classification"},
+ };
+ 
+ // Capabilities that name no deployment mode, so kModeInterfaces omits them by
+@@ -248,6 +249,10 @@ int main() {
+         // onnxruntime is the backend that does serve classification.
+         {"onnxruntime + classification", "onnxruntime", {"classification"}, true,
+          {"classification"}, ModelType::CLASSIFICATION},
++        {"tflite + image-classification", "tflite", {"image-classification"}, true,
++         {"image-classification"}, ModelType::IMAGE_CLASSIFICATION},
++        {"onnxruntime + image-classification", "onnxruntime", {"image-classification"},
++         false, {}, {}},
+         // Aliases of one mode are one claim, not two.
+         {"llamacpp + embedding alias", "llamacpp", {"embedding", "embeddings"}, true,
+          {"embedding", "embeddings"}, ModelType::EMBEDDING},
+diff --git a/test/cpp/test_image_classify_request.cpp b/test/cpp/test_image_classify_request.cpp
+new file mode 100644
+index 000000000..db9270eba
+--- /dev/null
++++ b/test/cpp/test_image_classify_request.cpp
+@@ -0,0 +1,193 @@
++// Request parsing and limits for POST /v1/images/classify
++// (lemon::image_classify). Pure functions, no server.
++
++#include "lemon/image_classify_request.h"
++
++#include <cstdio>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++using namespace lemon::image_classify;
++
++namespace {
++
++int failures = 0;
++
++void check(const std::string& what, bool ok) {
++    std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
++    if (!ok) ++failures;
++}
++
++const std::string kJpeg = std::string("\xFF\xD8\xFF\xE0", 4) + "rest-of-jpeg";
++const std::string kPng = std::string("\x89PNG\r\n\x1A\n", 8) + "rest-of-png";
++
++std::string b64(const std::string& in) {
++    static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    std::string out;
++    std::size_t i = 0;
++    for (; i + 2 < in.size(); i += 3) {
++        unsigned v = (static_cast<unsigned char>(in[i]) << 16) |
++                     (static_cast<unsigned char>(in[i + 1]) << 8) |
++                     static_cast<unsigned char>(in[i + 2]);
++        out += t[(v >> 18) & 63];
++        out += t[(v >> 12) & 63];
++        out += t[(v >> 6) & 63];
++        out += t[v & 63];
++    }
++    if (i + 1 == in.size()) {
++        unsigned v = static_cast<unsigned char>(in[i]) << 16;
++        out += t[(v >> 18) & 63];
++        out += t[(v >> 12) & 63];
++        out += "==";
++    } else if (i + 2 == in.size()) {
++        unsigned v = (static_cast<unsigned char>(in[i]) << 16) |
++                     (static_cast<unsigned char>(in[i + 1]) << 8);
++        out += t[(v >> 18) & 63];
++        out += t[(v >> 12) & 63];
++        out += t[(v >> 6) & 63];
++        out += '=';
++    }
++    return out;
++}
++
++std::string json_body(const std::string& image, const std::string& extra = "") {
++    return "{\"model\":\"m\",\"image\":\"" + image + "\"" + extra + "}";
++}
++
++void test_base64() {
++    std::string out;
++    check("base64: round-trips 1/2/3-byte tails",
++          strict_base64_decode(b64("a"), out) && out == "a" &&
++              strict_base64_decode(b64("ab"), out) && out == "ab" &&
++              strict_base64_decode(b64("abc"), out) && out == "abc");
++    check("base64: binary round-trips", strict_base64_decode(b64(kJpeg), out) && out == kJpeg);
++    check("base64: whitespace ignored",
++          strict_base64_decode("YW\r\nJj\t", out) && out == "abc");
++    check("base64: bad alphabet rejected", !strict_base64_decode("YW*j", out));
++    check("base64: url-safe alphabet rejected", !strict_base64_decode("YW-_", out));
++    check("base64: length not multiple of 4 rejected", !strict_base64_decode("YWJ", out));
++    check("base64: interior padding rejected", !strict_base64_decode("YW=j", out));
++    check("base64: '=' then data rejected", !strict_base64_decode("Y=Jj", out));
++    check("base64: triple padding rejected", !strict_base64_decode("Y===", out));
++    check("base64: empty rejected", !strict_base64_decode("", out));
++}
++
++void test_sniff() {
++    check("sniff: JPEG", sniff_image_mime(kJpeg) == "image/jpeg");
++    check("sniff: PNG", sniff_image_mime(kPng) == "image/png");
++    check("sniff: GIF rejected", sniff_image_mime("GIF89a....").empty());
++    check("sniff: empty rejected", sniff_image_mime("").empty());
++    check("sniff: truncated PNG signature rejected",
++          sniff_image_mime(std::string("\x89PNG", 4)).empty());
++}
++
++void test_json() {
++    auto ok = parse_json(json_body(b64(kJpeg), ",\"top_k\":3"));
++    check("json: base64 JPEG accepted", ok.ok() && ok.bytes == kJpeg && ok.mime == "image/jpeg");
++    check("json: params carry model and top_k, never the image",
++          ok.params.value("model", "") == "m" && ok.params.value("top_k", 0) == 3 &&
++              !ok.params.contains("image"));
++
++    auto data_url = parse_json(json_body("data:image/png;base64," + b64(kPng)));
++    check("json: PNG data URL accepted", data_url.ok() && data_url.mime == "image/png");
++    auto data_upper = parse_json(json_body("DATA:IMAGE/JPEG;BASE64," + b64(kJpeg)));
++    check("json: data URL scheme is case-insensitive", data_upper.ok());
++    check("json: non-image data URL rejected",
++          parse_json(json_body("data:text/plain;base64," + b64("hello"))).status == 400);
++    check("json: non-base64 data URL rejected",
++          parse_json(json_body("data:image/png," + b64(kPng))).status == 400);
++    check("json: http URL rejected",
++          parse_json(json_body("http://example.com/a.jpg")).status == 400);
++    auto https = parse_json(json_body("https://example.com/a.jpg"));
++    check("json: https URL rejected with a message naming the alternative",
++          https.status == 400 && https.error.find("data: URL") != std::string::npos);
++    check("json: bad base64 rejected", parse_json(json_body("@@@@")).status == 400);
++    check("json: GIF bytes rejected",
++          parse_json(json_body(b64("GIF89a-not-supported"))).status == 400);
++    check("json: missing image rejected", parse_json("{\"model\":\"m\"}").status == 400);
++    check("json: non-string image rejected",
++          parse_json("{\"model\":\"m\",\"image\":5}").status == 400);
++    check("json: non-string model rejected",
++          parse_json("{\"model\":1,\"image\":\"" + b64(kJpeg) + "\"}").status == 400);
++    check("json: malformed JSON rejected", parse_json("{").status == 400);
++    check("json: non-object rejected", parse_json("[]").status == 400);
++
++    const std::string img = b64(kJpeg);
++    check("top_k: 0 rejected", parse_json(json_body(img, ",\"top_k\":0")).status == 400);
++    check("top_k: 1 accepted", parse_json(json_body(img, ",\"top_k\":1")).ok());
++    check("top_k: 1000000 accepted", parse_json(json_body(img, ",\"top_k\":1000000")).ok());
++    check("top_k: 1000001 rejected",
++          parse_json(json_body(img, ",\"top_k\":1000001")).status == 400);
++    check("top_k: float rejected", parse_json(json_body(img, ",\"top_k\":2.5")).status == 400);
++    check("top_k: string rejected", parse_json(json_body(img, ",\"top_k\":\"3\"")).status == 400);
++    check("top_k: negative rejected", parse_json(json_body(img, ",\"top_k\":-1")).status == 400);
++
++    std::string at_limit = kJpeg;
++    at_limit.resize(kMaxImageBytes, 'x');
++    check("size: exactly 16 MiB accepted", parse_json(json_body(b64(at_limit))).ok());
++    std::string over = at_limit + "x";
++    auto big = parse_json(json_body(b64(over)));
++    check("size: 16 MiB + 1 is 413", big.status == 413);
++    check("size: empty image is 400", parse_json(json_body("")).status == 400);
++}
++
++void test_form() {
++    const std::vector<std::string_view> one = {kJpeg};
++    auto ok = from_form(std::string("m"), std::string("3"), one);
++    check("form: one part accepted", ok.ok() && ok.bytes == kJpeg &&
++                                         ok.params.value("top_k", 0) == 3 &&
++                                         ok.params.value("model", "") == "m");
++    auto implicit = from_form(std::nullopt, std::nullopt, one);
++    check("form: model and top_k optional",
++          implicit.ok() && !implicit.params.contains("model") && !implicit.params.contains("top_k"));
++    check("form: zero parts rejected", from_form(std::nullopt, std::nullopt, {}).status == 400);
++    const std::vector<std::string_view> two = {kJpeg, kPng};
++    auto multi = from_form(std::nullopt, std::nullopt, two);
++    check("form: two parts rejected", multi.status == 400 &&
++                                          multi.error.find("exactly one") != std::string::npos);
++    check("form: top_k 0 rejected", from_form(std::nullopt, std::string("0"), one).status == 400);
++    check("form: top_k float rejected",
++          from_form(std::nullopt, std::string("2.5"), one).status == 400);
++    check("form: top_k text rejected",
++          from_form(std::nullopt, std::string("abc"), one).status == 400);
++    check("form: top_k 1000001 rejected",
++          from_form(std::nullopt, std::string("1000001"), one).status == 400);
++    const std::vector<std::string_view> gif = {"GIF89a"};
++    check("form: GIF rejected", from_form(std::nullopt, std::nullopt, gif).status == 400);
++}
++
++void test_precheck_and_path() {
++    check("precheck: no Content-Length is 411", precheck_content_length(false, 0) == 411);
++    check("precheck: 1 KiB passes", precheck_content_length(true, 1024) == 0);
++    check("precheck: exactly the limit passes",
++          precheck_content_length(true, kMaxImageClassifyRequestBytes) == 0);
++    check("precheck: limit + 1 is 413",
++          precheck_content_length(true, kMaxImageClassifyRequestBytes + 1) == 413);
++
++    for (const char* p : {"/api/v0/images/classify", "/api/v1/images/classify",
++                          "/v0/images/classify", "/v1/images/classify"}) {
++        check(std::string("path: matches ") + p, is_image_classify_path(p));
++    }
++    for (const char* p : {"/v1/images/classifyx", "/v1/classify", "/v1/images/edits",
++                          "/v2/images/classify", "/images/classify"}) {
++        check(std::string("path: ignores ") + p, !is_image_classify_path(p));
++    }
++}
++
++}  // namespace
++
++int main() {
++    test_base64();
++    test_sniff();
++    test_json();
++    test_form();
++    test_precheck_and_path();
++    if (failures == 0) {
++        std::printf("\nAll image classify request checks passed.\n");
++        return 0;
++    }
++    std::printf("\n%d image classify request check(s) failed.\n", failures);
++    return 1;
++}
+diff --git a/test/cpp/test_model_type_classifier.cpp b/test/cpp/test_model_type_classifier.cpp
+index e796940d6..82632d9a0 100644
+--- a/test/cpp/test_model_type_classifier.cpp
++++ b/test/cpp/test_model_type_classifier.cpp
+@@ -72,6 +72,12 @@ int main() {
+          {"chat", "vision", "reasoning", "tool-calling", "transcription"},
+          ModelType::LLM},
+ 
++        // Image classification is its own mode, never the text CLASSIFICATION
++        // pool, and "image" alone still means image generation.
++        {"image-classification", {"image-classification"}, ModelType::IMAGE_CLASSIFICATION},
++        {"image stays generation", {"image"}, ModelType::IMAGE},
++        {"chat + image-classification → LLM", {"chat", "image-classification"}, ModelType::LLM},
++
+         // Fallbacks.
+         {"empty labels → LLM", {}, ModelType::LLM},
+         {"unknown label → LLM", {"some-future-label"}, ModelType::LLM},
+@@ -123,7 +129,12 @@ int main() {
+         if (!ok) ++failures;
+     }
+ 
+-    const size_t total = cases.size() + declared_cases.size();
++    const bool round_trip =
++        model_type_to_string(ModelType::IMAGE_CLASSIFICATION) == "image-classification";
++    std::printf("[%s] image-classification string round-trips\n", round_trip ? "PASS" : "FAIL");
++    if (!round_trip) ++failures;
++
++    const size_t total = cases.size() + declared_cases.size() + 1;
+     std::printf("\n%d/%zu cases passed\n", static_cast<int>(total - failures), total);
+     return failures == 0 ? 0 : 1;
+ }
+diff --git a/test/cpp/test_tflite_layout.cpp b/test/cpp/test_tflite_layout.cpp
+new file mode 100644
+index 000000000..b705d8da5
+--- /dev/null
++++ b/test/cpp/test_tflite_layout.cpp
+@@ -0,0 +1,121 @@
++// Model-directory layout detection for the tflite backend: which directories
++// are a text classifier, an image classifier, or neither.
++
++#include "lemon/backends/tflite/tflite_layout.h"
++
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <string>
++
++namespace fs = std::filesystem;
++using lemon::backends::tflite::TfliteLayout;
++using lemon::backends::tflite::detect_tflite_layout;
++using lemon::backends::tflite::find_complete_model_dirs;
++
++namespace {
++
++int failures = 0;
++
++void check(const std::string& what, bool ok) {
++    std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
++    if (!ok) ++failures;
++}
++
++void write(const fs::path& p, const std::string& content) {
++    fs::create_directories(p.parent_path());
++    std::ofstream out(p, std::ios::binary);
++    out << content;
++}
++
++const char* kImageManifest =
++    R"({"task":"image-classification","labels_file":"labels.txt"})";
++
++void make_text(const fs::path& dir) {
++    write(dir / "model.tflite", "x");
++    write(dir / "tokenizer.json", "{}");
++    write(dir / "config.json", "{}");
++}
++
++void make_image(const fs::path& dir) {
++    write(dir / "model.tflite", "x");
++    write(dir / "manifest.json", kImageManifest);
++    write(dir / "labels.txt", "background\ncat\n");
++}
++
++}  // namespace
++
++int main() {
++    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++    const fs::path root =
++        fs::temp_directory_path() / ("lemon_tflite_layout_" + std::to_string(stamp));
++    fs::create_directories(root);
++
++    make_text(root / "text");
++    check("text layout is Text", detect_tflite_layout(root / "text") == TfliteLayout::Text);
++
++    make_text(root / "text_manifest");
++    write(root / "text_manifest" / "manifest.json", R"({"task":"text-classification"})");
++    check("text layout with a text manifest is Text",
++          detect_tflite_layout(root / "text_manifest") == TfliteLayout::Text);
++
++    make_image(root / "image");
++    check("image manifest + labels is Image",
++          detect_tflite_layout(root / "image") == TfliteLayout::Image);
++
++    write(root / "image_default_labels" / "model.tflite", "x");
++    write(root / "image_default_labels" / "manifest.json", R"({"task":"image-classification"})");
++    write(root / "image_default_labels" / "labels.txt", "a\n");
++    check("labels_file defaults to labels.txt",
++          detect_tflite_layout(root / "image_default_labels") == TfliteLayout::Image);
++
++    write(root / "image_no_labels" / "model.tflite", "x");
++    write(root / "image_no_labels" / "manifest.json", kImageManifest);
++    check("image manifest with its labels file missing is None",
++          detect_tflite_layout(root / "image_no_labels") == TfliteLayout::None);
++
++    write(root / "image_escape" / "model.tflite", "x");
++    write(root / "image_escape" / "manifest.json",
++          R"({"task":"image-classification","labels_file":"../text/config.json"})");
++    check("labels_file outside the model dir is None",
++          detect_tflite_layout(root / "image_escape") == TfliteLayout::None);
++
++    write(root / "text_no_tokenizer" / "model.tflite", "x");
++    write(root / "text_no_tokenizer" / "config.json", "{}");
++    check("text layout without a tokenizer is None",
++          detect_tflite_layout(root / "text_no_tokenizer") == TfliteLayout::None);
++
++    write(root / "corrupt" / "model.tflite", "x");
++    write(root / "corrupt" / "manifest.json", "{not json");
++    write(root / "corrupt" / "labels.txt", "a\n");
++    check("corrupt manifest is None without throwing",
++          detect_tflite_layout(root / "corrupt") == TfliteLayout::None);
++
++    write(root / "huge" / "model.tflite", "x");
++    write(root / "huge" / "labels.txt", "a\n");
++    write(root / "huge" / "manifest.json",
++          std::string(R"({"task":"image-classification","pad":")") +
++              std::string(2 * 1024 * 1024, 'a') + "\"}");
++    check("2 MiB manifest is None without throwing",
++          detect_tflite_layout(root / "huge") == TfliteLayout::None);
++
++    check("missing directory is None",
++          detect_tflite_layout(root / "does_not_exist") == TfliteLayout::None);
++
++    const fs::path two = root / "two";
++    make_text(two / "a");
++    make_image(two / "b");
++    check("two complete dirs are both found", find_complete_model_dirs(two).size() == 2);
++    check("one complete dir is found", find_complete_model_dirs(root / "image").size() == 1);
++
++    std::error_code ec;
++    fs::remove_all(root, ec);
++
++    if (failures == 0) {
++        std::printf("\nAll tflite layout checks passed.\n");
++        return 0;
++    }
++    std::printf("\n%d tflite layout check(s) failed.\n", failures);
++    return 1;
++}
+-- 
+2.53.0
+

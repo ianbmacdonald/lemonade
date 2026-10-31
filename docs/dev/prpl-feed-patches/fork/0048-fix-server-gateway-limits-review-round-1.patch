@@ -1,0 +1,451 @@
+From 63373c72cf3c57418d62ccf15c656ad395de117d Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Fri, 9 Oct 2026 02:42:32 -0400
+Subject: [PATCH 48/58] fix(server): gateway limits review round 1
+
+Refuse a connection whose socket cannot be duplicated while the receive
+deadline is on, instead of admitting it with no deadline. Clamp an
+over-range limit in config.json to its maximum rather than falling back to
+off. Compute the payload limit in 64 bits. Log deadline closes once per
+watchdog tick. Document that the deadline counts from when a worker serves
+the connection, and that WebSocket upgrades leave both limits.
+
+Assisted-by: claude:opus-5.5
+---
+ docs/guide/configuration/README.md            |  6 +-
+ src/cpp/include/lemon/connection_guard.h      | 26 ++++---
+ .../include/lemon/upgradable_http_server.h    | 24 ++++---
+ src/cpp/server/connection_guard.cpp           | 36 ++++++++--
+ src/cpp/server/core/http_listener.cpp         |  6 +-
+ src/cpp/server/runtime_config.cpp             | 13 +++-
+ test/cpp/test_config_gateway_limits.cpp       | 10 +++
+ test/cpp/test_connection_guard.cpp            | 71 ++++++++++++++-----
+ 8 files changed, 145 insertions(+), 47 deletions(-)
+
+diff --git a/docs/guide/configuration/README.md b/docs/guide/configuration/README.md
+index c1bbb23fb..59becdef4 100644
+--- a/docs/guide/configuration/README.md
++++ b/docs/guide/configuration/README.md
+@@ -228,9 +228,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
+ | `log_max_files` | int | 5 | Max number of rotated log backup files to retain (.1 through .N); legacy oversized files are rotated into .1 and pruned over cycles |
+ | `global_timeout` | int | 600 | Timeout in seconds for HTTP, inference, and readiness checks |
+ | `max_loaded_models` | int | 1 | Max models per type slot. Use -1 for unlimited |
+-| `max_request_body_mb` | int | 100 | Largest request body the server accepts, in MB (1–4096). A larger body is refused with 413 before it is buffered. On a memory-constrained gateway set it lower, for example `32`: that still fits a 25 MB audio upload. Changing it restarts the HTTP listeners. |
+-| `request_receive_timeout` | int | 0 | Seconds a client has to send a complete request, headers and body, measured from when the connection is accepted (0–3600). `0` turns the limit off. The read timeout alone only limits the gap between two reads, so a client that sends a byte every few seconds can otherwise hold a worker thread indefinitely. While it is set, each connection carries one request (no keep-alive reuse). Not enforced on Windows. Changing it restarts the HTTP listeners. |
+-| `max_connections_per_client` | int | 0 | Most connections one client address may have open at once (0–1024). `0` means no limit. Further connections are refused with 503. Loopback clients are exempt. Changing it restarts the HTTP listeners. |
++| `max_request_body_mb` | int | 100 | Largest request body the server accepts, in MB (1–4096), including chunked uploads. A larger body is refused with 413. The bundled HTTP library already defaulted to 100 MB; builds against an older system cpp-httplib had no limit before. On a memory-constrained gateway set it lower, for example `32`: that still fits a 25 MB audio upload. Changing it restarts the HTTP listeners. |
++| `request_receive_timeout` | int | 0 | Seconds a client has to send a complete request, headers and body, counted from when a server thread starts serving the connection (0–3600). `0` turns the limit off. The read timeout alone only limits the gap between two reads, so a client that sends a byte every few seconds can otherwise hold a worker thread indefinitely. While it is set, each connection carries one request (no keep-alive reuse). Connections upgraded to WebSocket on the main port are not covered. Not enforced on Windows. Changing it restarts the HTTP listeners. |
++| `max_connections_per_client` | int | 0 | Most connections one client address may have open at once (0–1024). `0` means no limit. Further connections are refused with 503. Loopback clients are exempt, and connections upgraded to WebSocket stop counting once upgraded. Changing it restarts the HTTP listeners. |
+ | `auto_evict` | bool | false | Enable dynamic VRAM management based on idle time and global GPU memory pressure. Can be overridden per model. |
+ | `auto_evict_threshold_pct` | number | 0.90 | Global VRAM fraction at which pressure eviction is evaluated. Must be greater than 0 and at most 1.0; `0.90` means 90%. |
+ | `beacon_listen` | bool | false | Linux/macOS only. Listen on UDP 13305 for other Lemonade servers' LAN broadcast beacons from on-link RFC1918 senders and list them under `beacon_listener` in `/v1/health`. Heard hosts are never contacted and never used as providers. The list is as readable as `/health`, so set `LEMONADE_API_KEY` when `host` is not localhost. `stats.url_mismatch` counts multi-homed peers whose source IP differs from their advertised URL, and beacons re-sent by a relay that is not listed in `beacon_trusted_relays`. UDP 13305 must be allowed inbound on the LAN side. By default it hears every RFC1918 interface, so on a gateway whose WAN side is also RFC1918 (double NAT), set `beacon_listen_interfaces` to the LAN bridges, or WAN-side hosts are listed too. |
+diff --git a/src/cpp/include/lemon/connection_guard.h b/src/cpp/include/lemon/connection_guard.h
+index 7f94da0e4..b073a2859 100644
+--- a/src/cpp/include/lemon/connection_guard.h
++++ b/src/cpp/include/lemon/connection_guard.h
+@@ -19,11 +19,15 @@ namespace lemon {
+ // connections per client address, and a deadline for receiving each request.
+ //
+ // cpp-httplib's read timeout is per read, so a client that sends one byte just
+-// inside it can hold a worker thread indefinitely. The deadline is measured
+-// from accept until the route handler starts, which is the point where the
++// inside it can hold a worker thread indefinitely. The deadline runs from when
++// a worker thread picks the connection up (time queued for a worker is not
++// counted) until the route handler starts, which is the point where the
+ // headers and body have both been read. The server limits each connection to
+-// one request while the deadline is enabled, so every request starts at
+-// accept. A watchdog thread shuts down connections that miss the deadline.
++// one request while the deadline is enabled, so every request starts on a
++// fresh connection. A watchdog thread shuts down connections that miss the
++// deadline. A request whose body is read just before
++// a watchdog tick but whose handler has not yet started can still be closed;
++// the window is the few microseconds between the two inside httplib.
+ class ConnectionGuard {
+ public:
+     using Clock = std::chrono::steady_clock;
+@@ -66,11 +70,15 @@ public:
+     const Limits& limits() const { return limits_; }
+     bool deadline_enabled() const { return limits_.receive_timeout.count() > 0; }
+ 
+-    // Admits a connection from `client` (normalized address). Returns false when
+-    // the client is at its cap; the caller then refuses and closes the socket.
+-    // On success `ticket` tracks the connection until it is destroyed.
+-    bool admit(socket_t sock, const std::string& client, Ticket& ticket,
+-               Clock::time_point now = Clock::now());
++    enum class Admission { admitted, over_cap, untrackable };
++
++    // Admits a connection from `client` (normalized address). On `admitted`,
++    // `ticket` tracks the connection until it is destroyed; otherwise the
++    // caller refuses and closes the socket. `untrackable` means the deadline
++    // is on but the socket could not be duplicated (descriptor exhaustion):
++    // refusing fails closed, where admitting would leave it with no deadline.
++    Admission admit(socket_t sock, const std::string& client, Ticket& ticket,
++                    Clock::time_point now = Clock::now());
+ 
+     // Called on the serving thread when the route handler starts.
+     static void mark_request_received();
+diff --git a/src/cpp/include/lemon/upgradable_http_server.h b/src/cpp/include/lemon/upgradable_http_server.h
+index 5715cb909..4a4981c73 100644
+--- a/src/cpp/include/lemon/upgradable_http_server.h
++++ b/src/cpp/include/lemon/upgradable_http_server.h
+@@ -186,8 +186,9 @@ private:
+         ConnectionGuard::Ticket ticket;
+         if (guard_) {
+             const std::string client = ConnectionGuard::peer_address(sock);
+-            if (!guard_->admit(sock, client, ticket)) {
+-                refuse_over_cap(sock, client);
++            const auto admission = guard_->admit(sock, client, ticket);
++            if (admission != ConnectionGuard::Admission::admitted) {
++                refuse(sock, client, admission);
+                 return true;
+             }
+         }
+@@ -203,9 +204,9 @@ private:
+         return (delegate_->*fn)(sock);
+     }
+ 
+-    void refuse_over_cap(socket_t sock, const std::string& client) {
++    void refuse(socket_t sock, const std::string& client, ConnectionGuard::Admission why) {
+         static const std::string kBody =
+-            "{\"error\": \"Too many connections from this client; retry shortly\"}";
++            "{\"error\": \"Too many connections; retry shortly\"}";
+         static const std::string kBusy =
+             "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\n"
+             "Content-Type: application/json\r\nContent-Length: " +
+@@ -217,10 +218,17 @@ private:
+         // refusal and then every 100th rather than every one.
+         const auto n = refused_.fetch_add(1) + 1;
+         if (n == 1 || n % 100 == 0) {
+-            LOG(WARNING, "Server") << "Refused connection from " << client << ": "
+-                                   << guard_->limits().max_connections_per_client
+-                                   << " connections already open (" << n << " refused so far)"
+-                                   << std::endl;
++            if (why == ConnectionGuard::Admission::untrackable) {
++                LOG(ERROR, "Server") << "Refused connection from " << client
++                                     << ": could not duplicate the socket to enforce "
++                                        "request_receive_timeout (out of file descriptors?) ("
++                                     << n << " refused so far)" << std::endl;
++            } else {
++                LOG(WARNING, "Server") << "Refused connection from " << client << ": "
++                                       << guard_->limits().max_connections_per_client
++                                       << " connections already open (" << n
++                                       << " refused so far)" << std::endl;
++            }
+         }
+     }
+ 
+diff --git a/src/cpp/server/connection_guard.cpp b/src/cpp/server/connection_guard.cpp
+index 14ba814b6..59f213807 100644
+--- a/src/cpp/server/connection_guard.cpp
++++ b/src/cpp/server/connection_guard.cpp
+@@ -107,8 +107,8 @@ ConnectionGuard::~ConnectionGuard() {
+     }
+ }
+ 
+-bool ConnectionGuard::admit(socket_t sock, const std::string& client, Ticket& ticket,
+-                            Clock::time_point now) {
++ConnectionGuard::Admission ConnectionGuard::admit(socket_t sock, const std::string& client,
++                                                  Ticket& ticket, Clock::time_point now) {
+     auto entry = std::make_shared<Entry>();
+     entry->client = client;
+     entry->accepted = now;
+@@ -118,7 +118,7 @@ bool ConnectionGuard::admit(socket_t sock, const std::string& client, Ticket& ti
+         if (limits_.max_connections_per_client > 0 && !is_loopback(client)) {
+             auto it = per_client_.find(client);
+             if (it != per_client_.end() && it->second >= limits_.max_connections_per_client) {
+-                return false;
++                return Admission::over_cap;
+             }
+         }
+         // The watchdog shuts down a duplicate of the socket, never the original
+@@ -127,13 +127,18 @@ bool ConnectionGuard::admit(socket_t sock, const std::string& client, Ticket& ti
+         // to this connection's socket until the entry is released.
+         if (deadline_enabled()) {
+             entry->watch_sock = duplicate_socket(sock);
++#ifndef _WIN32
++            if (entry->watch_sock == kInvalidSocket) {
++                return Admission::untrackable;
++            }
++#endif
+         }
+         ++per_client_[client];
+         entries_.push_back(entry);
+     }
+     t_current_entry = entry.get();
+     ticket = Ticket(this, std::move(entry));
+-    return true;
++    return Admission::admitted;
+ }
+ 
+ void ConnectionGuard::release(const std::shared_ptr<Entry>& entry) {
+@@ -195,11 +200,28 @@ void ConnectionGuard::watchdog_loop() {
+             std::lock_guard<std::mutex> lock(mu_);
+             closed = expire_locked(Clock::now(), true);
+         }
++        if (closed.empty()) {
++            continue;
++        }
++        // One line per tick: a client that reconnects in a loop would
++        // otherwise write a line for every connection it opens.
++        std::map<std::string, size_t> by_client;
+         for (const auto& e : closed) {
+-            LOG(WARNING, "Server") << "Closed connection from " << e->client
+-                                   << ": request not received within "
+-                                   << limits_.receive_timeout.count() << "s" << std::endl;
++            ++by_client[e->client];
++        }
++        std::string clients;
++        size_t listed = 0;
++        for (const auto& [client, n] : by_client) {
++            if (listed++ == 5) {
++                clients += ", ...";
++                break;
++            }
++            clients += (clients.empty() ? "" : ", ") + client + " x" + std::to_string(n);
+         }
++        LOG(WARNING, "Server") << "Closed " << closed.size()
++                               << " connection(s) that did not send a complete request within "
++                               << limits_.receive_timeout.count() << "s (" << clients << ")"
++                               << std::endl;
+     }
+ }
+ 
+diff --git a/src/cpp/server/core/http_listener.cpp b/src/cpp/server/core/http_listener.cpp
+index 968057c34..0881bd8d3 100644
+--- a/src/cpp/server/core/http_listener.cpp
++++ b/src/cpp/server/core/http_listener.cpp
+@@ -4,6 +4,7 @@
+ #include <chrono>
+ #include <iomanip>
+ #include <iostream>
++#include <limits>
+ #include <random>
+ #include <sstream>
+ #include <stdexcept>
+@@ -129,6 +130,9 @@ void HttpListener::create_servers() {
+     // need the same limits: they own accept and run the WebSocket upgrade peek
+     // before delegating, so a stalled client could otherwise hold a front
+     // worker there.
++    const uint64_t payload_bytes = static_cast<uint64_t>(config_->max_request_body_mb()) * 1024 * 1024;
++    const size_t payload_max = static_cast<size_t>(
++        std::min<uint64_t>(payload_bytes, std::numeric_limits<size_t>::max()));
+     for (httplib::Server* srv : {static_cast<httplib::Server*>(http_front_.get()),
+                                  static_cast<httplib::Server*>(http_front_v6_.get()),
+                                  static_cast<httplib::Server*>(http_server_.get()),
+@@ -136,7 +140,7 @@ void HttpListener::create_servers() {
+         srv->set_read_timeout(30, 0);
+         srv->set_write_timeout(300, 0);
+         srv->set_keep_alive_max_count(100);
+-        srv->set_payload_max_length(static_cast<size_t>(config_->max_request_body_mb()) * 1024 * 1024);
++        srv->set_payload_max_length(payload_max);
+     }
+ 
+     // The per-read timeout above still lets a client that trickles bytes hold
+diff --git a/src/cpp/server/runtime_config.cpp b/src/cpp/server/runtime_config.cpp
+index ba2558fc8..616827fa3 100644
+--- a/src/cpp/server/runtime_config.cpp
++++ b/src/cpp/server/runtime_config.cpp
+@@ -505,14 +505,21 @@ int RuntimeConfig::download_connections() const {
+ 
+ namespace {
+ 
+-// Reads an integer setting that config.json may hold invalid or omit; any
+-// value outside [lo, hi] falls back to `fallback` with a warning.
++// Reads an integer setting that config.json may hold invalid or omit. A value
++// above `hi` is clamped to `hi` rather than reset: for these limits the
++// default is "off", and a hand-edited value that is merely too large should
++// keep the limit on. Anything else invalid falls back to `fallback`.
+ int bounded_int_setting(const json& config, const char* key, int lo, int hi, int fallback) {
+     if (!config.contains(key) || !config[key].is_number_integer()) {
+         return fallback;
+     }
+     const int64_t n = config[key].get<int64_t>();
+-    if (n < lo || n > hi) {
++    if (n > hi) {
++        LOG(WARNING, "RuntimeConfig") << key << " value " << n << " in config is above the maximum, using "
++                                      << hi << std::endl;
++        return hi;
++    }
++    if (n < lo) {
+         LOG(WARNING, "RuntimeConfig") << "Invalid " << key << " value in config, using "
+                                       << fallback << std::endl;
+         return fallback;
+diff --git a/test/cpp/test_config_gateway_limits.cpp b/test/cpp/test_config_gateway_limits.cpp
+index 43fb43647..8555a5620 100644
+--- a/test/cpp/test_config_gateway_limits.cpp
++++ b/test/cpp/test_config_gateway_limits.cpp
+@@ -44,6 +44,16 @@ int main() {
+     check(bad.request_receive_timeout() == 0, "negative timeout falls back to off");
+     check(bad.max_connections_per_client() == 0, "non-integer cap falls back to off");
+ 
++    const RuntimeConfig too_big(json{{"max_request_body_mb", 100000},
++                                     {"request_receive_timeout", 7200},
++                                     {"max_connections_per_client", 5000}});
++    check(too_big.max_request_body_mb() == RuntimeConfig::kMaxMaxRequestBodyMb,
++          "a body limit above the maximum is clamped, not reset");
++    check(too_big.request_receive_timeout() == RuntimeConfig::kMaxRequestReceiveTimeout,
++          "a timeout above the maximum is clamped, not switched off");
++    check(too_big.max_connections_per_client() == RuntimeConfig::kMaxConnectionsPerClient,
++          "a cap above the maximum is clamped, not switched off");
++
+     check(!set_throws({{"max_request_body_mb", 32}}), "set accepts a valid body limit");
+     check(set_throws({{"max_request_body_mb", 0}}), "set refuses a zero body limit");
+     check(set_throws({{"max_request_body_mb", RuntimeConfig::kMaxMaxRequestBodyMb + 1}}),
+diff --git a/test/cpp/test_connection_guard.cpp b/test/cpp/test_connection_guard.cpp
+index 773f8664b..09b8dd344 100644
+--- a/test/cpp/test_connection_guard.cpp
++++ b/test/cpp/test_connection_guard.cpp
+@@ -2,8 +2,11 @@
+ #include <cstdio>
+ #include <string>
+ #include <thread>
++#include <vector>
+ 
+ #ifndef _WIN32
++#include <fcntl.h>
++#include <sys/resource.h>
+ #include <sys/socket.h>
+ #include <sys/time.h>
+ #include <unistd.h>
+@@ -18,8 +21,12 @@ using test_helpers::check;
+ using test_helpers::report_results;
+ using namespace std::chrono_literals;
+ 
++static bool admitted(ConnectionGuard::Admission a) {
++    return a == ConnectionGuard::Admission::admitted;
++}
++
+ static void test_addresses() {
+-    check(ConnectionGuard::normalize_address("::FFFF:192.168.1.5") == "192.168.1.5",
++    check(ConnectionGuard::normalize_address("::FFFF:192.0.2.5") == "192.0.2.5",
+           "IPv4-mapped IPv6 reduces to IPv4");
+     check(ConnectionGuard::normalize_address("FE80::1") == "fe80::1", "IPv6 is lowercased");
+     check(ConnectionGuard::normalize_address("::ffff:abcd") == "::ffff:abcd",
+@@ -27,7 +34,7 @@ static void test_addresses() {
+     check(ConnectionGuard::is_loopback("127.0.0.1"), "127.0.0.1 is loopback");
+     check(ConnectionGuard::is_loopback("127.4.5.6"), "127/8 is loopback");
+     check(ConnectionGuard::is_loopback("::1"), "::1 is loopback");
+-    check(!ConnectionGuard::is_loopback("192.168.1.5"), "a LAN address is not loopback");
++    check(!ConnectionGuard::is_loopback("192.0.2.5"), "a LAN address is not loopback");
+     check(!ConnectionGuard::is_loopback(""), "an unreadable address is not loopback");
+ }
+ 
+@@ -38,23 +45,24 @@ static void test_cap() {
+     check(!guard.deadline_enabled(), "cap-only guard has no deadline");
+ 
+     ConnectionGuard::Ticket a1, a2, a3, b1;
+-    check(guard.admit(-1, "192.168.1.5", a1), "first connection admitted");
+-    check(guard.admit(-1, "192.168.1.5", a2), "second connection admitted");
+-    check(!guard.admit(-1, "192.168.1.5", a3), "third connection from the same client refused");
+-    check(guard.admit(-1, "192.168.1.6", b1), "another client is not affected");
+-    check(guard.connections_for("192.168.1.5") == 2, "refused connection is not counted");
++    check(admitted(guard.admit(-1, "192.0.2.5", a1)), "first connection admitted");
++    check(admitted(guard.admit(-1, "192.0.2.5", a2)), "second connection admitted");
++    check(!admitted(guard.admit(-1, "192.0.2.5", a3)), "third connection from the same client refused");
++    check(admitted(guard.admit(-1, "192.0.2.6", b1)), "another client is not affected");
++    check(guard.connections_for("192.0.2.5") == 2, "refused connection is not counted");
+ 
+     {
+         ConnectionGuard::Ticket l1, l2, l3;
+-        check(guard.admit(-1, "127.0.0.1", l1) && guard.admit(-1, "127.0.0.1", l2) &&
+-                  guard.admit(-1, "127.0.0.1", l3),
++        check(admitted(guard.admit(-1, "127.0.0.1", l1)) &&
++                  admitted(guard.admit(-1, "127.0.0.1", l2)) &&
++                  admitted(guard.admit(-1, "127.0.0.1", l3)),
+               "loopback is exempt from the cap");
+     }
+     check(guard.connections_for("127.0.0.1") == 0, "loopback tickets released on scope exit");
+ 
+     a1 = ConnectionGuard::Ticket();
+-    check(guard.connections_for("192.168.1.5") == 1, "releasing a ticket frees a slot");
+-    check(guard.admit(-1, "192.168.1.5", a3), "a freed slot can be reused");
++    check(guard.connections_for("192.0.2.5") == 1, "releasing a ticket frees a slot");
++    check(admitted(guard.admit(-1, "192.0.2.5", a3)), "a freed slot can be reused");
+     a2 = ConnectionGuard::Ticket();
+     a3 = ConnectionGuard::Ticket();
+     b1 = ConnectionGuard::Ticket();
+@@ -72,15 +80,15 @@ static void test_deadline_logic() {
+     check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
+     const auto t0 = ConnectionGuard::Clock::now();
+     ConnectionGuard::Ticket slow, fast;
+-    check(guard.admit(fds[0], "192.168.1.5", slow, t0), "slow connection admitted");
+-    check(guard.admit(fds[0], "192.168.1.7", fast, t0), "fast connection admitted");
++    check(admitted(guard.admit(fds[0], "192.0.2.5", slow, t0)), "slow connection admitted");
++    check(admitted(guard.admit(fds[0], "192.0.2.7", fast, t0)), "fast connection admitted");
+     // admit() binds the serving thread to the most recent entry, as the front
+     // server does for the connection it is about to serve.
+     ConnectionGuard::mark_request_received();
+ 
+     check(guard.collect_expired(t0 + 29s).empty(), "nothing expires before the deadline");
+     auto expired = guard.collect_expired(t0 + 31s);
+-    check(expired.size() == 1 && expired[0]->client == "192.168.1.5",
++    check(expired.size() == 1 && expired[0]->client == "192.0.2.5",
+           "only the connection still receiving expires");
+     check(guard.collect_expired(t0 + 60s).empty(), "an expired connection is reported once");
+ 
+@@ -103,7 +111,7 @@ static void test_watchdog_shuts_down_socket() {
+     ::setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+     {
+         ConnectionGuard::Ticket t;
+-        check(guard.admit(fds[0], "192.168.1.5", t), "connection admitted");
++        check(admitted(guard.admit(fds[0], "192.0.2.5", t)), "connection admitted");
+         // The original descriptor stays open the whole time: the watchdog acts
+         // through its own duplicate.
+         char buf[1];
+@@ -126,7 +134,7 @@ static void test_received_request_is_not_shut_down() {
+     int fds[2];
+     check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
+     ConnectionGuard::Ticket t;
+-    check(guard.admit(fds[0], "192.168.1.5", t), "connection admitted");
++    check(admitted(guard.admit(fds[0], "192.0.2.5", t)), "connection admitted");
+     ConnectionGuard::mark_request_received();
+     std::this_thread::sleep_for(2500ms);
+     const char ping = 'p';
+@@ -137,6 +145,36 @@ static void test_received_request_is_not_shut_down() {
+     ::close(fds[0]);
+     ::close(fds[1]);
+ }
++
++static void test_untrackable_fails_closed() {
++    ConnectionGuard::Limits limits;
++    limits.receive_timeout = 30s;
++    ConnectionGuard guard(limits, false);
++
++    int fds[2];
++    check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
++    rlimit saved{};
++    ::getrlimit(RLIMIT_NOFILE, &saved);
++    rlimit low = saved;
++    low.rlim_cur = 64;
++    ::setrlimit(RLIMIT_NOFILE, &low);
++    std::vector<int> filler;
++    for (int fd; (fd = ::open("/dev/null", O_RDONLY)) >= 0;) {
++        filler.push_back(fd);
++    }
++    ConnectionGuard::Ticket t;
++    const auto a = guard.admit(fds[0], "192.0.2.5", t);
++    for (int fd : filler) {
++        ::close(fd);
++    }
++    ::setrlimit(RLIMIT_NOFILE, &saved);
++    check(a == ConnectionGuard::Admission::untrackable,
++          "a socket that cannot be duplicated is refused, not admitted without a deadline");
++    check(guard.tracked() == 0 && guard.connections_for("192.0.2.5") == 0,
++          "a refused connection leaves nothing tracked");
++    ::close(fds[0]);
++    ::close(fds[1]);
++}
+ #endif
+ 
+ int main() {
+@@ -147,6 +185,7 @@ int main() {
+     test_deadline_logic();
+     test_watchdog_shuts_down_socket();
+     test_received_request_is_not_shut_down();
++    test_untrackable_fails_closed();
+ #endif
+     return report_results("connection guard");
+ }
+-- 
+2.53.0
+

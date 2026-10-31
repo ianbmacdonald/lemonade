@@ -1,0 +1,67 @@
+From 5657a3debd04ddbe53a146c08d8d744cac0a5ed8 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 27 Sep 2026 11:22:23 -0400
+Subject: [PATCH 09/58] feat(onnxruntime): accept model.ort (ONNX Runtime
+ format) model directories
+
+A --minimal_build ONNX Runtime, which keeps ort-server small enough for a
+musl gateway, loads only the ORT flatbuffer format. Treat a directory with
+model.ort + tokenizer.json + config.json as servable, like model.onnx, and
+count a directory holding both as one model.
+
+Assisted-by: claude:opus-5.5
+---
+ .../backends/onnxruntime/onnxruntime_server.cpp  | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+index 3929928bf..91e2a81bb 100644
+--- a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
++++ b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+@@ -29,9 +29,16 @@ namespace {
+ // config.json. The config is mandatory even when a manifest is present — the
+ // manifest describes the output contract only, so the backend still needs the
+ // config to check the architecture against its supported input convention.
++// The graph is model.onnx, or model.ort (the ONNX Runtime format that a
++// --minimal_build ort-server requires; ort-server prefers it when both exist).
++bool has_model_graph(const fs::path& dir) {
++    std::error_code ec;
++    return fs::exists(dir / "model.onnx", ec) || fs::exists(dir / "model.ort", ec);
++}
++
+ bool is_complete_model_dir(const fs::path& dir) {
+     std::error_code ec;
+-    return fs::exists(dir / "model.onnx", ec) && fs::exists(dir / "tokenizer.json", ec) &&
++    return has_model_graph(dir) && fs::exists(dir / "tokenizer.json", ec) &&
+            fs::exists(dir / "config.json", ec);
+ }
+ 
+@@ -97,12 +104,15 @@ std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
+     if (ec) return dirs;
+     for (auto end = fs::recursive_directory_iterator(); it != end; it.increment(ec)) {
+         if (ec) break;
+-        if (it->is_regular_file(ec) && !ec && it->path().filename() == "model.onnx" &&
++        const fs::path name = it->path().filename();
++        if (it->is_regular_file(ec) && !ec && (name == "model.onnx" || name == "model.ort") &&
+             is_complete_model_dir(it->path().parent_path())) {
+             dirs.push_back(it->path().parent_path());
+         }
+     }
+     std::sort(dirs.begin(), dirs.end());
++    // A directory holding both model.onnx and model.ort is one model, not two.
++    dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+     return dirs;
+ }
+ }  // namespace
+@@ -163,7 +173,7 @@ void OnnxRuntimeServer::load(const std::string& model_name,
+     if (candidates.empty()) {
+         throw std::runtime_error(
+             "No servable model directory under '" + model_path +
+-            "': need model.onnx + tokenizer.json + config.json "
++            "': need model.onnx (or model.ort) + tokenizer.json + config.json "
+             "(manifest.json is optional and overrides the output contract)");
+     }
+     if (candidates.size() > 1) {
+-- 
+2.53.0
+

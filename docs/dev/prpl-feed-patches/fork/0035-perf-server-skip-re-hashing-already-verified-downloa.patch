@@ -1,0 +1,353 @@
+From 9bce851bc1ff27af91d336f1fa1e1d8e6b8f3fb3 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 11 Aug 2026 22:07:39 -0400
+Subject: [PATCH 35/58] perf(server): skip re-hashing already-verified
+ downloads
+
+A completed download with an expected hash is re-hashed in full on every
+subsequent pull. mbedTLS software SHA-256 runs ~280 MB/s single-threaded,
+so a 340 GiB model costs ~20 minutes per pull with zero bytes to
+download, and re-registering recipes against a shared checkpoint repeats
+the full walk each time.
+
+Record a .verified sidecar (algorithm, digest, size, mtime) after any
+successful full verification; a later check whose expected digest and
+file facts all match skips the re-hash. Any divergence, a missing or
+garbled sidecar, or a failed verification falls back to the full hash,
+and failed verification also drops the sidecar. Deleting .verified files
+forces full re-verification.
+
+Assisted-by: claude:fable-5
+---
+ CMakeLists.txt                       |   7 ++
+ src/cpp/server/utils/http_client.cpp | 102 ++++++++++++++++-
+ test/cpp/test_verify_once.cpp        | 165 +++++++++++++++++++++++++++
+ 3 files changed, 272 insertions(+), 2 deletions(-)
+ create mode 100644 test/cpp/test_verify_once.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c2d6a5fc2..4afd7118f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3999,6 +3999,13 @@ if(BUILD_TESTING AND EXISTS "${_STREAMING_SILENT_STREAM_TEST_SRC}")
+     add_cpp_ci_test(StreamingSilentStreamTest CI ON COMMAND test_streaming_silent_stream)
+ endif()
+ 
++set(_VERIFY_ONCE_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_verify_once.cpp")
++if(BUILD_TESTING AND EXISTS "${_VERIFY_ONCE_TEST_SRC}")
++    add_executable(test_verify_once test/cpp/test_verify_once.cpp)
++    target_link_libraries(test_verify_once PRIVATE lemonade-server-core)
++    add_cpp_ci_test(VerifyOnceTest CI ON COMMAND test_verify_once)
++endif()
++
+ set(_CLOUD_DISCOVERY_POLICY_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_cloud_discovery_policy.cpp")
+ if(BUILD_TESTING AND EXISTS "${_CLOUD_DISCOVERY_POLICY_TEST_SRC}")
+     add_executable(test_cloud_discovery_policy test/cpp/test_cloud_discovery_policy.cpp)
+diff --git a/src/cpp/server/utils/http_client.cpp b/src/cpp/server/utils/http_client.cpp
+index f2af69e0c..6ad20ef14 100644
+--- a/src/cpp/server/utils/http_client.cpp
++++ b/src/cpp/server/utils/http_client.cpp
+@@ -263,6 +263,102 @@ static HashCheckResult verify_file_hash(const fs::path& path, const ExpectedHash
+     return result;
+ }
+ 
++// A ".verified" sidecar records that the file at this path passed a full content
++// verification: algorithm, digest, size and mtime, one per line. A later check
++// whose expected digest, size and mtime all match skips the full re-hash — on
++// large models that re-hash dominates repeat pulls (hashing runs ~280 MB/s, so
++// a 340 GiB model costs ~20 min per pull with no bytes to download). Any
++// mismatch, including a touched or replaced file, falls back to the full hash.
++
++static fs::path verified_sidecar_path(const fs::path& file) {
++    fs::path p = file;
++    p += ".verified";
++    return p;
++}
++
++static void remove_verified_sidecar(const fs::path& file) {
++    std::error_code ec;
++    fs::remove(verified_sidecar_path(file), ec);
++}
++
++static bool read_file_facts(const fs::path& file, uintmax_t& size, long long& mtime) {
++    std::error_code ec;
++    size = fs::file_size(file, ec);
++    if (ec) {
++        return false;
++    }
++    const auto t = fs::last_write_time(file, ec);
++    if (ec) {
++        return false;
++    }
++    mtime = static_cast<long long>(t.time_since_epoch().count());
++    return true;
++}
++
++static void write_verified_sidecar(const fs::path& file, const ExpectedHash& expected) {
++    uintmax_t size = 0;
++    long long mtime = 0;
++    if (!read_file_facts(file, size, mtime)) {
++        return;
++    }
++    std::ofstream out(verified_sidecar_path(file), std::ios::trunc);
++    if (!out.is_open()) {
++        return;
++    }
++    out << expected.algorithm << "\n"
++        << expected.value << "\n"
++        << size << "\n"
++        << mtime << "\n";
++}
++
++static bool sidecar_attests(const fs::path& file, const ExpectedHash& expected) {
++    std::ifstream in(verified_sidecar_path(file));
++    if (!in.is_open()) {
++        return false;
++    }
++    std::string algorithm, digest, size_line, mtime_line;
++    if (!std::getline(in, algorithm) || !std::getline(in, digest) ||
++        !std::getline(in, size_line) || !std::getline(in, mtime_line)) {
++        return false;
++    }
++    if (algorithm != expected.algorithm || lower_copy(digest) != expected.value) {
++        return false;
++    }
++    uintmax_t size = 0;
++    long long mtime = 0;
++    if (!read_file_facts(file, size, mtime)) {
++        return false;
++    }
++    try {
++        if (std::stoull(size_line) != size || std::stoll(mtime_line) != mtime) {
++            return false;
++        }
++    } catch (...) {
++        return false;
++    }
++    return true;
++}
++
++// verify_file_hash plus the sidecar fast path: attested files skip the re-hash;
++// full verifications record a fresh attestation, failed ones drop it.
++static HashCheckResult verify_file_hash_cached(const fs::path& path, const ExpectedHash& expected) {
++    if (sidecar_attests(path, expected)) {
++        LOG(INFO, "Download") << "Hash previously verified (sidecar match); skipping re-hash: "
++                              << path.string() << std::endl;
++        HashCheckResult result;
++        result.ok = true;
++        result.actual = expected.value;
++        return result;
++    }
++    auto result = verify_file_hash(path, expected);
++    if (result.ok && expected.present()) {
++        write_verified_sidecar(path, expected);
++    } else if (!result.ok) {
++        remove_verified_sidecar(path);
++    }
++    return result;
++}
++
+ } // namespace
+ 
+ // Callback for writing response data to string
+@@ -1484,7 +1580,7 @@ DownloadResult HttpClient::download_file(const std::string& url,
+     // If a verified final file exists next to a stale .partial file, trust the
+     // verified final file and remove the stale partial.
+     if (expected_hash.present() && fs::exists(output_path_fs) && fs::exists(partial_path_fs)) {
+-        auto hash_result = verify_file_hash(output_path_fs, expected_hash);
++        auto hash_result = verify_file_hash_cached(output_path_fs, expected_hash);
+         if (hash_result.ok) {
+             std::error_code remove_partial_ec;
+             fs::remove(partial_path_fs, remove_partial_ec);
+@@ -1510,7 +1606,7 @@ DownloadResult HttpClient::download_file(const std::string& url,
+     // matches; otherwise remove it and force a fresh download.
+     if (fs::exists(output_path_fs) && !fs::exists(partial_path_fs)) {
+         if (expected_hash.present()) {
+-            auto hash_result = verify_file_hash(output_path_fs, expected_hash);
++            auto hash_result = verify_file_hash_cached(output_path_fs, expected_hash);
+             if (hash_result.ok) {
+                 final_result.success = true;
+                 final_result.bytes_downloaded = 0;
+@@ -1653,6 +1749,8 @@ DownloadResult HttpClient::download_file(const std::string& url,
+             if (ec) {
+                 final_result.success = false;
+                 final_result.error_message = "Download succeeded but failed to rename file: " + ec.message();
++            } else if (expected_hash.present()) {
++                write_verified_sidecar(output_path_fs, expected_hash);
+             }
+             return final_result;
+         }
+diff --git a/test/cpp/test_verify_once.cpp b/test/cpp/test_verify_once.cpp
+new file mode 100644
+index 000000000..1cb9bae71
+--- /dev/null
++++ b/test/cpp/test_verify_once.cpp
+@@ -0,0 +1,165 @@
++// Unit tests for the ".verified" sidecar fast path in HttpClient::download_file.
++// A sidecar recording {algorithm, digest, size, mtime} lets a repeat pull of an
++// already-complete file skip the full content re-hash; any divergence (size,
++// mtime, digest, or a missing/garbled sidecar) falls back to the full hash.
++//
++// No network: the URL points at a closed loopback port, so any code path that
++// reaches the transport fails fast and observably. That makes the skip provable:
++// a file whose content does NOT match the expected digest, but whose sidecar
++// attests it does, can only return success if the sidecar short-circuited.
++//
++// Checks use an explicit pass/fail counter (not assert()) so the test stays
++// effective under the Release build the CI `default` preset uses, where
++// -DNDEBUG would compile assert() to a no-op.
++
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <string>
++
++#include <lemon/utils/http_client.h>
++
++namespace fs = std::filesystem;
++using lemon::utils::DownloadOptions;
++using lemon::utils::HttpClient;
++
++namespace {
++
++// sha256 of "lemonade verify-once test content\n"
++const std::string kContent = "lemonade verify-once test content\n";
++const std::string kContentSha256 =
++    "40b8c9cb744d4edc60c7172bf0f3b3c67b58a3431ac9921c062dc0fd843bfd0f";
++// sha256 of "LEMONADE VERIFY-ONCE TEST CONTENT\n" (same length as kContent)
++const std::string kOtherContent = "LEMONADE VERIFY-ONCE TEST CONTENT\n";
++
++const std::string kDeadUrl = "http://127.0.0.1:9/never-served.bin";
++
++struct TestResult {
++    int passed = 0;
++    int failed = 0;
++
++    void check(bool cond, const std::string& name) {
++        if (cond) {
++            printf("[PASS] %s\n", name.c_str());
++            ++passed;
++        } else {
++            printf("[FAIL] %s\n", name.c_str());
++            ++failed;
++        }
++    }
++};
++
++void write_file(const fs::path& p, const std::string& content) {
++    std::ofstream out(p, std::ios::binary | std::ios::trunc);
++    out << content;
++}
++
++void write_sidecar(const fs::path& file, const std::string& algorithm,
++                   const std::string& digest, uintmax_t size, long long mtime) {
++    std::ofstream out(fs::path(file) += ".verified", std::ios::trunc);
++    out << algorithm << "\n" << digest << "\n" << size << "\n" << mtime << "\n";
++}
++
++long long mtime_count(const fs::path& p) {
++    return static_cast<long long>(fs::last_write_time(p).time_since_epoch().count());
++}
++
++DownloadOptions fast_fail_options(const std::string& digest) {
++    DownloadOptions options;
++    options.expected_hash_algorithm = "sha256";
++    options.expected_hash = digest;
++    options.max_retries = 0;
++    options.initial_retry_delay_ms = 1;
++    options.max_retry_delay_ms = 1;
++    options.connect_timeout = 2;
++    return options;
++}
++
++}  // namespace
++
++int main() {
++    TestResult r;
++    const fs::path dir = fs::temp_directory_path() / "lemonade-verify-once-test";
++    fs::remove_all(dir);
++    fs::create_directories(dir);
++
++    {
++        // A matching sidecar short-circuits the hash: the file content does NOT
++        // match the expected digest, so only the sidecar path can return success.
++        const fs::path f = dir / "skip.bin";
++        write_file(f, kOtherContent);
++        write_sidecar(f, "sha256", kContentSha256, fs::file_size(f), mtime_count(f));
++        auto result = HttpClient::download_file(kDeadUrl, f.string(), nullptr, {},
++                                                fast_fail_options(kContentSha256));
++        r.check(result.success, "matching sidecar skips the re-hash (attested success)");
++        r.check(fs::exists(f), "attested file is left in place");
++    }
++
++    {
++        // First full verification records a sidecar.
++        const fs::path f = dir / "record.bin";
++        write_file(f, kContent);
++        auto result = HttpClient::download_file(kDeadUrl, f.string(), nullptr, {},
++                                                fast_fail_options(kContentSha256));
++        r.check(result.success, "full verification of a complete file succeeds");
++        const fs::path sidecar = fs::path(f) += ".verified";
++        r.check(fs::exists(sidecar), "successful verification writes the sidecar");
++        std::ifstream in(sidecar);
++        std::string algorithm, digest;
++        std::getline(in, algorithm);
++        std::getline(in, digest);
++        r.check(algorithm == "sha256" && digest == kContentSha256,
++                "sidecar records the verified algorithm and digest");
++    }
++
++    {
++        // A sidecar whose recorded size disagrees with the file is stale: fall
++        // back to the full hash (which passes here) and rewrite the sidecar.
++        const fs::path f = dir / "stale-size.bin";
++        write_file(f, kContent);
++        write_sidecar(f, "sha256", kContentSha256, fs::file_size(f) + 1, mtime_count(f));
++        auto result = HttpClient::download_file(kDeadUrl, f.string(), nullptr, {},
++                                                fast_fail_options(kContentSha256));
++        r.check(result.success, "stale-size sidecar falls back to a passing full hash");
++    }
++
++    {
++        // Changed content with a stale sidecar (old mtime) is NOT attested: the
++        // full hash runs, fails, the file and sidecar are removed, and the
++        // forced re-download hits the dead URL.
++        const fs::path f = dir / "tampered.bin";
++        write_file(f, kContent);
++        write_sidecar(f, "sha256", kContentSha256, fs::file_size(f), mtime_count(f) - 1);
++        auto result = HttpClient::download_file(kDeadUrl, f.string(), nullptr, {},
++                                                fast_fail_options(kContentSha256));
++        // Content still matches the digest, so this passes via the full hash.
++        r.check(result.success, "mtime-mismatched sidecar falls back to the full hash");
++
++        const fs::path g = dir / "tampered2.bin";
++        write_file(g, kOtherContent);
++        write_sidecar(g, "sha256", kContentSha256, fs::file_size(g), mtime_count(g) - 1);
++        auto bad = HttpClient::download_file(kDeadUrl, g.string(), nullptr, {},
++                                             fast_fail_options(kContentSha256));
++        r.check(!bad.success, "unattested content mismatch is caught and re-download fails on the dead URL");
++        r.check(!fs::exists(g), "failed verification removes the file");
++        r.check(!fs::exists(fs::path(g) += ".verified"),
++                "failed verification removes the sidecar");
++    }
++
++    {
++        // A garbled sidecar never attests.
++        const fs::path f = dir / "garbled.bin";
++        write_file(f, kOtherContent);
++        std::ofstream out(fs::path(f) += ".verified", std::ios::trunc);
++        out << "not-a-sidecar\n";
++        out.close();
++        auto result = HttpClient::download_file(kDeadUrl, f.string(), nullptr, {},
++                                                fast_fail_options(kContentSha256));
++        r.check(!result.success, "garbled sidecar falls back to the full hash (which fails)");
++    }
++
++    fs::remove_all(dir);
++    printf("\n%d passed, %d failed\n", r.passed, r.failed);
++    return r.failed == 0 ? 0 : 1;
++}
+-- 
+2.53.0
+

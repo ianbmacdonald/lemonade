@@ -1,0 +1,1687 @@
+From 2c6b449d9d003d31fb078d847a882b6e8aa98fb9 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 01:11:20 -0400
+Subject: [PATCH 51/58] feat: pin /pull to an exact Hugging Face revision
+
+Port of the fork's B174 series (c9d7f27b6..4cc581600, 22 commits) onto the
+refactored model manager (models/ingest, artifact_store, update_scan and the
+route classes). POST /v1/pull accepts `revision` (a commit sha, branch or tag);
+the main checkpoint repository is fetched at that commit into
+snapshots/<sha>, refs/main is left alone, the pin is recorded per model in
+.lemonade_registry.json (written atomically) and every later load resolves
+inside the pinned snapshot. Pinned models are skipped by update checks; an
+explicit /pull without revision releases the pin, other downloads restore it.
+Collections, local imports, non-Hugging Face registries, self-managed
+backends, offline mode and /models/register refuse revision with 400. Deleting
+a model drops its pin. `lemonade pull --revision` passes it through.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                                |  14 +
+ docs/guide/cli.md                             |   6 +-
+ src/cpp/cli/hf_pull.cpp                       |  12 +-
+ src/cpp/cli/main.cpp                          |  14 +-
+ src/cpp/include/lemon/models/artifact_store.h |   3 +
+ src/cpp/include/lemon/models/ingest.h         |   6 +
+ src/cpp/include/lemon/models/model_info.h     |   8 +
+ src/cpp/include/lemon/models/registry_types.h |   4 +
+ src/cpp/include/lemon/registry_files.h        |  26 ++
+ src/cpp/include/lemon_cli/hf_pull.h           |   3 +-
+ src/cpp/server/model_manager.cpp              |   1 +
+ src/cpp/server/model_registry.cpp             |  23 +-
+ src/cpp/server/models/artifact_store.cpp      |  44 ++-
+ src/cpp/server/models/ingest.cpp              | 123 ++++++--
+ .../server/models/repository_provenance.cpp   |  24 +-
+ src/cpp/server/models/update_scan.cpp         |   6 +
+ src/cpp/server/registry_files.cpp             |  93 ++++++
+ .../server/routes/lemonade/models/pull.cpp    | 169 ++++++++++-
+ .../routes/lemonade/models/register.cpp       |   9 +-
+ src/cpp/server/services/model_json.cpp        |   4 +
+ test/cpp/test_pull_revision.cpp               | 255 +++++++++++++++++
+ test/server_endpoints.py                      | 264 ++++++++++++++++++
+ 22 files changed, 1084 insertions(+), 27 deletions(-)
+ create mode 100644 test/cpp/test_pull_revision.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 627d5f925..b8a488ac7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3548,6 +3548,20 @@ if(BUILD_TESTING AND EXISTS "${_MODEL_DELETE_SHARED_REPO_TEST_SRC}")
+     add_cpp_ci_test(ModelDeleteSharedRepoTest CI ON COMMAND test_model_delete_shared_repo)
+ endif()
+ 
++set(_PULL_REVISION_TEST_SRC
++    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_pull_revision.cpp"
++)
++if(BUILD_TESTING AND EXISTS "${_PULL_REVISION_TEST_SRC}")
++    add_executable(test_pull_revision
++        test/cpp/test_pull_revision.cpp
++    )
++    target_link_libraries(test_pull_revision PRIVATE lemonade-server-core)
++    add_dependencies(test_pull_revision copy_resources)
++
++    include(CTest)
++    add_cpp_ci_test(PullRevisionTest CI ON COMMAND test_pull_revision)
++endif()
++
+ 
+ # Recipe hiding: a backend with every built-in model dropped by the system-memory
+ # heuristic (and no user model left) is hidden from the recipe/backends listing.
+diff --git a/docs/guide/cli.md b/docs/guide/cli.md
+index d8397f181..9bf876d82 100644
+--- a/docs/guide/cli.md
++++ b/docs/guide/cli.md
+@@ -177,7 +177,7 @@ The `pull` command downloads and installs models. It can also register a custom
+ Common forms:
+ 
+ ```bash
+-lemonade pull MODEL_OR_CHECKPOINT [--alias ALIAS] [--checkpoint TYPE CHECKPOINT] [--recipe RECIPE] [--label LABEL] [--components MODEL ...]
++lemonade pull MODEL_OR_CHECKPOINT [--alias ALIAS] [--revision REVISION] [--checkpoint TYPE CHECKPOINT] [--recipe RECIPE] [--label LABEL] [--components MODEL ...]
+ ```
+ 
+ ```bash
+@@ -192,6 +192,9 @@ lemonade pull unsloth/Qwen3-8B-GGUF:Q4_K_M
+ 
+ # Register and pull a custom model with an alias
+ lemonade pull user.MyModel --checkpoint main org/model:Q4_0 --recipe llamacpp --alias my-alias
++
++# Pin a pull to an exact Hugging Face commit
++lemonade pull unsloth/Qwen3-8B-GGUF:Q4_K_M --revision 0123456789abcdef0123456789abcdef01234567
+ ```
+ 
+ | Option | Description | Required |
+@@ -199,6 +202,7 @@ lemonade pull user.MyModel --checkpoint main org/model:Q4_0 --recipe llamacpp --
+ | `MODEL_OR_CHECKPOINT` | Registered model name, or `owner/repo[:variant]` Hugging Face/ModelScope checkpoint | Yes |
+ | `--source` | Remote registry for checkpoint pulls: <!-- BEGIN GENERATED: cli-pull-source-values -->`huggingface` or `modelscope`<!-- END GENERATED: cli-pull-source-values -->; when omitted, the server's configured `default_model_source` applies. Direct hub URLs are auto-detected | No |
+ | `--alias ALIAS` | Add an alias for the model being registered or pulled. | No |
++| `--revision REVISION` | Pin the pull to an exact Hugging Face commit sha, branch, or tag of the main checkpoint repository. Later loads use the pinned snapshot until the model is pulled again without `--revision`. See [Pin a revision](../api/lemonade.md#pin-a-revision). | No |
+ | `--checkpoint TYPE CHECKPOINT` | Manual registration: add a checkpoint entry. Repeat for multi-component models such as `main` + `mmproj` or `main` + `vae`. | No |
+ | `--recipe RECIPE` | Manual registration: recipe to associate with the new `user.*` model (`llamacpp`, `flm`, `ryzenai-llm`, `vllm`, `whispercpp`, `sd-cpp`, `kokoro`, `collection.omni`) | No |
+ | `--label LABEL` | Manual registration: add a label to the new model. Repeatable. Valid: `audio-generation`, `chat`, `coding`, `dflash`, `embeddings`, `hot`, `image-classification`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `transcription`, `vision` | No |
+diff --git a/src/cpp/cli/hf_pull.cpp b/src/cpp/cli/hf_pull.cpp
+index 5551d729b..f34a47992 100644
+--- a/src/cpp/cli/hf_pull.cpp
++++ b/src/cpp/cli/hf_pull.cpp
+@@ -210,7 +210,8 @@ std::string normalize_huggingface_checkpoint_arg(const std::string& arg) {
+ int registry_pull_flow(lemonade::LemonadeClient& client,
+                        const std::string& model_arg,
+                        bool assume_yes,
+-                       const std::string& registry_source) {
++                       const std::string& registry_source,
++                       const std::string& revision) {
+     std::string source;
+     std::string checkpoint;
+     std::string variant;
+@@ -278,6 +279,9 @@ int registry_pull_flow(lemonade::LemonadeClient& client,
+         pull_body["model_name"] = model_name;
+         pull_body["recipe"] = "collection.omni";
+         pull_body["source"] = source;
++        if (!revision.empty()) {
++            pull_body["revision"] = revision;
++        }
+         // The repo is the checkpoint pointer; /pull resolves components from the
+         // manifest it downloads to disk, and a later `lemonade pull <name>`
+         // refreshes them from the recorded remote registry.
+@@ -363,6 +367,9 @@ int registry_pull_flow(lemonade::LemonadeClient& client,
+         pull_body["checkpoint"] = checkpoint;
+         pull_body["recipe"] = recipe;
+         pull_body["source"] = source;
++        if (!revision.empty()) {
++            pull_body["revision"] = revision;
++        }
+ 
+         std::cout << "Pulling " << checkpoint
+                   << " as " << suggested_name << std::endl;
+@@ -414,6 +421,9 @@ int registry_pull_flow(lemonade::LemonadeClient& client,
+     pull_body["checkpoint"] = checkpoint + ":" + variant_name;
+     pull_body["recipe"] = recipe;
+     pull_body["source"] = source;
++    if (!revision.empty()) {
++        pull_body["revision"] = revision;
++    }
+ 
+     if (variants_response.contains("suggested_labels") &&
+         variants_response["suggested_labels"].is_array() &&
+diff --git a/src/cpp/cli/main.cpp b/src/cpp/cli/main.cpp
+index 1cd32e362..c8427b63c 100644
+--- a/src/cpp/cli/main.cpp
++++ b/src/cpp/cli/main.cpp
+@@ -146,6 +146,7 @@ struct CliConfig {
+     std::string recipe;
+     std::string model_source;  // empty means defer to lemond's default_model_source
+     bool model_source_explicit = false;
++    std::string revision;  // pull: exact registry revision of the main checkpoint
+     std::vector<std::string> labels;
+     std::vector<std::string> components;
+     nlohmann::json recipe_options;
+@@ -392,6 +393,10 @@ static int handle_manual_pull_command(lemonade::LemonadeClient& client, const Cl
+         model_data["labels"] = config.labels;
+     }
+ 
++    if (!config.revision.empty()) {
++        model_data["revision"] = config.revision;
++    }
++
+     // Explicit `lemonade pull`: opt into the configured registry update check.
+     return client.pull_model(model_data, "", /*upgrade=*/true);
+ }
+@@ -450,13 +455,16 @@ static int handle_pull_command(lemonade::LemonadeClient& client, const CliConfig
+     int res = 0;
+     if (normalized_model.find('/') != std::string::npos) {
+         res = lemon_cli::registry_pull_flow(
+-            client, normalized_model, false, detected_source);
++            client, normalized_model, false, detected_source, config.revision);
+     } else {
+         nlohmann::json model_data;
+         model_data["model_name"] = config.model;
+         if (config.model_source_explicit) {
+             model_data["source"] = config.model_source;
+         }
++        if (!config.revision.empty()) {
++            model_data["revision"] = config.revision;
++        }
+         res = client.pull_model(model_data, "", /*upgrade=*/true);
+     }
+ 
+@@ -1655,6 +1663,10 @@ int main(int argc, char* argv[]) {
+         ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
+     pull_cmd->add_option("--alias", config.alias_name, "Optional alias to register for the pulled model")
+         ->type_name("ALIAS");
++    pull_cmd->add_option("--revision", config.revision,
++        "Pin the pull to an exact Hugging Face commit sha, branch, or tag of the main "
++        "checkpoint repository; pulling again without it returns to the default branch")
++        ->type_name("REVISION");
+     pull_cmd->footer(
+         "Manual Configuration Guide:\n"
+         "  https://lemonade-server.ai/docs/guide/configuration/custom-models/");
+diff --git a/src/cpp/include/lemon/models/artifact_store.h b/src/cpp/include/lemon/models/artifact_store.h
+index c15338eaf..df6d81e15 100644
+--- a/src/cpp/include/lemon/models/artifact_store.h
++++ b/src/cpp/include/lemon/models/artifact_store.h
+@@ -58,6 +58,9 @@ struct Provenance {
+     std::string processed_snapshot_id;  // What this run fetched, which differs
+                                         // when a cancelled pull fell back to the
+                                         // snapshot already in place.
++    // Set when a pinned pull fetched processed_snapshot_id; it is then recorded as the
++    // model's pin, and the repository-level fields keep describing refs/main.
++    bool pinned = false;
+ };
+ 
+ struct CleanupReport {
+diff --git a/src/cpp/include/lemon/models/ingest.h b/src/cpp/include/lemon/models/ingest.h
+index 1a0173bc1..335a389af 100644
+--- a/src/cpp/include/lemon/models/ingest.h
++++ b/src/cpp/include/lemon/models/ingest.h
+@@ -95,6 +95,10 @@ class ModelIngest : public ArtifactFetchService {
+                      DownloadProgressCallback progress,
+                      const utils::CancelToken& cancel = utils::CancelToken());
+ 
++    // Drops a deleted model's entry (and so its pin) from the repository's
++    // .lemonade_registry.json, under the repository's download lock.
++    void forget_registry_provenance(const ModelInfo& info);
++
+     // Disk state only: no request, no registration.
+     void populate_from_cached_manifest(ModelInfo& info);  // forwards to the collection unit
+ 
+@@ -124,6 +128,8 @@ class ModelIngest : public ArtifactFetchService {
+ 
+     void persist_size(const std::string& canonical_model_name) const;
+ 
++    std::shared_ptr<std::mutex> repo_download_lock(const ModelInfo& info);
++
+     Deps deps_;
+ 
+     std::unique_ptr<IngestCollections> collections_;
+diff --git a/src/cpp/include/lemon/models/model_info.h b/src/cpp/include/lemon/models/model_info.h
+index a149cde27..e552a84c9 100644
+--- a/src/cpp/include/lemon/models/model_info.h
++++ b/src/cpp/include/lemon/models/model_info.h
+@@ -75,6 +75,14 @@ struct ModelInfo {
+     bool suggested = false;
+     std::string source;  // Local origin: local_upload/local_path/extra_models_dir
+     std::string registry_source;  // Remote registry: huggingface/modelscope; empty when unpinned
++    // Main-checkpoint snapshot a pinned pull recorded (read from the repository's
++    // .lemonade_registry.json); empty follows refs/main.
++    std::string pinned_revision;
++    // Registry revision requested for the download in progress; never persisted.
++    std::string requested_revision;
++    // Set only by an explicit /pull without a revision: that download releases
++    // the pin instead of restoring it. Never persisted.
++    bool release_pin = false;
+     bool downloaded = false;     // Whether model is downloaded and available
+     bool update_available = false; // Whether a newer remote-registry version exists
+     std::optional<bool> auto_update = std::nullopt; // Optional per-model auto-update override
+diff --git a/src/cpp/include/lemon/models/registry_types.h b/src/cpp/include/lemon/models/registry_types.h
+index e08a7aac4..7f5fb84d1 100644
+--- a/src/cpp/include/lemon/models/registry_types.h
++++ b/src/cpp/include/lemon/models/registry_types.h
+@@ -169,6 +169,10 @@ std::string huggingface_repository_api_url(
+     const std::string& endpoint,
+     const std::string& repo_id,
+     const std::string& revision = "");
++// Empty when `revision` may be sent to a registry (the empty default included);
++// otherwise a message suitable for a 400 response. Checked before any network
++// call because the value becomes part of a registry URL.
++std::string registry_revision_error(const std::string& revision);
+ std::optional<nlohmann::json> parse_huggingface_compatibility_response(
+     int status_code,
+     const std::string& body,
+diff --git a/src/cpp/include/lemon/registry_files.h b/src/cpp/include/lemon/registry_files.h
+index a42fc5884..2602a1461 100644
+--- a/src/cpp/include/lemon/registry_files.h
++++ b/src/cpp/include/lemon/registry_files.h
+@@ -3,6 +3,8 @@
+ #include <cstddef>
+ #include <filesystem>
+ #include <map>
++#include <optional>
++#include <set>
+ #include <string>
+ #include <unordered_set>
+ #include <vector>
+@@ -55,6 +57,30 @@ std::string active_local_snapshot(
+     const std::string& resolved_path,
+     const std::filesystem::path& model_cache_path);
+ 
++// Snapshot a pinned pull recorded for model_name in the repository's
++// .lemonade_registry.json; empty when the model follows refs/main. A recorded
++// value that is not a single safe path component is ignored.
++std::string pinned_snapshot_id(
++    const std::filesystem::path& model_cache_path,
++    const std::string& model_name);
++
++// Every snapshot some model in the repository is pinned to; nullopt when the
++// provenance file exists but cannot be read, i.e. the pins are unknown.
++std::optional<std::set<std::string>> pinned_snapshot_ids(
++    const std::filesystem::path& model_cache_path);
++
++// The revision a download fetches: the request's own, none when the request
++// releases the pin, otherwise the pin currently recorded on disk.
++std::string download_revision(const std::string& requested_revision,
++                              bool release_pin,
++                              const std::string& current_pin);
++
++// False when a pinned pull must refuse the snapshot id the registry resolved:
++// not a single safe path component, or the requested name echoed back instead
++// of a commit id.
++bool is_pinnable_snapshot_id(const std::string& requested_revision,
++                             const std::string& snapshot_id);
++
+ // content_id identifies content across commits (LFS sha256 or git blob oid),
+ // so revisions compare without downloading anything.
+ struct HfFileMetadata {
+diff --git a/src/cpp/include/lemon_cli/hf_pull.h b/src/cpp/include/lemon_cli/hf_pull.h
+index e5a9bcb74..376aafa4e 100644
+--- a/src/cpp/include/lemon_cli/hf_pull.h
++++ b/src/cpp/include/lemon_cli/hf_pull.h
+@@ -21,7 +21,8 @@ std::string normalize_huggingface_checkpoint_arg(const std::string& arg);
+ int registry_pull_flow(lemonade::LemonadeClient& client,
+                        const std::string& model_arg,
+                        bool assume_yes,
+-                       const std::string& registry_source);
++                       const std::string& registry_source,
++                       const std::string& revision = "");
+ 
+ // Backward-compatible Hugging Face entry point.
+ int hf_pull_flow(lemonade::LemonadeClient& client,
+diff --git a/src/cpp/server/model_manager.cpp b/src/cpp/server/model_manager.cpp
+index 157632f65..82df554a0 100644
+--- a/src/cpp/server/model_manager.cpp
++++ b/src/cpp/server/model_manager.cpp
+@@ -759,6 +759,7 @@ void ModelManager::delete_model(const std::string& model_name) {
+                                   << canonical_model_name << std::endl;
+     }
+ 
++    ingest_->forget_registry_provenance(info);
+     forget_registered_model(canonical_model_name);
+     store_.patch_removed(canonical_model_name);
+ }
+diff --git a/src/cpp/server/model_registry.cpp b/src/cpp/server/model_registry.cpp
+index 16e25fda1..7401cd375 100644
+--- a/src/cpp/server/model_registry.cpp
++++ b/src/cpp/server/model_registry.cpp
+@@ -659,11 +659,32 @@ std::string huggingface_repository_api_url(
+     std::string url = trim_trailing_slash(endpoint) +
+                       "/api/models/" + percent_encode(repo_id, true);
+     if (!revision.empty()) {
+-        url += "/revision/" + percent_encode(revision, true);
++        // The Hub routes a ref such as refs/pr/1 only when its slashes are encoded.
++        url += "/revision/" + percent_encode(revision);
+     }
+     return url;
+ }
+ 
++std::string registry_revision_error(const std::string& revision) {
++    if (revision.empty()) {
++        return "";
++    }
++    const std::string rule =
++        "a 40-character commit sha, or a branch/tag name of at most 128 characters "
++        "using A-Z a-z 0-9 . _ / - that contains no '..' and does not start with "
++        "'/' or '-'";
++    if (revision.size() > 128 || revision.front() == '/' || revision.front() == '-' ||
++        revision.find("..") != std::string::npos) {
++        return "Invalid revision '" + revision.substr(0, 128) + "': expected " + rule;
++    }
++    for (const unsigned char c : revision) {
++        if (!std::isalnum(c) && c != '.' && c != '_' && c != '/' && c != '-') {
++            return "Invalid revision '" + revision + "': expected " + rule;
++        }
++    }
++    return "";
++}
++
+ std::optional<json> parse_huggingface_compatibility_response(
+     int status_code,
+     const std::string& body,
+diff --git a/src/cpp/server/models/artifact_store.cpp b/src/cpp/server/models/artifact_store.cpp
+index 3522c240e..656c21f87 100644
+--- a/src/cpp/server/models/artifact_store.cpp
++++ b/src/cpp/server/models/artifact_store.cpp
+@@ -11,6 +11,8 @@
+ #include <lemon/models/registry_types.h>
+ #include <lemon/models/artifact_source.h>
+ #include <lemon/models/repository_provenance.h>
++#include <lemon/model_types.h>
++#include <lemon/registry_files.h>
+ #include <lemon/utils/aixlog.hpp>
+ #include <lemon/utils/json_utils.h>
+ #include <lemon/utils/path_utils.h>
+@@ -349,10 +351,40 @@ std::string ModelArtifactStore::resolve_path_in(const ModelInfo& info, const std
+     ctx.registry_source = registry_source_of(info);
+     ctx.model_cache_path = cache_root + "/" +
+         backends::hf_cache::repo_id_to_cache_dir_name(ctx.repo_id, ctx.registry_source);
++    const bool pinned = !info.pinned_revision.empty() && ctx.repo_id == ctx.main_repo_id;
++    if (pinned) {
++        // Presenting the pinned snapshot as the whole repository cache keeps every
++        // backend's lookup, including refs/main and whole-cache fallbacks, on the
++        // pinned commit without each backend knowing about pins.
++        ctx.model_cache_path += "/snapshots/" + info.pinned_revision;
++        if (!utils::safe_exists(utils::path_from_utf8(ctx.model_cache_path))) {
++            return "";
++        }
++    }
+     ctx.type = type;
+     ctx.checkpoint = checkpoint;
+ 
+-    return backends::ops_for(info.recipe)->resolve_checkpoint_path(info, ctx);
++    std::string resolved = backends::ops_for(info.recipe)->resolve_checkpoint_path(info, ctx);
++    // Backends fall back to the cache root when a named file is absent (the
++    // pre-snapshot flat layout); for a pin that root is the snapshot itself.
++    if (pinned && !ctx.variant.empty() && resolved == ctx.model_cache_path) {
++        return "";
++    }
++    if (!pinned && !resolved.empty()) {
++        // Backends that search every snapshot (no refs/main yet, or a variant
++        // missing from it) must not hand an unpinned model another model's
++        // pinned commit; it then reports not downloaded and a pull fetches main.
++        const fs::path cache_path = utils::path_from_utf8(ctx.model_cache_path);
++        const std::string snapshot =
++            registry_files::snapshot_id_from_resolved_path(resolved, cache_path);
++        if (!snapshot.empty() && snapshot != backends::hf_cache::read_ref_main(cache_path)) {
++            const auto pins = registry_files::pinned_snapshot_ids(cache_path);
++            if (!pins || pins->count(snapshot) != 0) {
++                return "";
++            }
++        }
++    }
++    return resolved;
+ }
+ 
+ // The same three checks every ArtifactSource::present() applies, asked of the path this
+@@ -1169,6 +1201,16 @@ backends::DownloadPolicy ModelArtifactStore::download_policy(const ModelInfo& in
+ }
+ 
+ void ModelArtifactStore::resolve_all(ModelInfo& info) const {
++    info.pinned_revision.clear();
++    const std::string main_repo_id = repo_id_from_checkpoint(info.checkpoint("main"));
++    if (info.source.empty() && !main_repo_id.empty() &&
++        !is_model_collection_recipe(info.recipe)) {
++        info.pinned_revision = registry_files::pinned_snapshot_id(
++            utils::path_from_utf8(root()) /
++                backends::hf_cache::repo_id_to_cache_dir_name(main_repo_id,
++                                                              registry_source_of(info)),
++            info.model_name);
++    }
+     for (const auto& [type, checkpoint] : info.checkpoints) {
+         info.resolved_paths[type] = resolve_path(info, type, checkpoint);
+     }
+diff --git a/src/cpp/server/models/ingest.cpp b/src/cpp/server/models/ingest.cpp
+index 0bbc0d563..fb18ac997 100644
+--- a/src/cpp/server/models/ingest.cpp
++++ b/src/cpp/server/models/ingest.cpp
+@@ -3,6 +3,7 @@
+ #include <lemon/models/ingest_collections.h>
+ 
+ #include <lemon/backends/backend_registry.h>
++#include <lemon/backends/hf_cache_util.h>
+ #include <lemon/routing_policy.h>
+ #include <lemon/routing_policy_parser.h>
+ #include <lemon/canonical_id.h>
+@@ -243,15 +244,29 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
+     SourcePlacement placement;
+     placement.recipe = info.recipe;
+ 
++    const bool pinned = !info.requested_revision.empty();
+     std::map<std::string, std::unique_ptr<FetchableRepository>> repositories;
+     std::map<std::string, RepoListing> listings;
+     for (const auto& ref : refs) {
+         if (listings.count(ref.repo_id)) continue;
+         std::unique_ptr<FetchableRepository> repository =
+             deps_.resolver->repository_for(ref, placement);
+-        listings.emplace(ref.repo_id, repository->list(ref.repo_id, ref.revision));
++        const std::string revision =
++            pinned && ref.repo_id == main_repo_id ? info.requested_revision : ref.revision;
++        listings.emplace(ref.repo_id, repository->list(ref.repo_id, revision));
+         repositories.emplace(ref.repo_id, std::move(repository));
+     }
++    if (pinned) {
++        const RepoListing& main_listing = listings.at(main_repo_id);
++        const std::string resolved = main_listing.revision.id.empty()
++            ? main_listing.download_revision
++            : main_listing.revision.id;
++        if (!registry_files::is_pinnable_snapshot_id(info.requested_revision, resolved)) {
++            throw std::runtime_error(
++                source_display + " did not report a commit for revision '" +
++                info.requested_revision + "' of " + main_repo_id + "; cannot pin it");
++        }
++    }
+ 
+     // The existence rule stays the pull's own: its words tell the user which
+     // host refused, where the plan builder's generic words do not.
+@@ -337,6 +352,9 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
+     std::set<std::string> repos_reusing_previous_snapshot;
+     if (source == models::huggingface_descriptor().id) {
+         for (const auto& repo_id : repo_ids) {
++            // A pin must own snapshots/<sha> even when its artifacts match the
++            // snapshot refs/main names.
++            if (pinned && repo_id == main_repo_id) continue;
+             const std::string current_ref = repo_snapshot_ids.at(repo_id);
+             const std::string previous_ref = repo_previous_refs.at(repo_id);
+             if (previous_ref.empty() || previous_ref == current_ref) continue;
+@@ -438,10 +456,17 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
+             ? repo_previous_refs.at(repo_id)
+             : snapshot_id;
+ 
+-        artifacts().write_active_snapshot(cache_path, active_snapshot_id);
++        const bool pinned_repo = pinned && repo_id == main_repo_id;
++        if (!pinned_repo) {
++            artifacts().write_active_snapshot(cache_path, active_snapshot_id);
++        }
+         if (reusing_previous_snapshot) {
+-            artifacts().remove_unused_snapshot(
+-                cache_path, repo_snapshot_paths.at(repo_id), active_snapshot_id);
++            // The commit refs/main skipped can be another model's pinned snapshot.
++            const auto pins = registry_files::pinned_snapshot_ids(cache_path);
++            if (pins && pins->count(snapshot_id) == 0) {
++                artifacts().remove_unused_snapshot(
++                    cache_path, repo_snapshot_paths.at(repo_id), active_snapshot_id);
++            }
+         }
+ 
+         const RepoListing& listing = listings.at(repo_id);
+@@ -454,13 +479,15 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
+                 }
+             }
+         }
+-        artifacts().record_processed_model(cache_path, info, models::Provenance{
++        models::Provenance provenance{
+             source_name,
+             repo_id,
+             listing.download_revision,
+             active_snapshot_id,
+             snapshot_id,
+-        }, checkpoint_type);
++        };
++        provenance.pinned = pinned_repo;
++        artifacts().record_processed_model(cache_path, info, provenance, checkpoint_type);
+     }
+ 
+     if (progress_callback) {
+@@ -869,10 +896,19 @@ void ModelIngest::pull(const std::string& model_name,
+     // The do_not_upgrade flag means:
+     //   - Load/inference endpoints: Don't check the remote registry for updates (use cache if available)
+     //   - Pull endpoint: Always check the recorded registry for the latest version (do_not_upgrade=false)
+-    if (do_not_upgrade && deps_.store->is_downloaded(artifacts(), model_name)) {
++    model_info.requested_revision =
++        model_data.contains("revision") && model_data["revision"].is_string()
++            ? model_data["revision"].get<std::string>()
++            : std::string();
++    if (do_not_upgrade && model_info.requested_revision.empty() &&
++        deps_.store->is_downloaded(artifacts(), model_name)) {
+         LOG(INFO, "ModelManager") << "Model already downloaded and do_not_upgrade=true, using cached version" << std::endl;
+         return;
+     }
++    // Only /pull sets "revision" (empty included); load-time, sync, Ollama and
++    // collection-component downloads omit it and so restore the pin instead.
++    model_info.release_pin = !do_not_upgrade && model_data.contains("revision") &&
++                             model_info.requested_revision.empty();
+ 
+     const auto resolved_paths_before = deps_.store->resolved_paths_for(model_info.model_name);
+ 
+@@ -886,6 +922,52 @@ void ModelIngest::pull(const std::string& model_name,
+ 
+ }
+ 
++std::shared_ptr<std::mutex> ModelIngest::repo_download_lock(const ModelInfo& info) {
++    std::lock_guard<std::mutex> guard(download_locks_mutex_);
++    auto& slot = download_locks_[
++        registry_source_of(info) + ":" +
++        repo_id_from_checkpoint(info.checkpoint("main"))];
++    if (!slot) slot = std::make_shared<std::mutex>();
++    return slot;
++}
++
++void ModelIngest::forget_registry_provenance(const ModelInfo& info) {
++    const std::string main_repo_id = repo_id_from_checkpoint(info.checkpoint("main"));
++    if (main_repo_id.empty() || !info.source.empty()) {
++        return;
++    }
++    std::shared_ptr<std::mutex> repo_lock = repo_download_lock(info);
++    std::lock_guard<std::mutex> download_lock(*repo_lock);
++    const fs::path provenance_path =
++        path_from_utf8(artifacts().root()) /
++        backends::hf_cache::repo_id_to_cache_dir_name(main_repo_id, registry_source_of(info)) /
++        ".lemonade_registry.json";
++    if (!safe_exists(provenance_path)) {
++        return;
++    }
++    try {
++        json provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
++        const auto models_it = provenance.find("processed_models");
++        if (models_it == provenance.end() || !models_it->is_object() ||
++            !models_it->contains(info.model_name)) {
++            return;
++        }
++        models_it->erase(info.model_name);
++        fs::path tmp = provenance_path;
++        tmp += ".tmp";
++        JsonUtils::save_to_file(provenance, path_to_utf8(tmp));
++        std::error_code ec;
++        fs::rename(tmp, provenance_path, ec);
++        if (ec) {
++            fs::remove(tmp, ec);
++            JsonUtils::save_to_file(provenance, path_to_utf8(provenance_path));
++        }
++    } catch (const std::exception& e) {
++        LOG(WARNING, "ModelManager") << "Could not update " << path_to_utf8(provenance_path)
++                                     << ": " << e.what() << std::endl;
++    }
++}
++
+ void ModelIngest::fetch_model(const ModelInfo& info, bool do_not_upgrade,
+                                  DownloadProgressCallback progress_callback,
+                                  const utils::CancelToken& cancel) {
+@@ -894,24 +976,31 @@ void ModelIngest::fetch_model(const ModelInfo& info, bool do_not_upgrade,
+     // download is still running) must wait for the in-flight download instead
+     // of writing the same .partial files concurrently, which corrupts them and
+     // sends the hash verification into an endless retry-from-scratch loop.
+-    std::shared_ptr<std::mutex> repo_lock;
+-    {
+-        std::lock_guard<std::mutex> guard(download_locks_mutex_);
+-        auto& slot = download_locks_[
+-            registry_source_of(info) + ":" +
+-            repo_id_from_checkpoint(info.checkpoint("main"))];
+-        if (!slot) slot = std::make_shared<std::mutex>();
+-        repo_lock = slot;
+-    }
++    std::shared_ptr<std::mutex> repo_lock = repo_download_lock(info);
+     std::lock_guard<std::mutex> download_lock(*repo_lock);
+ 
++    // The pin is re-read under the repo lock: `info` may predate a pinned pull
++    // that finished while this download waited, and a download that does not
++    // release the pin must restore whatever is pinned now.
++    ModelInfo download_info = info;
++    const std::string main_repo_id = repo_id_from_checkpoint(info.checkpoint("main"));
++    const std::string current_pin = main_repo_id.empty()
++        ? std::string()
++        : registry_files::pinned_snapshot_id(
++              path_from_utf8(artifacts().root()) /
++                  backends::hf_cache::repo_id_to_cache_dir_name(main_repo_id,
++                                                                registry_source_of(info)),
++              info.model_name);
++    download_info.requested_revision = registry_files::download_revision(
++        info.requested_revision, info.release_pin, current_pin);
++
+     // The backend's ops own the download (shared registry engine by default; flm pulls
+     // via the flm CLI; cloud is a no-op).
+     backends::BackendOpsContext octx;
+     octx.fetch = this;
+     octx.artifacts = deps_.artifacts;
+     octx.cancel = cancel;
+-    backends::ops_for(info.recipe)->download_model(info, do_not_upgrade, progress_callback, octx);
++    backends::ops_for(info.recipe)->download_model(download_info, do_not_upgrade, progress_callback, octx);
+ 
+     // Update cache after successful download
+     deps_.store->patch_download(*deps_.artifacts, info.model_name, true);
+diff --git a/src/cpp/server/models/repository_provenance.cpp b/src/cpp/server/models/repository_provenance.cpp
+index 3940fe2df..44bfe2d89 100644
+--- a/src/cpp/server/models/repository_provenance.cpp
++++ b/src/cpp/server/models/repository_provenance.cpp
+@@ -139,6 +139,9 @@ void record_processed_model(const fs::path& repo_cache_dir, const ModelInfo& inf
+         }
+         entry["selection"] = processed_selection(info);
+         entry["snapshot_id"] = provenance.processed_snapshot_id;
++        if (provenance.pinned) {
++            entry["pinned_revision"] = provenance.processed_snapshot_id;
++        }
+     }
+ 
+     // v2: what this model processed from this repository, checkpoint by checkpoint.
+@@ -164,7 +167,26 @@ void record_processed_model(const fs::path& repo_cache_dir, const ModelInfo& inf
+              {"snapshot_id", provenance.active_snapshot_id},
+              {"processed_models", std::move(processed)}};
+     if (!is_main) out["version"] = 2;
+-    utils::JsonUtils::save_to_file(out, utils::path_to_utf8(provenance_path));
++    if (provenance.pinned) {
++        // The repository-level fields describe refs/main, which a pin leaves alone.
++        for (const char* field : {"revision", "snapshot_id"}) {
++            if (previous.is_object() && previous.contains(field)) {
++                out[field] = previous[field];
++            } else {
++                out.erase(field);
++            }
++        }
++    }
++    // Loads read the pin from this file concurrently; a torn read would drop it.
++    fs::path tmp = provenance_path;
++    tmp += ".tmp";
++    utils::JsonUtils::save_to_file(out, utils::path_to_utf8(tmp));
++    std::error_code ec;
++    fs::rename(tmp, provenance_path, ec);
++    if (ec) {
++        fs::remove(tmp, ec);
++        utils::JsonUtils::save_to_file(out, utils::path_to_utf8(provenance_path));
++    }
+ }
+ 
+ }  // namespace models
+diff --git a/src/cpp/server/models/update_scan.cpp b/src/cpp/server/models/update_scan.cpp
+index afc02d7b2..af482c237 100644
+--- a/src/cpp/server/models/update_scan.cpp
++++ b/src/cpp/server/models/update_scan.cpp
+@@ -104,6 +104,12 @@ UpdateScanResult run_update_scan(const UpdateScanDeps& deps,
+                 continue;
+             }
+ 
++            // A pinned model asked for one commit; reporting the branch tip as an
++            // update would let auto-update silently undo the pin.
++            if (!info.pinned_revision.empty()) {
++                continue;
++            }
++
+             const std::string main_cp = info.checkpoint("main");
+             if (main_cp.empty()) {
+                 continue;
+diff --git a/src/cpp/server/registry_files.cpp b/src/cpp/server/registry_files.cpp
+index d5ac57052..18ea6cf90 100644
+--- a/src/cpp/server/registry_files.cpp
++++ b/src/cpp/server/registry_files.cpp
+@@ -6,6 +6,7 @@
+ #include <lemon/gguf_shard_utils.h>
+ #include <lemon/hf_variants.h>
+ #include <lemon/models/artifact_ref.h>
++#include <lemon/models/registry_types.h>
+ #include <lemon/utils/aixlog.hpp>
+ #include <lemon/utils/path_utils.h>
+ #include <lemon/utils/http_client.h>
+@@ -13,7 +14,10 @@
+ #include <lemon/utils/safe_fs.h>
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <cstdlib>
++#include <mutex>
++#include <optional>
+ #include <filesystem>
+ #include <map>
+ #include <set>
+@@ -250,6 +254,95 @@ std::string active_local_snapshot(
+     return snapshot;
+ }
+ 
++static bool is_commit_sha(const std::string& value) {
++    return value.size() == 40 &&
++           std::all_of(value.begin(), value.end(), [](unsigned char c) {
++               return std::isdigit(c) || (c >= 'a' && c <= 'f');
++           });
++}
++
++static bool is_snapshot_component(const std::string& snapshot_id) {
++    // A leading dot would name "." or a hidden entry rather than a commit.
++    return !snapshot_id.empty() && snapshot_id.front() != '.' &&
++           registry_revision_error(snapshot_id).empty() &&
++           snapshot_id.find('/') == std::string::npos;
++}
++
++// Every valid pin recorded in a repository's .lemonade_registry.json, by model;
++// nullopt when the file exists but cannot be read.
++static std::optional<std::map<std::string, std::string>> read_pinned_snapshot_ids(
++    const fs::path& model_cache_path) {
++    std::map<std::string, std::string> pins;
++    const fs::path provenance_path = model_cache_path / ".lemonade_registry.json";
++    if (!utils::safe_exists(provenance_path)) {
++        return pins;
++    }
++    try {
++        const nlohmann::json provenance =
++            utils::JsonUtils::load_from_file(utils::path_to_utf8(provenance_path));
++        const auto models_it = provenance.find("processed_models");
++        if (models_it == provenance.end() || !models_it->is_object()) {
++            return pins;
++        }
++        for (const auto& [model_name, entry] : models_it->items()) {
++            if (!entry.is_object()) continue;
++            const std::string pinned =
++                utils::JsonUtils::get_or_default<std::string>(entry, "pinned_revision", "");
++            if (is_snapshot_component(pinned)) {
++                pins[model_name] = pinned;
++            }
++        }
++    } catch (const std::exception& e) {
++        static std::mutex logged_mutex;
++        static std::set<std::string> logged;
++        std::lock_guard<std::mutex> lock(logged_mutex);
++        if (logged.insert(utils::path_to_utf8(provenance_path)).second) {
++            LOG(ERROR, "ModelManager") << "Cannot read " << utils::path_to_utf8(provenance_path)
++                << " (" << e.what() << "); models in this repository load only "
++                << "the refs/main snapshot until it is repaired or re-pulled" << std::endl;
++        }
++        return std::nullopt;
++    }
++    return pins;
++}
++
++std::string pinned_snapshot_id(
++    const fs::path& model_cache_path,
++    const std::string& model_name) {
++    const auto pins = read_pinned_snapshot_ids(model_cache_path);
++    if (!pins) return "";
++    const auto it = pins->find(model_name);
++    return it == pins->end() ? "" : it->second;
++}
++
++std::optional<std::set<std::string>> pinned_snapshot_ids(const fs::path& model_cache_path) {
++    const auto pins = read_pinned_snapshot_ids(model_cache_path);
++    if (!pins) return std::nullopt;
++    std::set<std::string> ids;
++    for (const auto& [model_name, pinned] : *pins) {
++        (void)model_name;
++        ids.insert(pinned);
++    }
++    return ids;
++}
++
++std::string download_revision(const std::string& requested_revision,
++                              bool release_pin,
++                              const std::string& current_pin) {
++    if (!requested_revision.empty() || release_pin) {
++        return requested_revision;
++    }
++    return current_pin;
++}
++
++bool is_pinnable_snapshot_id(const std::string& requested_revision,
++                             const std::string& snapshot_id) {
++    // A registry that omits the commit id reports the requested name instead;
++    // pinning that would persist a pin the load path cannot honour.
++    return is_snapshot_component(snapshot_id) &&
++           (snapshot_id != requested_revision || is_commit_sha(snapshot_id));
++}
++
+ std::map<std::string, std::vector<std::string>> group_aux_checkpoint_variants(
+     const std::string& recipe, const std::map<std::string, std::string>& checkpoints) {
+     std::map<std::string, std::vector<std::string>> grouped;
+diff --git a/src/cpp/server/routes/lemonade/models/pull.cpp b/src/cpp/server/routes/lemonade/models/pull.cpp
+index 4491d0b33..9e85ead8e 100644
+--- a/src/cpp/server/routes/lemonade/models/pull.cpp
++++ b/src/cpp/server/routes/lemonade/models/pull.cpp
+@@ -1,7 +1,13 @@
++#include <optional>
++#include <string>
++
+ #include <lemon/utils/aixlog.hpp>
+ 
++#include "lemon/backends/backend_descriptor_registry.h"
+ #include "lemon/server/model_sync.h"
+ #include "lemon/model_manager.h"
++#include "lemon/model_types.h"
++#include "lemon/models/registry_descriptors.h"
+ #include "lemon/models/registry_types.h"
+ #include "lemon/runtime_config.h"
+ #include "lemon/server/api_route.h"
+@@ -30,6 +36,13 @@ const RouteError kRegistryUnavailable{
+     503, "registry_unavailable",
+     "Without `stream`, the model registry rate-limits or is temporarily unavailable; the "
+     "`Retry-After` header and the body's `upstream_status_code` carry the details"};
++const RouteError kInvalidRevision{
++    400, "",
++    "`revision` is malformed, or cannot pin this model: a collection, a local import, a "
++    "non-Hugging Face registry, a backend that manages its own downloads, or a request that "
++    "also changes an existing model's recipe or source"};
++const RouteError kRevisionOffline{
++    400, "lemond_offline", "`revision` is sent while the server is in offline mode"};
+ const RouteError kPullFailed{
+     500, "",
+     "Another failure occurs, for example a failed download, a model this system cannot run, a "
+@@ -45,6 +58,7 @@ ordered_json pull_schema() {
+         "properties": {
+             "status": {"const": "success", "description": "Always `success`."},
+             "model_name": {"type": "string", "description": "The installed model."},
++            "revision": {"type": "string", "description": "Only with `revision`: the commit sha the model is pinned to."},
+             "message": {"type": "string", "description": "Only with `local_import`: a confirmation that the files were registered."}
+         }
+     })");
+@@ -104,6 +118,12 @@ const RouteArg kLocalImport{"local_import", ArgIn::JsonBody, {{"type", "boolean"
+                             "Register model files a client already copied into the Hugging Face cache, without "
+                             "downloading. Defaults to `false`."};
+ 
++const RouteArg kRevision{"revision", ArgIn::JsonBody, {{"type", "string"}}, false, Support::Available,
++                         "Pin the download to an exact Hugging Face revision of the model's main "
++                         "checkpoint repository: a 40-character commit sha, or a branch or tag name. "
++                         "Omitted or empty pulls the registry's default branch, and an explicit pull "
++                         "without it releases an existing pin. See Pin a Revision below."};
++
+ class PullRoute : public ApiRoute {
+ public:
+     using ApiRoute::ApiRoute;
+@@ -123,6 +143,41 @@ public:
+             "[`POST /v1/models/check-updates`](#post-v1modelscheck-updates) only reports them.",
+             "With `stream`, the error event or the job reports an unknown model.",
+             "In offline mode a new definition is still registered, but nothing is downloaded.",
++            "### Pin a Revision\n\n"
++            "A client can look up a model's commits on the Hub (for example "
++            "`https://huggingface.co/api/models/<owner>/<repo>/commits/main`) and download exactly "
++            "one of them by passing `revision`; the non-streaming response then carries the "
++            "resolved commit as `revision`.\n\n"
++            "- `revision` must be a 40-character hexadecimal commit sha, or a branch/tag name of at "
++            "most 128 characters made of `A-Z a-z 0-9 . _ / -` that does not contain `..` and does "
++            "not start with `/` or `-` (for example `main` or `refs/pr/1`). Anything else is "
++            "rejected with `400` before any registration or network request.\n"
++            "- A branch or tag is resolved to its commit when the pull runs; the model stays on that "
++            "commit even if the branch moves later.\n"
++            "- The pin applies to the main checkpoint's repository only. Auxiliary checkpoints in "
++            "other repositories follow their default branch; auxiliary files in the main repository "
++            "come from the pinned commit.\n"
++            "- Files are stored under `snapshots/<commit sha>/`. A pinned pull never moves "
++            "`refs/main`, so other models that share the repository keep loading the default-branch "
++            "snapshot.\n"
++            "- The model records the pinned commit in the repository's `.lemonade_registry.json`, "
++            "and every later load of that model uses the pinned snapshot. "
++            "[`GET /v1/models/{id}`](./openai.md#get-v1modelsid) reports it as `pinned_revision`. A "
++            "pinned model is excluded from update checks and auto-update.\n"
++            "- An explicit pull with `revision` always fetches and pins that revision, even with "
++            "`do_not_upgrade` and an already-downloaded model, so it also moves an existing pin. "
++            "Pulling again without `revision` removes the pin.\n"
++            "- `revision` is rejected with `400` for collections, local imports, models from a "
++            "non-Hugging Face registry, backends that manage their own downloads (`flm`, `cloud`), "
++            "a request that also changes an existing model's recipe or source, and in offline "
++            "mode. [`POST /v1/models/register`](#post-v1modelsregister) does not download and "
++            "rejects `revision`.\n"
++            "- Streaming and server-owned job responses do not carry the resolved sha; read "
++            "`pinned_revision` after the download completes.\n"
++            "- If a repository's `.lemonade_registry.json` is corrupt, models in that repository "
++            "that are not on the `refs/main` snapshot (pinned models included) report not "
++            "downloaded. A later download of that repository rewrites the file and drops the pins "
++            "it held.",
+             "### Register and Install a Model\n\n"
+             "Registering writes the model to `user_models.json` in the Lemonade config directory "
+             "(`~/.config/lemonade` by default), after which [`GET /v1/models`](./openai.md#get-v1models) lists it beside the "
+@@ -141,7 +196,7 @@ public:
+         s.args = {
+             common::kStream, downloads::kSubscribe, kModelName, kRecipe, kCheckpoint, kCheckpoints,
+             kReasoning, kVision, kEmbedding, kReranking, kMmproj, kComponents, kModels, kLabels,
+-            kSource, kRegistrySource, kDoNotUpgrade, kLocalImport
++            kSource, kRegistrySource, kDoNotUpgrade, kLocalImport, kRevision
+         };
+ 
+         RouteResponse job;
+@@ -204,7 +259,7 @@ public:
+         s.examples = {job_example, success_example, events_example, register_example,
+                       collection_example};
+         s.errors = {kBodyNotJson, kArgMissing, kArgInvalid, kInvalidSource, kInvalidModelDefinition,
+-                    kLemondOffline, kUnknownModel, kIllegalLabels, kRegistryUnavailable, kPullFailed};
++                    kInvalidRevision, kRevisionOffline, kLemondOffline, kUnknownModel, kIllegalLabels, kRegistryUnavailable, kPullFailed};
+         s.request_format = RequestFormat::Json;
+         return s;
+     }
+@@ -220,6 +275,28 @@ public:
+             bool subscribe = req.value(downloads::kSubscribe, true);
+             bool local_import = req.value(kLocalImport, false);
+ 
++            const std::string revision = req.value(kRevision, "");
++            if (req.has(kRevision)) {
++                const std::string revision_error = lemon::registry_revision_error(revision);
++                if (!revision_error.empty()) {
++                    write_plain_error(res, kInvalidRevision, revision_error);
++                    return;
++                }
++                req.body.erase(kRevision.name);
++                if (!revision.empty() && local_import) {
++                    write_plain_error(res, kInvalidRevision,
++                        "`revision` applies only to registry downloads, not local imports");
++                    return;
++                }
++                if (!revision.empty() && ctx_.config->offline()) {
++                    res.status = kRevisionOffline.status;
++                    res.set_content(json{
++                        {"error", "revision pinning needs network access; offline mode is on"},
++                        {"code", kRevisionOffline.code}}.dump(), "application/json");
++                    return;
++                }
++            }
++
+             // The registry is resolved once, up front, so download, cache layout and
+             // later refresh agree on it.
+             try {
+@@ -238,6 +315,9 @@ public:
+             if (!recipe.empty()) {
+                 LOG(INFO, "Server") << "   recipe: " << recipe << std::endl;
+             }
++            if (!revision.empty() && !check_pinnable(req, model_name, recipe, revision, res)) {
++                return;
++            }
+ 
+             const bool collection_file_import = req.arg(kModels).is_array();
+ 
+@@ -272,6 +352,9 @@ public:
+                     download_request[field->name] = req.arg(*field);
+                 }
+             }
++            // Present even when empty: an explicit /pull without a revision is the one
++            // request that releases a pin; every other download keeps it.
++            download_request[kRevision.name] = revision;
+ 
+             if (stream) {
+                 ModelManager* model_manager = ctx_.model_manager;
+@@ -295,6 +378,13 @@ public:
+                 ctx_.model_manager->download_model(model_name, download_request, do_not_upgrade);
+ 
+                 json response = {{"status", "success"}, {"model_name", model_name}};
++                if (!revision.empty()) {
++                    const std::string pinned =
++                        ctx_.model_manager->get_model_info(model_name).pinned_revision;
++                    if (!pinned.empty()) {
++                        response["revision"] = pinned;
++                    }
++                }
+                 res.set_content(response.dump(), "application/json");
+             }
+ 
+@@ -319,6 +409,81 @@ public:
+             write_plain_error(res, kPullFailed, e.what());
+         }
+     }
++
++private:
++    // A pin is checked against the registration the download will use: the existing one
++    // when the model is registered, so a request that also changes it is refused.
++    bool check_pinnable(RouteRequest& req, const std::string& model_name,
++                        const std::string& recipe, const std::string& revision,
++                        httplib::Response& res) {
++        LOG(INFO, "Server") << "   revision: " << revision << std::endl;
++        std::string pinned_recipe = recipe;
++        const std::string requested_source = req.value(kSource, "");
++        std::string pinned_source =
++            requested_source.empty() || lemon::is_remote_registry_source(requested_source)
++                ? std::string()
++                : requested_source;
++        std::string pinned_registry = req.value(kRegistrySource, "");
++        if (pinned_registry.empty() && lemon::is_remote_registry_source(requested_source)) {
++            pinned_registry = requested_source;
++        }
++        const auto registry_name = [](const std::string& name) {
++            try {
++                return remote_registry_source_name(parse_remote_registry_source(name));
++            } catch (const std::exception&) {
++                return name;
++            }
++        };
++        std::optional<ModelInfo> existing_info;
++        try {
++            if (ctx_.model_manager->model_exists(model_name)) {
++                existing_info = ctx_.model_manager->get_model_info(model_name);
++            }
++        } catch (const std::exception&) {
++            // Deleted between the two calls: check it as a new registration.
++        }
++        if (existing_info) {
++            const ModelInfo& existing = *existing_info;
++            const std::string existing_registry = existing.registry_source.empty()
++                ? ctx_.config->default_model_source()
++                : existing.registry_source;
++            if ((!pinned_recipe.empty() && pinned_recipe != existing.recipe) ||
++                (!pinned_source.empty() && pinned_source != existing.source) ||
++                (!pinned_registry.empty() &&
++                 registry_name(pinned_registry) != registry_name(existing_registry))) {
++                write_plain_error(res, kInvalidRevision,
++                    "`revision` cannot be combined with a change to the recipe or source of the "
++                    "existing model '" + model_name + "'");
++                return false;
++            }
++            pinned_recipe = existing.recipe;
++            pinned_source = existing.source;
++            pinned_registry = existing_registry;
++        }
++        if (pinned_registry.empty()) pinned_registry = ctx_.config->default_model_source();
++        const auto* descriptor = backends::descriptor_for(pinned_recipe);
++        if (is_model_collection_recipe(pinned_recipe) || !pinned_source.empty() ||
++            (descriptor && descriptor->self_manages_downloads)) {
++            write_plain_error(res, kInvalidRevision,
++                "`revision` applies only to registry downloads; '" + model_name + "' (recipe " +
++                pinned_recipe + ") cannot be pinned");
++            return false;
++        }
++        bool hugging_face = false;
++        try {
++            hugging_face = parse_remote_registry_source(pinned_registry) ==
++                           models::huggingface_descriptor().id;
++        } catch (const std::exception&) {
++            // An unrecognized registry name cannot be pinned either.
++        }
++        if (!hugging_face) {
++            write_plain_error(res, kInvalidRevision,
++                "`revision` pinning is supported for Hugging Face only; '" + model_name +
++                "' downloads from " + pinned_registry);
++            return false;
++        }
++        return true;
++    }
+ };
+ 
+ } // namespace
+diff --git a/src/cpp/server/routes/lemonade/models/register.cpp b/src/cpp/server/routes/lemonade/models/register.cpp
+index 42d775baa..e991f7367 100644
+--- a/src/cpp/server/routes/lemonade/models/register.cpp
++++ b/src/cpp/server/routes/lemonade/models/register.cpp
+@@ -11,6 +11,8 @@ namespace {
+ using json = nlohmann::json;
+ using ordered_json = nlohmann::ordered_json;
+ 
++const RouteError kRevisionRefused{
++    400, "", "`revision` is sent; it applies to `/pull` only, since registering downloads nothing"};
+ const RouteError kRegisterFailed{
+     500, "",
+     "The definition is invalid in another way and nothing is registered, for example a GGUF "
+@@ -80,7 +82,7 @@ public:
+         })");
+         s.examples = {example};
+         s.errors = {kBodyNotJson, kArgMissing, kArgInvalid, kInvalidModelDefinition, kUnlistedFieldInvalid,
+-                    kRegisterFailed};
++                    kRevisionRefused, kRegisterFailed};
+         s.request_format = RequestFormat::Json;
+         return s;
+     }
+@@ -88,6 +90,11 @@ public:
+     void handle(RouteRequest& req, httplib::Response& res) override {
+         try {
+             const std::string model_name = req.arg(kModelName).get<std::string>();
++            if (req.body.contains("revision")) {
++                write_plain_error(res, kRevisionRefused,
++                    "`revision` applies to /pull only; /models/register does not download");
++                return;
++            }
+             const auto registered = try_register_model_definition(
+                 ctx_,
+                 model_name,
+diff --git a/src/cpp/server/services/model_json.cpp b/src/cpp/server/services/model_json.cpp
+index 2b528cbe8..3ea9f8ede 100644
+--- a/src/cpp/server/services/model_json.cpp
++++ b/src/cpp/server/services/model_json.cpp
+@@ -96,6 +96,9 @@ json ModelJson::to_json(const std::string& model_id, const ModelInfo& info, int
+         checkpoint_status.push_back(std::move(entry));
+     }
+     model_json["checkpoint_status"] = std::move(checkpoint_status);
++    if (!info.pinned_revision.empty()) {
++        model_json["pinned_revision"] = info.pinned_revision;
++    }
+ 
+     // The Model Manager buckets cloud models by provider. Local models omit the
+     // field rather than carry an empty one.
+@@ -230,6 +233,7 @@ nlohmann::ordered_json ModelJson::schema() {
+             "max_completion_tokens": {"type": "integer", "description": "Cloud models only: `max_output_tokens` under its OpenAI name."},
+             "downloaded": {"type": "boolean", "description": "Whether the model is downloaded."},
+             "update_available": {"type": "boolean", "description": "Whether the model's registry has a newer commit; `false` except for downloaded registry models."},
++            "pinned_revision": {"type": "string", "description": "The commit a `/v1/pull` with `revision` pinned the model to; absent when the model follows its default branch."},
+             "suggested": {"type": "boolean", "description": "Whether the model is recommended for general use."},
+             "labels": {"type": "array", "items": {"type": "string"}, "description": "The model's capabilities and characteristics; see [Model Labels](./openai.md#model-labels)."},
+             "image_defaults": {
+diff --git a/test/cpp/test_pull_revision.cpp b/test/cpp/test_pull_revision.cpp
+new file mode 100644
+index 000000000..3cac80630
+--- /dev/null
++++ b/test/cpp/test_pull_revision.cpp
+@@ -0,0 +1,255 @@
++#include "support/server_wired_manager.h"
++
++#include "lemon/config_file.h"
++#include "lemon/model_manager.h"
++#include "lemon/models/registry_types.h"
++#include "lemon/registry_files.h"
++#include "lemon/runtime_config.h"
++#include "lemon/utils/path_utils.h"
++
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <string>
++
++namespace fs = std::filesystem;
++using lemon::ModelInfo;
++using lemon::ModelManager;
++using lemon::json;
++using lemon::utils::path_from_utf8;
++using lemon::utils::path_to_utf8;
++
++static int g_failures = 0;
++
++static void check(const std::string& name, bool ok) {
++    std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", name.c_str());
++    if (!ok) ++g_failures;
++}
++
++static fs::path make_temp_dir() {
++    fs::path dir = fs::temp_directory_path();
++    dir /= "pull_revision_" +
++           std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
++    fs::create_directories(dir);
++    return dir;
++}
++
++static void write_file(const fs::path& path, const std::string& contents) {
++    fs::create_directories(path.parent_path());
++    std::ofstream out(path, std::ios::binary | std::ios::trunc);
++    out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
++}
++
++static void test_revision_validation() {
++    const std::string sha = "6e091d820cbe8f22eeb604d136403eca290b8c1e";
++    for (const std::string& valid :
++         {std::string(), std::string("main"), sha, std::string("v1.0"),
++          std::string("refs/pr/1"), std::string("release_2024-01"),
++          std::string(128, 'a')}) {
++        check("revision accepted: '" + valid.substr(0, 40) + "'",
++              lemon::registry_revision_error(valid).empty());
++    }
++    for (const std::string& invalid :
++         {std::string(129, 'a'), std::string("../main"), std::string("a..b"),
++          std::string("/main"), std::string("-main"), std::string("bad revision"),
++          std::string("rev~1"), std::string("re?v"), std::string("main@{1}"),
++          std::string("a\\b"), std::string("tag:v1")}) {
++        check("revision rejected: '" + invalid.substr(0, 40) + "'",
++              !lemon::registry_revision_error(invalid).empty());
++    }
++}
++
++static void test_revision_api_url() {
++    check("a commit sha is used verbatim in the revision API URL",
++          lemon::huggingface_repository_api_url(
++              "https://huggingface.co", "org/model", "abc123") ==
++              "https://huggingface.co/api/models/org/model/revision/abc123");
++    check("a slash in a branch name is encoded so the Hub resolves the ref",
++          lemon::huggingface_repository_api_url(
++              "https://huggingface.co", "org/model", "refs/pr/1") ==
++              "https://huggingface.co/api/models/org/model/revision/refs%2Fpr%2F1");
++}
++
++static void test_pinned_snapshot_id(const fs::path& root) {
++    const fs::path cache = root / "provenance" / "models--org--repo";
++    namespace rf = lemon::registry_files;
++
++    check("no provenance file means no pin", rf::pinned_snapshot_id(cache, "m").empty());
++
++    write_file(cache / ".lemonade_registry.json",
++               R"({"processed_models":{
++                   "pinned":{"selection":"s","snapshot_id":"bbbb","pinned_revision":"bbbb"},
++                   "follow":{"selection":"s","snapshot_id":"aaaa"},
++                   "escape":{"selection":"s","snapshot_id":"x","pinned_revision":"../aaaa"},
++                   "dot":{"selection":"s","snapshot_id":"x","pinned_revision":"."}}})");
++    check("a pinned entry yields its snapshot", rf::pinned_snapshot_id(cache, "pinned") == "bbbb");
++    check("an unpinned entry yields no pin", rf::pinned_snapshot_id(cache, "follow").empty());
++    check("an unknown model yields no pin", rf::pinned_snapshot_id(cache, "other").empty());
++    check("a pin that is not a single path component is ignored",
++          rf::pinned_snapshot_id(cache, "escape").empty());
++    check("a pin of '.' is ignored", rf::pinned_snapshot_id(cache, "dot").empty());
++
++    write_file(cache / ".lemonade_registry.json", "{not json");
++    check("malformed provenance yields no pin", rf::pinned_snapshot_id(cache, "pinned").empty());
++}
++
++static void test_pinned_model_resolution(const fs::path& root, const fs::path& hf_root) {
++    const fs::path repo = hf_root / "models--org--pin";
++    const fs::path main_snapshot = repo / "snapshots" / "aaaa";
++    const fs::path pinned_snapshot = repo / "snapshots" / "bbbb";
++    write_file(main_snapshot / "model.gguf", "GGUF-main");
++    write_file(pinned_snapshot / "model.gguf", "GGUF-pinned");
++    write_file(repo / "refs" / "main", "aaaa");
++    write_file(repo / ".lemonade_registry.json",
++               R"({"processed_models":{
++                   "user.pinned":{"selection":"s","snapshot_id":"bbbb","pinned_revision":"bbbb"},
++                   "user.follow":{"selection":"s","snapshot_id":"aaaa"}}})");
++
++    // A repository whose first pull was pinned: no refs/main yet.
++    const fs::path first = hf_root / "models--org--firstpin";
++    write_file(first / "snapshots" / "cccc" / "model.gguf", "GGUF-pinned");
++    write_file(first / "snapshots" / "cccc" / "mmproj.gguf", "GGUF-mmproj");
++    write_file(first / "snapshots" / "cccc" / "other.gguf", "GGUF-other");
++    write_file(first / ".lemonade_registry.json",
++               R"({"processed_models":{
++                   "user.firstpinned":{"selection":"s","snapshot_id":"cccc","pinned_revision":"cccc"}}})");
++
++    const json first_checkpoints = {{"main", "org/firstpin:model.gguf"},
++                                    {"mmproj", "org/firstpin:mmproj.gguf"}};
++    const json user_models = {
++        {"pinned", json{{"checkpoint", "org/pin:model.gguf"}, {"recipe", "llamacpp"}}},
++        {"follow", json{{"checkpoint", "org/pin:model.gguf"}, {"recipe", "llamacpp"}}},
++        {"firstpinned", json{{"checkpoints", first_checkpoints}, {"recipe", "llamacpp"}}},
++        {"firstfollow", json{{"checkpoints", first_checkpoints}, {"recipe", "llamacpp"}}},
++        {"firstother", json{{"checkpoint", "org/firstpin:other.gguf"}, {"recipe", "llamacpp"}}},
++    };
++    write_file(root / "user_models.json", user_models.dump(2));
++
++    ModelManager manager(lemon::test::server_wired_config());
++
++    const ModelInfo pinned = manager.get_model_info("user.pinned");
++    check("pinned model reports its pinned revision", pinned.pinned_revision == "bbbb");
++    check("pinned model resolves inside the pinned snapshot",
++          pinned.downloaded &&
++              path_from_utf8(pinned.resolved_path()) == pinned_snapshot / "model.gguf");
++
++    const ModelInfo follow = manager.get_model_info("user.follow");
++    check("unpinned model sharing the repo has no pin", follow.pinned_revision.empty());
++    check("unpinned model sharing the repo follows refs/main",
++          follow.downloaded &&
++              path_from_utf8(follow.resolved_path()) == main_snapshot / "model.gguf");
++
++    const ModelInfo first_pinned = manager.get_model_info("user.firstpinned");
++    check("a first pinned pull resolves main and mmproj in its snapshot",
++          first_pinned.downloaded &&
++              path_from_utf8(first_pinned.resolved_path("mmproj")) ==
++                  first / "snapshots" / "cccc" / "mmproj.gguf");
++    const ModelInfo first_follow = manager.get_model_info("user.firstfollow");
++    check("an unpinned model never resolves into another model's pinned snapshot",
++          !first_follow.downloaded && first_follow.resolved_path("main").empty() &&
++              first_follow.resolved_path("mmproj").empty());
++
++    write_file(first / "snapshots" / "dddd" / "model.gguf", "GGUF-main");
++    write_file(first / "refs" / "main", "dddd");
++    manager.invalidate_models_cache();
++    check("once refs/main exists the unpinned model follows it",
++          path_from_utf8(manager.get_model_info("user.firstfollow").resolved_path()) ==
++              first / "snapshots" / "dddd" / "model.gguf");
++    check("a variant found only in another model's pinned snapshot is not used",
++          !manager.get_model_info("user.firstother").downloaded &&
++              manager.get_model_info("user.firstother").resolved_path().empty());
++
++    manager.delete_model("user.firstpinned");
++    manager.invalidate_models_cache();
++    check("deleting a pinned model drops its pin from the repository",
++          lemon::registry_files::pinned_snapshot_id(first, "user.firstpinned").empty());
++    check("a sibling then resolves as if the pin never existed",
++          path_from_utf8(manager.get_model_info("user.firstother").resolved_path()) ==
++              first / "snapshots" / "cccc" / "other.gguf");
++
++    write_file(first / ".lemonade_registry.json", "{not json");
++    manager.invalidate_models_cache();
++    check("unreadable pin state keeps models out of non-refs/main snapshots",
++          !manager.get_model_info("user.firstother").downloaded);
++    check("unreadable pin state still allows the refs/main snapshot",
++          path_from_utf8(manager.get_model_info("user.firstfollow").resolved_path()) ==
++              first / "snapshots" / "dddd" / "model.gguf");
++
++    fs::remove(pinned_snapshot / "model.gguf");
++    manager.invalidate_models_cache();
++    const ModelInfo missing = manager.get_model_info("user.pinned");
++    check("a pinned model whose snapshot lacks the file is not downloaded",
++          !missing.downloaded);
++    check("a pinned model never falls back to another snapshot",
++          path_from_utf8(missing.resolved_path()).string().find(
++              path_to_utf8(main_snapshot)) == std::string::npos);
++
++    fs::remove_all(pinned_snapshot);
++    manager.invalidate_models_cache();
++    const ModelInfo gone = manager.get_model_info("user.pinned");
++    check("a pinned model whose snapshot is gone is not downloaded",
++          !gone.downloaded && gone.resolved_path().empty());
++}
++
++static void test_download_revision() {
++    namespace rf = lemon::registry_files;
++    check("an explicit revision wins over the recorded pin",
++          rf::download_revision("main", false, "bbbb") == "main");
++    check("a stale request restores the pin recorded on disk",
++          rf::download_revision("", false, "bbbb") == "bbbb");
++    check("an explicit unpinned pull releases the pin",
++          rf::download_revision("", true, "bbbb").empty());
++    check("no pin and no request follows the default branch",
++          rf::download_revision("", false, "").empty());
++}
++
++static void test_pinnable_snapshot_id() {
++    namespace rf = lemon::registry_files;
++    const std::string sha = "6e091d820cbe8f22eeb604d136403eca290b8c1e";
++    check("a branch resolved to a commit can be pinned", rf::is_pinnable_snapshot_id("main", sha));
++    check("a commit sha echoed back can be pinned", rf::is_pinnable_snapshot_id(sha, sha));
++    check("a slashed ref echoed back for lack of a commit is refused",
++          !rf::is_pinnable_snapshot_id("refs/pr/1", "refs/pr/1"));
++    check("a tag echoed back for lack of a commit is refused",
++          !rf::is_pinnable_snapshot_id("v1.0", "v1.0"));
++    check("an empty snapshot id is refused", !rf::is_pinnable_snapshot_id("main", ""));
++    check("a snapshot id that escapes snapshots/ is refused",
++          !rf::is_pinnable_snapshot_id("main", "../x"));
++    for (const std::string dotted : {".", "..", ".hidden"}) {
++        check("a dot-led snapshot id '" + dotted + "' is refused",
++              !rf::is_pinnable_snapshot_id("main", dotted));
++    }
++}
++
++int main() {
++    fs::path temp = make_temp_dir();
++    fs::path hf_root = temp / "hf";
++    fs::create_directories(hf_root);
++
++    lemon::utils::set_cache_dir(path_to_utf8(temp));
++    lemon::utils::set_config_dir(path_to_utf8(temp));
++    lemon::utils::set_models_dir(path_to_utf8(hf_root));
++
++    json config_json = lemon::ConfigFile::base_defaults();
++    config_json["disable_model_filtering"] = true;
++    lemon::RuntimeConfig config(config_json);
++    lemon::RuntimeConfig::set_global(&config);
++
++    test_revision_validation();
++    test_revision_api_url();
++    test_pinned_snapshot_id(temp);
++    test_pinned_model_resolution(temp, hf_root);
++    test_pinnable_snapshot_id();
++    test_download_revision();
++
++    std::error_code ec;
++    fs::remove_all(temp, ec);
++
++    if (g_failures == 0) {
++        std::printf("All pull revision tests passed.\n");
++    } else {
++        std::printf("%d pull revision test(s) failed.\n", g_failures);
++    }
++    return g_failures == 0 ? 0 : 1;
++}
+diff --git a/test/server_endpoints.py b/test/server_endpoints.py
+index ca51cc3bf..397cb8e94 100644
+--- a/test/server_endpoints.py
++++ b/test/server_endpoints.py
+@@ -1394,6 +1394,270 @@ class EndpointTests(ServerTestBase):
+ 
+         print(f"[OK] Inference pulled missing model: {ENDPOINT_TEST_MODEL}")
+ 
++    PINNED_PULL_REPO = "ggml-org/tiny-llamas"
++    PINNED_PULL_FILE = "stories260K.gguf"
++
++    def test_008a_pull_rejects_invalid_revision(self):
++        """An invalid revision is a 400 before registration or any download."""
++        model_name = "user.RevisionReject-" + uuid.uuid4().hex[:8]
++        for revision in [
++            "-main",
++            "/main",
++            "../main",
++            "a..b",
++            "bad revision",
++            "main@{1}",
++            "a" * 129,
++            7,
++        ]:
++            with self.subTest(revision=revision):
++                response = requests.post(
++                    f"{self.base_url}/pull",
++                    json={
++                        "model_name": model_name,
++                        "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
++                        "recipe": "llamacpp",
++                        "revision": revision,
++                        "stream": False,
++                    },
++                    timeout=TIMEOUT_DEFAULT,
++                )
++                self.assertEqual(response.status_code, 400, response.text)
++                self.assertIn("revision", response.json().get("error", ""))
++
++        local_name = "user.RevisionLocal-" + uuid.uuid4().hex[:8]
++        local_response = requests.post(
++            f"{self.base_url}/pull",
++            json={
++                "model_name": local_name,
++                "checkpoint": "/models/local.gguf",
++                "recipe": "llamacpp",
++                "source": "local_path",
++                "revision": "main",
++                "stream": False,
++            },
++            timeout=TIMEOUT_DEFAULT,
++        )
++        self.assertEqual(local_response.status_code, 400, local_response.text)
++        self.assertIn("revision", local_response.json().get("error", ""))
++
++        modelscope_name = "user.RevisionModelScope-" + uuid.uuid4().hex[:8]
++        modelscope_response = requests.post(
++            f"{self.base_url}/pull",
++            json={
++                "model_name": modelscope_name,
++                "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
++                "recipe": "llamacpp",
++                "source": "modelscope",
++                "revision": "master",
++                "stream": False,
++            },
++            timeout=TIMEOUT_DEFAULT,
++        )
++        self.assertEqual(modelscope_response.status_code, 400, modelscope_response.text)
++        self.assertIn("Hugging Face", modelscope_response.json().get("error", ""))
++
++        for name in (model_name, local_name, modelscope_name):
++            model_response = requests.get(
++                f"{self.base_url}/models/{name}", timeout=TIMEOUT_DEFAULT
++            )
++            self.assertEqual(
++                model_response.status_code,
++                404,
++                "A rejected revision must not register the model",
++            )
++        print("[OK] /pull rejects invalid revisions with 400")
++
++    def test_008c_pull_revision_checks_existing_registration(self):
++        """A revision is checked against the existing registration it downloads."""
++        suffix = uuid.uuid4().hex[:8]
++        modelscope_name = f"user.RevisionExistingMS-{suffix}"
++        collection_name = f"user.RevisionExistingKit-{suffix}"
++        registrations = [
++            {
++                "model_name": modelscope_name,
++                "recipe": "llamacpp",
++                "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
++                "source": "modelscope",
++            },
++            {
++                "model_name": collection_name,
++                "recipe": "collection.omni",
++                "components": [ENDPOINT_TEST_MODEL],
++            },
++        ]
++        attempts = [
++            {"model_name": modelscope_name, "source": "huggingface"},
++            {"model_name": collection_name, "recipe": "llamacpp"},
++        ]
++        try:
++            for body in registrations:
++                response = requests.post(
++                    f"{self.base_url}/models/register",
++                    json=body,
++                    timeout=TIMEOUT_DEFAULT,
++                )
++                self.assertEqual(response.status_code, 200, response.text)
++            for body in attempts:
++                with self.subTest(model=body["model_name"]):
++                    response = requests.post(
++                        f"{self.base_url}/pull",
++                        json={**body, "revision": "main", "stream": False},
++                        timeout=TIMEOUT_DEFAULT,
++                    )
++                    self.assertEqual(response.status_code, 400, response.text)
++                    self.assertIn("revision", response.json().get("error", ""))
++        finally:
++            for name in (modelscope_name, collection_name):
++                requests.post(
++                    f"{self.base_url}/delete",
++                    json={"model_name": name},
++                    timeout=TIMEOUT_DEFAULT,
++                )
++        print("[OK] /pull checks a revision against the existing registration")
++
++    def test_008d_pull_revision_refused_offline(self):
++        """Offline, a pinned /pull is a clear 400 before registration."""
++        model_name = "user.RevisionOffline-" + uuid.uuid4().hex[:8]
++        set_server_config({"offline": True})
++        try:
++            response = requests.post(
++                f"{self.base_url}/pull",
++                json={
++                    "model_name": model_name,
++                    "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
++                    "recipe": "llamacpp",
++                    "revision": "main",
++                    "stream": False,
++                },
++                timeout=TIMEOUT_DEFAULT,
++            )
++        finally:
++            set_server_config({"offline": False})
++        self.assertEqual(response.status_code, 400, response.text)
++        self.assertIn("offline", response.json().get("error", ""))
++        self.assertEqual(response.json().get("code"), "lemond_offline")
++        model_response = requests.get(
++            f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
++        )
++        self.assertEqual(model_response.status_code, 404)
++        print("[OK] /pull refuses a revision in offline mode")
++
++    def test_008e_register_rejects_revision(self):
++        """/models/register never downloads, so it refuses a revision."""
++        model_name = "user.RevisionRegister-" + uuid.uuid4().hex[:8]
++        response = requests.post(
++            f"{self.base_url}/models/register",
++            json={
++                "model_name": model_name,
++                "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
++                "recipe": "llamacpp",
++                "revision": "main",
++            },
++            timeout=TIMEOUT_DEFAULT,
++        )
++        self.assertEqual(response.status_code, 400, response.text)
++        self.assertIn("/pull only", response.json().get("error", ""))
++        model_response = requests.get(
++            f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
++        )
++        self.assertEqual(model_response.status_code, 404)
++        print("[OK] /models/register refuses a revision")
++
++    def _hub_commits(self, repo_id):
++        try:
++            response = requests.get(
++                f"https://huggingface.co/api/models/{repo_id}/commits/main",
++                timeout=TIMEOUT_DEFAULT,
++            )
++            response.raise_for_status()
++            return [c["id"] for c in response.json() if c.get("id")]
++        except Exception as exc:
++            self.skipTest(f"Hugging Face commit API unavailable: {exc}")
++
++    def test_008b_pull_pins_revision(self):
++        """A pinned pull loads its commit's snapshot until an unpinned pull."""
++        commits = self._hub_commits(self.PINNED_PULL_REPO)
++        if len(commits) < 2:
++            self.skipTest("Fixture repository no longer has two commits")
++        main_sha = commits[0]
++
++        pinned_sha = None
++        for sha in commits[1:]:
++            tree = requests.get(
++                f"https://huggingface.co/api/models/{self.PINNED_PULL_REPO}/tree/{sha}",
++                timeout=TIMEOUT_DEFAULT,
++            )
++            if tree.ok and any(
++                entry.get("path") == self.PINNED_PULL_FILE for entry in tree.json()
++            ):
++                pinned_sha = sha
++                break
++        if pinned_sha is None:
++            self.skipTest("No older commit of the fixture contains the test file")
++
++        model_name = "user.RevisionPin-" + uuid.uuid4().hex[:8]
++        pull_body = {
++            "model_name": model_name,
++            "checkpoint": f"{self.PINNED_PULL_REPO}:{self.PINNED_PULL_FILE}",
++            "recipe": "llamacpp",
++            "stream": False,
++        }
++        try:
++            response = requests.post(
++                f"{self.base_url}/pull",
++                json={**pull_body, "revision": pinned_sha},
++                timeout=TIMEOUT_MODEL_OPERATION,
++            )
++            self.assertEqual(response.status_code, 200, response.text)
++            self.assertEqual(response.json().get("revision"), pinned_sha)
++
++            info = requests.get(
++                f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
++            ).json()
++            self.assertEqual(info.get("pinned_revision"), pinned_sha)
++            self.assertTrue(info.get("downloaded"), info)
++
++            repo_cache_dir = "models--" + self.PINNED_PULL_REPO.replace("/", "--")
++            cache_root = self._server_hf_cache_root(repo_cache_dir)
++            if cache_root is not None:
++                repo_cache = os.path.join(cache_root, repo_cache_dir)
++                self.assertTrue(
++                    os.path.isfile(
++                        os.path.join(
++                            repo_cache, "snapshots", pinned_sha, self.PINNED_PULL_FILE
++                        )
++                    )
++                )
++                refs_main = os.path.join(repo_cache, "refs", "main")
++                if os.path.isfile(refs_main):
++                    with open(refs_main, "r", encoding="utf-8") as ref_file:
++                        self.assertNotEqual(ref_file.read().strip(), pinned_sha)
++
++            response = requests.post(
++                f"{self.base_url}/pull",
++                json=pull_body,
++                timeout=TIMEOUT_MODEL_OPERATION,
++            )
++            self.assertEqual(response.status_code, 200, response.text)
++            self.assertNotIn("revision", response.json())
++
++            info = requests.get(
++                f"{self.base_url}/models/{model_name}", timeout=TIMEOUT_DEFAULT
++            ).json()
++            self.assertNotIn("pinned_revision", info)
++            self.assertTrue(info.get("downloaded"), info)
++            if cache_root is not None:
++                with open(refs_main, "r", encoding="utf-8") as ref_file:
++                    self.assertEqual(ref_file.read().strip(), main_sha)
++        finally:
++            requests.post(
++                f"{self.base_url}/delete",
++                json={"model_name": model_name},
++                timeout=TIMEOUT_DEFAULT,
++            )
++        print(f"[OK] /pull pins {self.PINNED_PULL_REPO} to {pinned_sha[:12]}")
++
+     def test_009_load_model_basic(self):
+         """Test loading a model into memory."""
+         # Model is already pulled (setUpClass or previous pull tests)
+-- 
+2.53.0
+

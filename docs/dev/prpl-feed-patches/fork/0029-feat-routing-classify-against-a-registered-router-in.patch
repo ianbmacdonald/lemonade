@@ -1,0 +1,381 @@
+From 248abc467a1cd6b5a59c813f0fa6bd9fb645dd6b Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 17:52:56 -0400
+Subject: [PATCH 29/58] feat(routing): classify against a registered router in
+ /routing/validate
+
+POST /routing/validate now also accepts {"model": <collection.router>, ...}
+and returns the decision that router's registered policy makes for the
+request body, without dispatching or loading any candidate. The decision
+comes from the same evaluation path dispatch uses (split out of
+route_collection_request minus its routing-metrics side effect), so validate
+and dispatch cannot disagree.
+
+The ad-hoc policy mode is unchanged. Sending both 'policy' and 'model' is
+rejected with 400; an unknown model is 404 and a non-router model is 400.
+
+Assisted-by: claude:opus-5.5
+---
+ docs/dev/router-policy.md                     |  11 ++
+ .../include/lemon/server/router_dispatch.h    |   8 +
+ .../server/routes/router/router_dispatch.cpp  |  52 +++---
+ .../server/routes/router/routing_validate.cpp | 153 ++++++++++++++++--
+ 4 files changed, 192 insertions(+), 32 deletions(-)
+
+diff --git a/docs/dev/router-policy.md b/docs/dev/router-policy.md
+index 047c5c81f..c79626979 100644
+--- a/docs/dev/router-policy.md
++++ b/docs/dev/router-policy.md
+@@ -302,6 +302,17 @@ curl -X POST http://localhost:13305/api/v1/routing/validate \
+      -d '{"policy": {...}, "prompt": "please write a def to reverse a list"}'
+ ```
+ 
++To ask where an already registered router would send a request, without
++dispatching it or loading any candidate, send `model` instead of `policy`. The
++body is read as the equivalent chat/completions request would be, and the
++registered policy is evaluated by the same path dispatch uses:
++
++```bash
++curl -X POST http://localhost:13305/api/v1/routing/validate \
++     -H "Content-Type: application/json" \
++     -d '{"model": "user.My-Router", "messages": [{"role": "user", "content": "..."}]}'
++```
++
+ ## The decision on the response
+ 
+ Every routed response carries the header **`x-lemonade-route`** — the matched rule
+diff --git a/src/cpp/include/lemon/server/router_dispatch.h b/src/cpp/include/lemon/server/router_dispatch.h
+index 220451140..ac59731f9 100644
+--- a/src/cpp/include/lemon/server/router_dispatch.h
++++ b/src/cpp/include/lemon/server/router_dispatch.h
+@@ -11,6 +11,7 @@
+ namespace lemon {
+ 
+ class ModelManager;
++struct ModelInfo;
+ struct ServerContext;
+ 
+ struct RouterDispatchResult {
+@@ -19,6 +20,13 @@ struct RouterDispatchResult {
+     Decision decision;
+ };
+ 
++// The decision the registered policy of collection.router `info` makes for body. Dispatch
++// and the classify-only /routing/validate share it so the two cannot disagree. It has no
++// dispatch side effects, though routing helper models may load. std::nullopt when the
++// collection has no parsed policy.
++std::optional<Decision> evaluate_router_policy(ServerContext& ctx, const ModelInfo& info,
++                                               const nlohmann::json& body, bool want_trace);
++
+ // Naming a collection.router model makes a completion request route itself: this
+ // runs the collection's policy on body, rewrites model and the body's model to the
+ // selected candidate, and returns the decision. Returns std::nullopt, leaving both
+diff --git a/src/cpp/server/routes/router/router_dispatch.cpp b/src/cpp/server/routes/router/router_dispatch.cpp
+index fc7946022..1c7efa11f 100644
+--- a/src/cpp/server/routes/router/router_dispatch.cpp
++++ b/src/cpp/server/routes/router/router_dispatch.cpp
+@@ -15,6 +15,32 @@ namespace lemon {
+ 
+ using json = nlohmann::json;
+ 
++std::optional<Decision> evaluate_router_policy(ServerContext& ctx, const ModelInfo& info,
++                                               const json& body, bool want_trace) {
++    // The policy is parsed once when the models cache is built. A missing one means
++    // the collection failed to parse.
++    if (!info.route_policy) {
++        LOG(WARNING, "Server") << "Router collection '" << info.model_name
++                               << "' has no parsed routing policy" << std::endl;
++        return std::nullopt;
++    }
++
++    // The engine owns its policy and is rebuilt per request, because its
++    // classifier services are bound to the live Router.
++    RoutePolicy policy = *info.route_policy;
++    ModelLoader* loader = ctx.model_loader;
++    ClassifierServices services = make_router_classifier_services(
++        *ctx.router, [loader](const std::string& m) {
++            loader->ensure_loaded(m, json::object(), LoadPurpose::RoutingDependency);
++        });
++    CostServices cost_services = make_router_cost_services(*ctx.router);
++    RoutingPolicyEngine engine(std::move(policy), std::move(services),
++                               std::move(cost_services));
++
++    RouteContext route_context = build_route_context(body, info.model_name);
++    return engine.route(route_context, want_trace);
++}
++
+ std::optional<RouterDispatchResult> router_dispatch(ServerContext& ctx, std::string& model,
+                                                     bool want_trace, json& body) {
+     if (model.empty()) {
+@@ -29,33 +55,15 @@ std::optional<RouterDispatchResult> router_dispatch(ServerContext& ctx, std::str
+         if (!is_router_collection_recipe(info.recipe)) {
+             return std::nullopt;
+         }
+-        // The policy is parsed once when the models cache is built. A missing one means
+-        // the collection failed to parse, so the request keeps its model (fail open).
+-        if (!info.route_policy) {
+-            LOG(WARNING, "Server") << "Router collection '" << info.model_name
+-                                   << "' has no parsed routing policy" << std::endl;
++        std::optional<Decision> decision = evaluate_router_policy(ctx, info, body, want_trace);
++        if (!decision) {
+             return std::nullopt;
+         }
+ 
+-        // The engine owns its policy and is rebuilt per request, because its
+-        // classifier services are bound to the live Router.
+-        RoutePolicy policy = *info.route_policy;
+-        ModelLoader* loader = ctx.model_loader;
+-        ClassifierServices services = make_router_classifier_services(
+-            *ctx.router, [loader](const std::string& m) {
+-                loader->ensure_loaded(m, json::object(), LoadPurpose::RoutingDependency);
+-            });
+-        CostServices cost_services = make_router_cost_services(*ctx.router);
+-        RoutingPolicyEngine engine(std::move(policy), std::move(services),
+-                                   std::move(cost_services));
+-
+-        RouteContext route_context = build_route_context(body, info.model_name);
+-        Decision decision = engine.route(route_context, want_trace);
+-
+         RouterDispatchResult result;
+         result.requested_model = requested_model;
+-        result.selected_model = decision.route_to;
+-        result.decision = std::move(decision);
++        result.selected_model = decision->route_to;
++        result.decision = std::move(*decision);
+         ctx.router->note_route_decision(utils::conversation_fingerprint(body),
+                                         result.selected_model);
+ 
+diff --git a/src/cpp/server/routes/router/routing_validate.cpp b/src/cpp/server/routes/router/routing_validate.cpp
+index b5d7e17e3..328691921 100644
+--- a/src/cpp/server/routes/router/routing_validate.cpp
++++ b/src/cpp/server/routes/router/routing_validate.cpp
+@@ -1,8 +1,10 @@
++#include <algorithm>
+ #include <map>
+ #include <optional>
+ #include <string>
+ 
+ #include "lemon/error_types.h"
++#include "lemon/model_manager.h"
+ #include "lemon/model_residency.h"
+ #include "lemon/route_decision_response.h"
+ #include "lemon/routing_classifier_services.h"
+@@ -10,6 +12,7 @@
+ #include "lemon/routing_policy_parser.h"
+ #include "lemon/server/api_route.h"
+ #include "lemon/server/model_loader.h"
++#include "lemon/server/router_dispatch.h"
+ 
+ namespace lemon {
+ namespace {
+@@ -18,12 +21,31 @@ using json = nlohmann::json;
+ using ordered_json = nlohmann::ordered_json;
+ 
+ const RouteError kInvalidPolicy{400, "", "`policy` is invalid or internally inconsistent"};
++const RouteError kPolicyOrModel{400, "", "Neither or both of `policy` and `model` are sent"};
++const RouteError kRegisteredInvalid{
++    400, "",
++    "With `model`: the model is not a `collection.router`, `has_images`/`has_tools` are sent, "
++    "`prompt` is not a string or an array of strings or token ids, `input` is not a string or "
++    "array, or `messages` is not an array"};
++const RouteError kRouterNotFound{404, "", "With `model`: no model by that name is registered"};
++const RouteError kRouterEvaluationFailed{
++    500, "",
++    "With `model`: the router's registered policy failed to parse, or a helper model failed in a "
++    "way its `on_error` policy does not absorb"};
+ 
+-const RouteArg kPolicy{"policy", ArgIn::JsonBody, {{"type", "object"}}, true, Support::Available,
++const RouteArg kPolicy{"policy", ArgIn::JsonBody, {{"type", "object"}}, false, Support::Available,
+                        "A `collection.router` policy document. `model_name` is accepted but is not required "
+-                       "for validation. See [Router Policies](../dev/router-policy.md)."};
+-const RouteArg kPrompt{"prompt", ArgIn::JsonBody, {{"type", "string"}}, false, Support::Available,
+-                       "The prompt text to route. Defaults to `\"\"`."};
++                       "for validation. See [Router Policies](../dev/router-policy.md). Required unless "
++                       "`model` is sent, and refused alongside it."};
++const RouteArg kModel{"model", ArgIn::JsonBody, {{"type", "string"}}, false, Support::Available,
++                      "A registered `collection.router` model, by public or `user.` name, to classify "
++                      "against instead of `policy`. The rest of the body is then read exactly as a chat, "
++                      "completions or responses request to that router would be: `messages`, `prompt`, "
++                      "`input`, `tools`, `metadata` and `max_tokens` build the routing context, and "
++                      "`has_images`/`has_tools` are refused, since they come from the body itself."};
++const RouteArg kPrompt{"prompt", ArgIn::JsonBody, {{"type", json::array({"string", "array"})}}, false, Support::Available,
++                       "The prompt text to route. Defaults to `\"\"`. With `model`, an array of strings or "
++                       "token ids is accepted too, as on completions."};
+ const RouteArg kHasImages{"has_images", ArgIn::JsonBody, {{"type", "boolean"}}, false, Support::Available,
+                           "Simulate a request carrying image input. Defaults to `false`."};
+ const RouteArg kHasTools{"has_tools", ArgIn::JsonBody, {{"type", "boolean"}}, false, Support::Available,
+@@ -41,14 +63,28 @@ public:
+         s.id = "router.routing_validate";
+         s.methods = {"POST"};
+         s.paths = {"routing/validate"};
+-        s.summary = "Test a routing policy against a prompt without registering it";
++        s.summary = "Test an ad-hoc or registered routing policy against a prompt without dispatching it";
+         s.experimental = true;
+         s.description =
+             "Returns the decision a routing policy makes for a prompt, without registering the "
+             "policy or sending the request to the chosen candidate. The Router Builder's **Test "
+             "Prompt** tab uses it to iterate on a policy before attaching it to a "
+-            "`collection.router` model.";
++            "`collection.router` model. Sent `model` instead of `policy`, it returns the decision a "
++            "registered router would make for the request body, without dispatching it.";
+         s.notes = {
++            "### Classify Against a Registered Router\n\n"
++            "Send `model` naming a registered `collection.router` model, instead of `policy`, to "
++            "ask where that router would send a request without dispatching it. The router's "
++            "registered policy is evaluated by the same code path dispatch uses, so the returned "
++            "`decision` is the one a real request with the same body would get, and it equals the "
++            "`x_lemonade_route` object a routed completion of that body returns with "
++            "`route_trace: true`. The trace is always included, and the response carries the "
++            "router's public name as `model` instead of `normalized_policy`.\n\n"
++            "No candidate is loaded and nothing is forwarded to a backend. Deterministic rules are "
++            "evaluated locally; model-backed conditions load and run their helper models as they "
++            "do on dispatch, which can evict other models to make room. Classify-only requests are "
++            "not counted in the routing metrics. Unlike dispatch, which falls back to the "
++            "collection itself when routing fails, a failure here is an error.",
+             "Validation is structural: every `candidates` entry, `default_model`, rule `route_to` "
+             "and classifier model must be listed in `components`. Component names are not looked "
+             "up in the model registry, so a policy can be tested before its candidates are "
+@@ -113,7 +149,7 @@ public:
+             "`routing.router` has no rules of its own, only the generated `__route_0`, "
+             "`__route_1`, etc.",
+         };
+-        s.args = {kPolicy, kPrompt, kHasImages, kHasTools, kMetadata};
++        s.args = {kPolicy, kModel, kPrompt, kHasImages, kHasTools, kMetadata};
+ 
+         const ordered_json decision = {
+             {"type", "object"},
+@@ -126,10 +162,11 @@ public:
+         response.format = ResponseFormat::Json;
+         response.schema = {
+             {"type", "object"},
+-            {"required", ordered_json::array({"decision", "normalized_policy"})},
++            {"required", ordered_json::array({"decision"})},
+             {"properties", {
+                 {"decision", decision},
+-                {"normalized_policy", {{"type", "object"}, {"description", "The policy as evaluated, with any `routing.router` shorthand expanded."}}},
++                {"normalized_policy", {{"type", "object"}, {"description", "The policy as evaluated, with any `routing.router` shorthand expanded. Present with `policy`."}}},
++                {"model", {{"type", "string"}, {"description", "The router's public name. Present with `model`."}}},
+             }},
+         };
+         s.responses = {response};
+@@ -156,13 +193,32 @@ public:
+             "prompt": "please write a def to reverse a list"
+         })");
+         s.examples = {example};
+-        s.errors = {kBodyNotJson, kArgMissing, kArgInvalid, kInvalidPolicy,
++        s.errors = {kBodyNotJson, kArgMissing, kArgInvalid, kInvalidPolicy, kPolicyOrModel,
++                    kRegisteredInvalid, kRouterNotFound, kRouterEvaluationFailed,
+                     ModelLoader::kRouterResidencyConflict};
+         s.request_format = RequestFormat::Json;
+         return s;
+     }
+ 
+     void handle(RouteRequest& req, httplib::Response& res) override {
++        if (req.has(kModel)) {
++            if (req.has(kPolicy)) {
++                write_plain_error(res, kPolicyOrModel,
++                    "'policy' and 'model' are mutually exclusive: send 'policy' to test an "
++                    "ad-hoc policy, or 'model' to classify against a registered router");
++                return;
++            }
++            handle_registered(req, res);
++            return;
++        }
++        if (!req.has(kPolicy)) {
++            write_plain_error(res, kPolicyOrModel, "'policy' must be a JSON object");
++            return;
++        }
++        if (req.has(kPrompt) && !req.arg(kPrompt).is_string()) {
++            write_plain_error(res, kArgInvalid, "'prompt' must be a string");
++            return;
++        }
+         const std::string prompt = req.value(kPrompt, std::string());
+         const bool has_images = req.value(kHasImages, false);
+         const bool has_tools = req.value(kHasTools, false);
+@@ -228,6 +284,83 @@ public:
+             write_plain_error(res, kInvalidPolicy, std::string("Invalid routing policy: ") + e.what());
+         }
+     }
++
++private:
++    void handle_registered(RouteRequest& req, httplib::Response& res) {
++        const json& body = req.body;
++        // These only simulate request features for an ad-hoc policy; here the context is
++        // derived from the body exactly as dispatch derives it, so an explicit flag would
++        // silently disagree with what dispatch would see.
++        for (const RouteArg* flag : {&kHasImages, &kHasTools}) {
++            if (req.has(*flag)) {
++                write_plain_error(res, kRegisteredInvalid,
++                    "'" + flag->name + "' is not accepted with 'model'; it is derived from the "
++                    "request's messages/tools as it is on dispatch");
++                return;
++            }
++        }
++        if (req.has(kPrompt)) {
++            const json& prompt = req.arg(kPrompt);
++            // Token ids and token-id arrays are valid completions prompts that dispatch
++            // routes as empty text, so only other element types are rejected.
++            const bool valid = prompt.is_string() ||
++                std::all_of(prompt.begin(), prompt.end(), [](const json& part) {
++                    return part.is_string() || part.is_number_integer() || part.is_array();
++                });
++            if (!valid) {
++                write_plain_error(res, kRegisteredInvalid,
++                                  "'prompt' must be a string or an array of strings or token ids");
++                return;
++            }
++        }
++        if (body.contains("input") && !body["input"].is_string() && !body["input"].is_array()) {
++            write_plain_error(res, kRegisteredInvalid, "'input' must be a string or an array");
++            return;
++        }
++        if (body.contains("messages") && !body["messages"].is_array()) {
++            write_plain_error(res, kRegisteredInvalid, "'messages' must be an array");
++            return;
++        }
++
++        try {
++            const std::string requested_model =
++                canonical_model_name(ctx_, req.arg(kModel).get<std::string>());
++            json request = body;
++            request[kModel.name] = requested_model;
++
++            if (!ctx_.model_manager->model_exists(requested_model)) {
++                write_plain_error(res, kRouterNotFound, "Model '" + requested_model + "' not found");
++                return;
++            }
++            ModelInfo info = ctx_.model_manager->get_model_info(requested_model);
++            if (!is_router_collection_recipe(info.recipe)) {
++                write_plain_error(res, kRegisteredInvalid,
++                    "Model '" + requested_model + "' is not a collection.router model "
++                    "(recipe '" + info.recipe + "')");
++                return;
++            }
++
++            std::optional<Decision> decision =
++                evaluate_router_policy(ctx_, info, request, /*want_trace=*/true);
++            if (!decision) {
++                write_plain_error(res, kRouterEvaluationFailed,
++                    "Router '" + requested_model + "' has no parsed routing policy");
++                return;
++            }
++
++            json response = {
++                {"model", ctx_.model_manager->get_public_model_name(info.model_name)},
++                {"decision", route_decision_to_json(*decision)},
++            };
++            res.set_content(response.dump(), "application/json");
++        } catch (const RouterResidencyConflictException& e) {
++            write_openai_error(res, ModelLoader::kRouterResidencyConflict, e.what(),
++                               ErrorType::ROUTER_RESIDENCY_CONFLICT);
++        } catch (const std::exception& e) {
++            write_plain_error(res, kRouterEvaluationFailed,
++                              std::string("Routing evaluation failed: ") + e.what());
++        }
++    }
+ };
+ 
+ } // namespace
+-- 
+2.53.0
+

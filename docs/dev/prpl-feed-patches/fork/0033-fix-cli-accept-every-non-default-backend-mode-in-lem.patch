@@ -1,0 +1,68 @@
+From 011fd9c836c363af053f4f9c7a74a1e37a206758 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 17:48:13 -0400
+Subject: [PATCH 33/58] fix(cli): accept every non-default backend mode in
+ lemonade pull --label
+
+flm serves transcription and openmoss serves audio-generation beside
+their default modes, but the pull allow-list rejected both labels, so a
+user.* model of either kind could not be registered from the CLI. The
+test now walks every backend descriptor's non-default modes instead of
+checking tflite alone.
+
+Assisted-by: claude:opus-5.5
+---
+ docs/guide/cli.md                         | 2 +-
+ docs/guide/configuration/custom-models.md | 2 +-
+ src/cpp/include/lemon_cli/pull_labels.h   | 2 ++
+ 3 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/docs/guide/cli.md b/docs/guide/cli.md
+index c9f93c65e..d8397f181 100644
+--- a/docs/guide/cli.md
++++ b/docs/guide/cli.md
+@@ -201,7 +201,7 @@ lemonade pull user.MyModel --checkpoint main org/model:Q4_0 --recipe llamacpp --
+ | `--alias ALIAS` | Add an alias for the model being registered or pulled. | No |
+ | `--checkpoint TYPE CHECKPOINT` | Manual registration: add a checkpoint entry. Repeat for multi-component models such as `main` + `mmproj` or `main` + `vae`. | No |
+ | `--recipe RECIPE` | Manual registration: recipe to associate with the new `user.*` model (`llamacpp`, `flm`, `ryzenai-llm`, `vllm`, `whispercpp`, `sd-cpp`, `kokoro`, `collection.omni`) | No |
+-| `--label LABEL` | Manual registration: add a label to the new model. Repeatable. Valid: `chat`, `coding`, `dflash`, `embeddings`, `hot`, `image-classification`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `vision` | No |
++| `--label LABEL` | Manual registration: add a label to the new model. Repeatable. Valid: `audio-generation`, `chat`, `coding`, `dflash`, `embeddings`, `hot`, `image-classification`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `transcription`, `vision` | No |
+ | `--components MODEL [MODEL ...]` | Omni-model registration: component names to bundle. Use with `--recipe collection.omni`. Components must already be registered (built-in or previously pulled `user.*`); any not-yet-downloaded components are pulled by the same call. | No |
+ 
+ ## Options for alias
+diff --git a/docs/guide/configuration/custom-models.md b/docs/guide/configuration/custom-models.md
+index d6faccc5b..279888f5b 100644
+--- a/docs/guide/configuration/custom-models.md
++++ b/docs/guide/configuration/custom-models.md
+@@ -100,7 +100,7 @@ Supported registration flags:
+ | `--source SOURCE` | Remote registry for every checkpoint in this model: <!-- BEGIN GENERATED: remote-registry-tokens -->`huggingface` or `modelscope`<!-- END GENERATED: remote-registry-tokens -->. When omitted, the server's configured `default_model_source` applies. |
+ | `--checkpoint TYPE CHECKPOINT` | Add a checkpoint entry. Repeat for multi-file models such as `main` + `mmproj` or `main` + `vae`. |
+ | `--recipe RECIPE` | Recipe to associate with the new `user.*` model. Common values: <!-- BEGIN GENERATED: recipe-values -->`llamacpp`, `llamacpp-hrx`, `whispercpp`, `moonshine`, `kokoro`, `sd-cpp`, `flm`, `ryzenai-llm`, `vllm`, `thenoise`, `ds4`, `thinksound`, `acestep`, `onnxruntime`, `trellis`, `openmoss`, `litert`, `tflite`, `executorch`, `collection.omni`<!-- END GENERATED: recipe-values -->. |
+-| `--label LABEL` | Add a label to the new model. Repeatable. Valid labels include `chat`, `coding`, `dflash`, `embeddings`, `hot`, `image-classification`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `vision`. When no [deployment label](../../api/openai.md#model-labels) is given, the recipe's default is added — `chat` for `llamacpp`, `flm`, `ryzenai-llm` and `vllm`; `transcription` for `whispercpp`; `image` for `sd-cpp`; `classification` for `tflite`, so a `tflite` image classifier needs `--label image-classification`; and so on. |
++| `--label LABEL` | Add a label to the new model. Repeatable. Valid labels include `audio-generation`, `chat`, `coding`, `dflash`, `embeddings`, `hot`, `image-classification`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `transcription`, `vision`. When no [deployment label](../../api/openai.md#model-labels) is given, the recipe's default is added — `chat` for `llamacpp`, `flm`, `ryzenai-llm` and `vllm`; `transcription` for `whispercpp`; `image` for `sd-cpp`; `classification` for `tflite`, so a `tflite` image classifier needs `--label image-classification`; and so on. |
+ | `--components MODEL [MODEL ...]` | Components for an omni collection (see below). Use with `--recipe collection.omni`. |
+ 
+ ### Pull an Omni Collection
+diff --git a/src/cpp/include/lemon_cli/pull_labels.h b/src/cpp/include/lemon_cli/pull_labels.h
+index f0e1a21a3..45558e855 100644
+--- a/src/cpp/include/lemon_cli/pull_labels.h
++++ b/src/cpp/include/lemon_cli/pull_labels.h
+@@ -8,6 +8,7 @@ namespace lemon_cli {
+ // Labels `lemonade pull --label` accepts for a manual user.* registration.
+ inline const std::vector<std::string>& pull_labels() {
+     static const std::vector<std::string> labels = {
++        "audio-generation",
+         "chat",
+         "coding",
+         "dflash",
+@@ -18,6 +19,7 @@ inline const std::vector<std::string>& pull_labels() {
+         "reasoning",
+         "reranking",
+         "tool-calling",
++        "transcription",
+         "vision"
+     };
+     return labels;
+-- 
+2.53.0
+

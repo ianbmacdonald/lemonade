@@ -1,0 +1,26 @@
+From 876f653d406e88385dbd57e24d988e921af13e2a Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 26 Sep 2026 21:33:36 -0400
+Subject: [PATCH 05/58] fix(litert): label Qwen3-0.6B-LiteRT with its chat
+ deployment mode
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/resources/server_models.json | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/cpp/resources/server_models.json b/src/cpp/resources/server_models.json
+index f7b004c83..fe18ee9aa 100644
+--- a/src/cpp/resources/server_models.json
++++ b/src/cpp/resources/server_models.json
+@@ -2970,6 +2970,7 @@
+         "checkpoint": "litert-community/Qwen3-0.6B:qwen3_0_6b_mixed_int4.litertlm",
+         "recipe": "litert",
+         "labels": [
++            "chat",
+             "reasoning"
+         ],
+         "size": 0.5
+-- 
+2.53.0
+

@@ -1,0 +1,100 @@
+From e0f48a8f1cf8b1b374a6dcb675a265c340ddead4 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 27 Sep 2026 13:04:13 -0400
+Subject: [PATCH 10/58] feat(vllm): per-arch release repo override for the ROCm
+ backend
+
+backend_versions.json vllm.rocm_arch_repos maps an asset family to the GitHub
+repo that publishes its vLLM ROCm release; unset families keep
+lemonade-sdk/vllm-rocm. prpl-demo points gfx942 at ianbmacdonald/vllm-rocm-cdna,
+whose re-assembled nightly restores aiter_meta: the upstream nightly deletes it,
+so FP8 (Quark) models fail importing AITER ('aiter_enum.h not found').
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/system_info.h          |  3 +++
+ src/cpp/resources/backend_versions.json      |  5 ++++-
+ src/cpp/server/backends/vllm/vllm_server.cpp |  3 +++
+ src/cpp/server/system_info.cpp               | 21 ++++++++++++++++++++
+ 4 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/cpp/include/lemon/system_info.h b/src/cpp/include/lemon/system_info.h
+index a459668de..e043d5e19 100644
+--- a/src/cpp/include/lemon/system_info.h
++++ b/src/cpp/include/lemon/system_info.h
+@@ -140,6 +140,9 @@ public:
+     // default pin. Beware: vLLM release tags use the raw ISA (gfx942), unlike
+     // therock.url_mapping, which maps it to gfx94X-dcgpu.
+     static std::string vllm_rocm_version_override(const std::string& asset_family);
++    // GitHub repo that publishes the vLLM ROCm release for an asset family, when it is
++    // not lemonade-sdk/vllm-rocm (backend_versions.json vllm.rocm_arch_repos); "" = default.
++    static std::string vllm_rocm_repo_override(const std::string& asset_family);
+ 
+     // When set non-empty on the calling thread, get_rocm_arch() returns this
+     // value instead of probing hardware, so backend asset URLs can be resolved
+diff --git a/src/cpp/resources/backend_versions.json b/src/cpp/resources/backend_versions.json
+index 29b9d36a2..8ce3101b3 100644
+--- a/src/cpp/resources/backend_versions.json
++++ b/src/cpp/resources/backend_versions.json
+@@ -151,8 +151,11 @@
+     "metal": "b21"
+   },
+   "vllm": {
+-    "comment": "'rocm' is the default (RDNA) pin. 'rocm_arch_overrides' pins per detected asset family (rocm_asset_family output) where AMD's vLLM/ROCm wheel cadence diverges: CDNA-dcgpu (gfx942, gfx950) shares no release tag with the RDNA line, so it pins its own version. gfx950 (CDNA4) rides the same CDNA vLLM/ROCm line as gfx942 (CDNA3). CDNA pins the nightly line because the stable vllm0.19.1-rocm7.13.0 CDNA asset does not start (tokenizers and torch ABI mismatch inside the bundle). Review each override at release time - feature/fix parity across arch lines lags until bumped.",
++    "comment": "'rocm' is the default (RDNA) pin. 'rocm_arch_overrides' pins per detected asset family (rocm_asset_family output) where AMD's vLLM/ROCm wheel cadence diverges: CDNA-dcgpu (gfx942, gfx950) shares no release tag with the RDNA line, so it pins its own version. gfx950 (CDNA4) rides the same CDNA vLLM/ROCm line as gfx942 (CDNA3). CDNA pins the nightly line because the stable vllm0.19.1-rocm7.13.0 CDNA asset does not start (tokenizers and torch ABI mismatch inside the bundle). Review each override at release time - feature/fix parity across arch lines lags until bumped. 'rocm_arch_repos' names a different GitHub repo for an asset family's release (default lemonade-sdk/vllm-rocm); the prpl-demo branch points gfx942 at ianbmacdonald/vllm-rocm-cdna, whose re-assembled nightly keeps aiter_meta (AITER's headers and prebuilt kernels), which FP8/Quark models need.",
+     "rocm": "vllm0.20.1-rocm7.12.0",
++    "rocm_arch_repos": {
++      "gfx942": "ianbmacdonald/vllm-rocm-cdna"
++    },
+     "rocm_arch_overrides": {
+       "gfx942": "vllm0.23.1.dev0+rocm7.15.0a20260721.g0fc695fc6.d20260723-rocm7.15.0",
+       "gfx950": "vllm0.23.1.dev0+rocm7.15.0a20260721.g0fc695fc6.d20260723-rocm7.15.0"
+diff --git a/src/cpp/server/backends/vllm/vllm_server.cpp b/src/cpp/server/backends/vllm/vllm_server.cpp
+index 535f3e672..3330018f2 100644
+--- a/src/cpp/server/backends/vllm/vllm_server.cpp
++++ b/src/cpp/server/backends/vllm/vllm_server.cpp
+@@ -300,6 +300,9 @@ InstallParams VLLMServer::get_install_params(const std::string& backend, const s
+             );
+         }
+ #ifdef __linux__
++        if (std::string repo = SystemInfo::vllm_rocm_repo_override(target_arch); !repo.empty()) {
++            params.repo = repo;
++        }
+         // The per-arch override replaces ONLY the builtin default base, so an explicit
+         // vllm.rocm_bin pin is not silently clobbered on an MI300X host.
+         std::string arch_override = SystemInfo::vllm_rocm_version_override(target_arch);
+diff --git a/src/cpp/server/system_info.cpp b/src/cpp/server/system_info.cpp
+index 454a09887..514445fab 100644
+--- a/src/cpp/server/system_info.cpp
++++ b/src/cpp/server/system_info.cpp
+@@ -2129,6 +2129,27 @@ std::string SystemInfo::vllm_rocm_version_override(const std::string& asset_fami
+     return "";
+ }
+ 
++std::string SystemInfo::vllm_rocm_repo_override(const std::string& asset_family) {
++    static const json repos = []() -> json {
++        try {
++            std::string config_path = utils::get_resource_path("resources/backend_versions.json");
++            std::ifstream file(config_path);
++            if (!file.is_open()) {
++                return json::object();
++            }
++            json vllm = json::parse(file).value("vllm", json::object());
++            return vllm.value("rocm_arch_repos", json::object());
++        } catch (...) {
++            return json::object();
++        }
++    }();
++
++    if (auto it = repos.find(asset_family); it != repos.end() && it->is_string()) {
++        return it->get<std::string>();
++    }
++    return "";
++}
++
+ std::string SystemInfo::select_rocm_arch(const json& amd_gpu_devices) {
+     if (!amd_gpu_devices.is_array()) {
+         return "";
+-- 
+2.53.0
+

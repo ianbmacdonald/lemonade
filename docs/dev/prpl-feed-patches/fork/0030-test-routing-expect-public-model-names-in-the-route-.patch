@@ -1,0 +1,98 @@
+From 2a3af55eba32be86665aaad892899eecce809af9 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 17:46:38 -0400
+Subject: [PATCH 30/58] test(routing): expect public model names in the route
+ decision (RED)
+
+Assisted-by: claude:opus-5.5
+---
+ .../include/lemon/route_decision_response.h   |  8 ++++-
+ src/cpp/server/route_decision_response.cpp    |  3 +-
+ test/cpp/test_route_decision_response.cpp     | 31 +++++++++++++++++++
+ 3 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/src/cpp/include/lemon/route_decision_response.h b/src/cpp/include/lemon/route_decision_response.h
+index e9f16f660..ecfb5a2b9 100644
+--- a/src/cpp/include/lemon/route_decision_response.h
++++ b/src/cpp/include/lemon/route_decision_response.h
+@@ -11,7 +11,13 @@
+ 
+ namespace lemon {
+ 
+-json route_decision_to_json(const Decision& decision);
++using ModelNameMapper = std::function<std::string(const std::string&)>;
++
++// Engine decisions carry internal component ids (e.g. user.X); a client joins
++// route_to against /v1/models, so every model name is emitted through
++// `public_model_name` when one is given.
++json route_decision_to_json(const Decision& decision,
++                            const ModelNameMapper& public_model_name = nullptr);
+ 
+ std::string route_decision_header_value(const Decision& decision);
+ 
+diff --git a/src/cpp/server/route_decision_response.cpp b/src/cpp/server/route_decision_response.cpp
+index 2e16cf953..ec1ee1e1a 100644
+--- a/src/cpp/server/route_decision_response.cpp
++++ b/src/cpp/server/route_decision_response.cpp
+@@ -48,7 +48,8 @@ std::optional<EventBoundary> find_sse_event_boundary(const std::string& buffer)
+ 
+ } // namespace
+ 
+-json route_decision_to_json(const Decision& decision) {
++json route_decision_to_json(const Decision& decision,
++                            const ModelNameMapper& public_model_name) {
+     json out = {
+         {"version", "1"},
+         {"route_to", decision.route_to},
+diff --git a/test/cpp/test_route_decision_response.cpp b/test/cpp/test_route_decision_response.cpp
+index 4941e5b69..d800bb5ff 100644
+--- a/test/cpp/test_route_decision_response.cpp
++++ b/test/cpp/test_route_decision_response.cpp
+@@ -172,6 +172,36 @@ static void test_trace_serializes_error_and_truncated() {
+           out["trace"][3].contains("truncated") && out["trace"][3]["truncated"] == false);
+ }
+ 
++static void test_model_names_use_public_mapping() {
++    Decision decision;
++    decision.route_to = "user.Gemma3-1B-IT-LiteRT";
++    decision.matched_rule = "__route_0";
++    lemon::TraceEntry candidate;
++    candidate.condition = "classifier:__router";
++    candidate.label = "user.Gemma3-1B-IT-LiteRT";
++    candidate.rationale = "user.Gemma3-1B-IT-LiteRT fits";
++    lemon::TraceEntry other;
++    other.condition = "classifier:pii";
++    other.label = "pii";
++    decision.trace = {candidate, other};
++
++    const lemon::ModelNameMapper public_name = [](const std::string& name) {
++        return name == "user.Gemma3-1B-IT-LiteRT" ? std::string("Gemma3-1B-IT-LiteRT") : name;
++    };
++    json out = lemon::route_decision_to_json(decision, public_name);
++    check("route_to uses the public model name",
++          out.value("route_to", "") == "Gemma3-1B-IT-LiteRT");
++    check("trace candidate label uses the public model name",
++          out["trace"][0].value("label", "") == "Gemma3-1B-IT-LiteRT");
++    check("free-text rationale is not rewritten",
++          out["trace"][0].value("rationale", "") == "user.Gemma3-1B-IT-LiteRT fits");
++    check("non-model label passes through",
++          out["trace"][1].value("label", "") == "pii");
++    check("no mapper keeps the engine's names",
++          lemon::route_decision_to_json(decision).value("route_to", "") ==
++              "user.Gemma3-1B-IT-LiteRT");
++}
++
+ int main() {
+     test_lf_event_is_injected();
+     test_crlf_split_event_is_injected_before_done();
+@@ -180,6 +210,7 @@ int main() {
+     test_route_header_default_value();
+     test_trace_serializes_label_and_rationale();
+     test_trace_serializes_error_and_truncated();
++    test_model_names_use_public_mapping();
+ 
+     if (g_failures == 0) {
+         std::printf("All route decision response tests passed.\n");
+-- 
+2.53.0
+

@@ -1,0 +1,27 @@
+From cdc5fdadbed98f1f3bc51b1b237df45d440cf997 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:23:37 -0400
+Subject: [PATCH 22/58] test: cover tflite in backend mode contract
+
+Assisted-by: claude:opus-5.5
+---
+ test/cpp/test_backend_mode_contract.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/test/cpp/test_backend_mode_contract.cpp b/test/cpp/test_backend_mode_contract.cpp
+index ad46d637e..c16a700ef 100644
+--- a/test/cpp/test_backend_mode_contract.cpp
++++ b/test/cpp/test_backend_mode_contract.cpp
+@@ -253,6 +253,9 @@ int main() {
+          {"image-classification"}, ModelType::IMAGE_CLASSIFICATION},
+         {"onnxruntime + image-classification", "onnxruntime", {"image-classification"},
+          false, {}, {}},
++        {"tflite + classification", "tflite", {"classification"}, true,
++         {"classification"}, ModelType::CLASSIFICATION},
++        {"tflite + chat", "tflite", {"chat"}, false, {}, {}},
+         {"executorch + classification", "executorch", {"classification"}, true,
+          {"classification"}, ModelType::CLASSIFICATION},
+         {"executorch + chat", "executorch", {"chat"}, false, {}, {}},
+-- 
+2.53.0
+

@@ -1,0 +1,1974 @@
+From c1936cee7f421bf1ff70596696cc33d01ee375a4 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:36:32 -0400
+Subject: [PATCH 12/58] feat: opt-in lemond LAN beacon listener, list-only
+
+Add a beacon_listen config key (default false). When enabled, lemond binds
+UDP 13305 on each local RFC1918 interface's directed-broadcast address plus
+255.255.255.255 (never INADDR_ANY, so 127.0.0.1 CLI/Tauri discovery is
+untouched), validates heard beacons (RFC1918 source, strict URL bound to the
+source IP, sanitised hostname, self filter, two-tier rate limit, 32-row cap,
+15 s TTL) and reports them as beacon_listener in GET /health. Heard hosts are
+display-only: nothing contacts them or registers them as providers. Windows
+builds a stub that reports supported=false.
+
+The broadcaster now builds its payload with nlohmann::json (replace on
+invalid UTF-8, try/catch around each send) and adds an instance_id for
+exact self-detection.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                                |  16 +
+ src/cpp/include/lemon/runtime_config.h        |   1 +
+ src/cpp/include/lemon/server/http_listener.h  |   9 +
+ src/cpp/include/lemon/utils/beacon_listener.h | 159 ++++
+ src/cpp/include/lemon/utils/network_beacon.h  |   2 +
+ src/cpp/resources/defaults.json               |   1 +
+ src/cpp/server/core/config_effects.cpp        |   4 +
+ src/cpp/server/core/http_listener.cpp         |  28 +
+ .../server/routes/lemonade/system/health.cpp  |  20 +
+ src/cpp/server/runtime_config.cpp             |  13 +
+ src/cpp/server/utils/beacon_listener.cpp      | 689 ++++++++++++++++++
+ src/cpp/server/utils/network_beacon.cpp       | 108 +--
+ test/cpp/test_beacon_listener_socket.cpp      | 187 +++++
+ test/cpp/test_beacon_peer_table.cpp           | 398 ++++++++++
+ test/cpp/test_config_discovery.cpp            |  33 +
+ 15 files changed, 1622 insertions(+), 46 deletions(-)
+ create mode 100644 src/cpp/include/lemon/utils/beacon_listener.h
+ create mode 100644 src/cpp/server/utils/beacon_listener.cpp
+ create mode 100644 test/cpp/test_beacon_listener_socket.cpp
+ create mode 100644 test/cpp/test_beacon_peer_table.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 93737ed46..6156f4686 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1138,6 +1138,7 @@ set(SOURCES_CORE
+     src/cpp/server/utils/version_utils.cpp
+     src/cpp/server/utils/wmi_helper.cpp
+     src/cpp/server/utils/network_beacon.cpp
++    src/cpp/server/utils/beacon_listener.cpp
+     src/cpp/server/utils/tcp_jsonl_client.cpp
+     src/cpp/server/backends/backend_utils.cpp
+     src/cpp/server/backend_manager.cpp
+@@ -3688,6 +3689,21 @@ if(BUILD_TESTING AND EXISTS "${_CONFIG_DISCOVERY_TEST_SRC}")
+     add_cpp_ci_test(ConfigDiscoveryTest CI ON COMMAND test_config_discovery)
+ endif()
+ 
++set(_BEACON_PEER_TABLE_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_beacon_peer_table.cpp")
++if(BUILD_TESTING AND EXISTS "${_BEACON_PEER_TABLE_TEST_SRC}")
++    add_executable(test_beacon_peer_table test/cpp/test_beacon_peer_table.cpp)
++    target_link_libraries(test_beacon_peer_table PRIVATE lemonade-server-core)
++    add_cpp_ci_test(BeaconPeerTableTest CI ON COMMAND test_beacon_peer_table)
++endif()
++
++# Binds real UDP 13305, so it stays out of CI.
++set(_BEACON_LISTENER_SOCKET_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_beacon_listener_socket.cpp")
++if(BUILD_TESTING AND UNIX AND NOT APPLE AND EXISTS "${_BEACON_LISTENER_SOCKET_TEST_SRC}")
++    add_executable(test_beacon_listener_socket test/cpp/test_beacon_listener_socket.cpp)
++    target_link_libraries(test_beacon_listener_socket PRIVATE lemonade-server-core)
++    add_cpp_ci_test(BeaconListenerSocketTest CI OFF COMMAND test_beacon_listener_socket)
++endif()
++
+ set(_CONFIG_TELEMETRY_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_config_telemetry.cpp")
+ if(BUILD_TESTING AND EXISTS "${_CONFIG_TELEMETRY_TEST_SRC}")
+     add_executable(test_config_telemetry test/cpp/test_config_telemetry.cpp)
+diff --git a/src/cpp/include/lemon/runtime_config.h b/src/cpp/include/lemon/runtime_config.h
+index c51b1f55a..c47afb974 100644
+--- a/src/cpp/include/lemon/runtime_config.h
++++ b/src/cpp/include/lemon/runtime_config.h
+@@ -52,6 +52,7 @@ public:
+     bool auto_evict() const;
+     double auto_evict_threshold_pct() const;
+     bool inhibit_suspend() const;
++    bool beacon_listen() const;
+ 
+     // Telemetry settings
+     bool telemetry_enabled() const;
+diff --git a/src/cpp/include/lemon/server/http_listener.h b/src/cpp/include/lemon/server/http_listener.h
+index 49cea8ba6..09d5463a9 100644
+--- a/src/cpp/include/lemon/server/http_listener.h
++++ b/src/cpp/include/lemon/server/http_listener.h
+@@ -10,6 +10,7 @@
+ #include <httplib.h>
+ 
+ #include "lemon/upgradable_http_server.h"
++#include "lemon/utils/beacon_listener.h"
+ #include "lemon/utils/network_beacon.h"
+ 
+ namespace lemon {
+@@ -45,6 +46,10 @@ public:
+     // the running listeners. Only what changed is restarted.
+     void rebind();
+ 
++    // Starts or stops the LAN beacon listener to match config; safe to call repeatedly.
++    void sync_beacon_listener();
++    nlohmann::json beacon_listener_status() const { return beacon_listener_.status_json(); }
++
+     // 0 when the WebSocket server is not running.
+     int websocket_port() const;
+     int port() const { return port_.load(); }
+@@ -91,6 +96,10 @@ private:
+     std::unique_ptr<WebSocketServer> websocket_server_;
+ 
+     NetworkBeacon udp_beacon_;
++    std::string instance_id_;
++    BeaconListener beacon_listener_;
++    std::mutex beacon_listener_mtx_;
++    bool beacon_listener_shutdown_ = false;
+ 
+     std::atomic<bool> running_{false};
+     std::atomic<bool> shutdown_requested_{false};
+diff --git a/src/cpp/include/lemon/utils/beacon_listener.h b/src/cpp/include/lemon/utils/beacon_listener.h
+new file mode 100644
+index 000000000..db748f7da
+--- /dev/null
++++ b/src/cpp/include/lemon/utils/beacon_listener.h
+@@ -0,0 +1,159 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <nlohmann/json.hpp>
++
++namespace lemon {
++
++constexpr int kBeaconPort = 13305;
++constexpr std::chrono::seconds kPeerTtl{15};
++constexpr std::chrono::seconds kEvictStale{8};
++constexpr std::size_t kMaxHosts = 32;
++constexpr double kGlobalRate = 500.0;
++constexpr double kGlobalBurst = 1000.0;
++constexpr double kPerSourceRate = 2.0;
++constexpr double kPerSourceBurst = 4.0;
++constexpr std::size_t kMaxSources = 64;
++constexpr std::size_t kMaxDatagram = 1024;
++constexpr std::chrono::seconds kIfaceRefresh{10};
++constexpr std::chrono::milliseconds kPollSlice{500};
++
++namespace utils {
++bool is_rfc1918_ipv4(uint32_t host_order);
++std::string ipv4_to_string(uint32_t host_order);
++} // namespace utils
++
++enum class IngestResult {
++    Accepted,
++    Refreshed,
++    Self,
++    BadSource,
++    BadPayload,
++    UrlMismatch,
++    RateLimited,
++    TableFull
++};
++
++const char* ingest_result_name(IngestResult result);
++
++struct HeardHost {
++    std::string hostname;
++    std::string url;
++    std::string source_ip;
++    std::string instance_id;
++    uint32_t source_ip_host_order = 0;
++    std::chrono::system_clock::time_point first_seen_wall;
++    std::chrono::system_clock::time_point last_seen_wall;
++    std::chrono::steady_clock::time_point last_seen;
++};
++
++// Socket-free acceptance logic for received beacons. All time is injected so
++// rate limiting and expiry are deterministic under test.
++class BeaconPeerTable {
++public:
++    BeaconPeerTable();
++
++    void set_self(const std::string& instance_id, int self_port);
++    void set_self_port(int port);
++    void set_local_addresses(std::vector<uint32_t> addrs);
++
++    IngestResult ingest(const char* buf, std::size_t len, bool truncated, uint32_t src_ip,
++                        std::chrono::steady_clock::time_point now);
++    void expire(std::chrono::steady_clock::time_point now);
++
++    nlohmann::json to_json(std::chrono::steady_clock::time_point now) const;
++    std::vector<HeardHost> hosts() const;
++    std::size_t size() const;
++    std::size_t tracked_source_count() const;
++    uint64_t stat(IngestResult result) const;
++    uint64_t evicted() const;
++    void clear();
++
++private:
++    struct Bucket {
++        double tokens = 0.0;
++        std::chrono::steady_clock::time_point last;
++    };
++    struct SourceState {
++        Bucket bucket;
++        std::chrono::steady_clock::time_point last_seen;
++    };
++
++    bool admit_locked(uint32_t src_ip, std::chrono::steady_clock::time_point now);
++    bool is_pinned_locked(uint32_t src_ip) const;
++    void expire_locked(std::chrono::steady_clock::time_point now);
++    IngestResult record_locked(IngestResult result);
++
++    mutable std::mutex mutex_;
++    std::string self_instance_id_;
++    int self_port_ = 0;
++    std::vector<uint32_t> local_addresses_;
++    std::map<std::string, HeardHost> rows_;
++    Bucket global_bucket_;
++    bool global_bucket_primed_ = false;
++    std::map<uint32_t, SourceState> sources_;
++    std::map<IngestResult, uint64_t> stats_;
++    uint64_t evicted_ = 0;
++};
++
++// Owns the UDP sockets and one worker thread. Binds only broadcast addresses
++// (never INADDR_ANY) so 127.0.0.1 unicast beacons keep reaching the CLI and
++// desktop app wildcard listeners.
++class BeaconListener {
++public:
++    BeaconListener();
++    ~BeaconListener();
++
++    BeaconListener(const BeaconListener&) = delete;
++    BeaconListener& operator=(const BeaconListener&) = delete;
++
++    void start(const std::string& instance_id, int self_port);
++    void stop();
++    void set_self_port(int port);
++    bool is_running() const;
++    nlohmann::json status_json() const;
++
++private:
++    struct SocketState {
++        std::string address;
++        uint32_t bind_ip = 0;
++        int fd = -1;
++        bool bound = false;
++        std::string error;
++    };
++
++    void thread_loop();
++    void refresh_sockets();
++    void close_all_sockets();
++    void publish_socket_status();
++    void wait_slice();
++    void log_rejection(IngestResult result, uint32_t src_ip);
++
++    std::mutex lifecycle_mtx_;
++    std::thread worker_;
++    std::atomic<bool> stop_{false};
++    std::atomic<bool> running_{false};
++    std::condition_variable cv_;
++    std::mutex cv_mtx_;
++
++    mutable std::mutex status_mtx_;
++    bool supported_ = true;
++    std::string error_;
++    nlohmann::json sockets_status_ = nlohmann::json::array();
++
++    std::vector<SocketState> sockets_;
++    std::map<IngestResult, std::chrono::steady_clock::time_point> last_warning_;
++    BeaconPeerTable table_;
++};
++
++} // namespace lemon
+diff --git a/src/cpp/include/lemon/utils/network_beacon.h b/src/cpp/include/lemon/utils/network_beacon.h
+index b5d7a315d..d4cd524c8 100644
+--- a/src/cpp/include/lemon/utils/network_beacon.h
++++ b/src/cpp/include/lemon/utils/network_beacon.h
+@@ -33,6 +33,7 @@ public:
+     std::vector<NetworkInterfaceInfo> getLocalRFC1918Interfaces();
+     void startBroadcasting(int beaconPort, int serverPort, uint16_t intervalSeconds);
+     void stopBroadcasting();
++    void setInstanceId(const std::string& id);
+ 
+ private:
+     std::mutex _netMtx;
+@@ -44,6 +45,7 @@ private:
+     SOCKET _socket;
+     bool _isInitialized;
+     uint16_t _broadcastIntervalSeconds;
++    std::string _instanceId;
+     void cleanup();
+     void createSocket();
+     void broadcastThreadLoop();
+diff --git a/src/cpp/resources/defaults.json b/src/cpp/resources/defaults.json
+index 7ecf45987..7399ede60 100644
+--- a/src/cpp/resources/defaults.json
++++ b/src/cpp/resources/defaults.json
+@@ -11,6 +11,7 @@
+   "auto_evict": false,
+   "auto_evict_threshold_pct": 0.9,
+   "auto_update_models": false,
++  "beacon_listen": false,
+   "broadcast": true,
+   "cloud_providers": [],
+   "config_version": 2,
+diff --git a/src/cpp/server/core/config_effects.cpp b/src/cpp/server/core/config_effects.cpp
+index 70d7cf1bb..e33458cce 100644
+--- a/src/cpp/server/core/config_effects.cpp
++++ b/src/cpp/server/core/config_effects.cpp
+@@ -25,6 +25,10 @@ void ConfigEffects::apply(const std::string& key, const json& value) {
+     if (key == "port" || key == "host" || key == "websocket_port" ||
+         key == "broadcast" || key == "no_broadcast") {
+         ctx_.listener->rebind();
++    } else if (key == "beacon_listen") {
++        LOG(INFO, "Server") << "Beacon listener "
++                            << (config.beacon_listen() ? "enabled" : "disabled") << std::endl;
++        ctx_.listener->sync_beacon_listener();
+     } else if (key == "log_level" || key == "log_file" || key == "log_max_file_size_mb" ||
+                key == "log_max_files") {
+         LogRotationConfig rot_cfg;
+diff --git a/src/cpp/server/core/http_listener.cpp b/src/cpp/server/core/http_listener.cpp
+index c0134cfc3..2c6078e8e 100644
+--- a/src/cpp/server/core/http_listener.cpp
++++ b/src/cpp/server/core/http_listener.cpp
+@@ -2,7 +2,10 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <iomanip>
+ #include <iostream>
++#include <random>
++#include <sstream>
+ #include <stdexcept>
+ 
+ #include <lemon/utils/aixlog.hpp>
+@@ -51,6 +54,14 @@ HttpListener::HttpListener(RuntimeConfig* config, Router* router, SetupFn setup,
+       bound_host_(config->host()),
+       websocket_requested_port_(config->websocket_port()),
+       broadcast_(config->broadcast()) {
++    {
++        std::random_device rd;
++        std::mt19937_64 gen((static_cast<uint64_t>(rd()) << 32) ^ rd());
++        std::ostringstream id;
++        id << std::hex << std::setw(16) << std::setfill('0') << gen();
++        instance_id_ = id.str();
++    }
++    udp_beacon_.setInstanceId(instance_id_);
+     create_servers();
+     websocket_server_ = std::make_unique<WebSocketServer>(
+         router_, config_->host(), config_->websocket_port());
+@@ -283,6 +294,8 @@ void HttpListener::start() {
+         }
+     }
+ 
++    sync_beacon_listener();
++
+     while (true) {
+         if (shutdown_requested_.load()) {
+             LOG(INFO, "Server") << "Shutdown requested, stopping server..." << std::endl;
+@@ -391,7 +404,21 @@ void HttpListener::start() {
+ }
+ 
+ 
++void HttpListener::sync_beacon_listener() {
++    std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
++    if (!beacon_listener_shutdown_ && config_->beacon_listen()) {
++        beacon_listener_.start(instance_id_, port_.load());
++    } else {
++        beacon_listener_.stop();
++    }
++}
++
+ bool HttpListener::stop() {
++    {
++        std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
++        beacon_listener_shutdown_ = true;
++        beacon_listener_.stop();
++    }
+     if (!running_.exchange(false)) {
+         return false;
+     }
+@@ -432,6 +459,7 @@ void HttpListener::rebind() {
+     if (new_port != current_port) {
+         LOG(INFO, "Server") << "Port change requested: " << current_port << " -> " << new_port << std::endl;
+         port_.store(new_port);
++        beacon_listener_.set_self_port(new_port);
+         rebind_http = true;
+     }
+     if (new_host != bound_host_) {
+diff --git a/src/cpp/server/routes/lemonade/system/health.cpp b/src/cpp/server/routes/lemonade/system/health.cpp
+index d35fdbaff..8d32c283d 100644
+--- a/src/cpp/server/routes/lemonade/system/health.cpp
++++ b/src/cpp/server/routes/lemonade/system/health.cpp
+@@ -109,6 +109,25 @@ ordered_json health_schema() {
+                 }
+             },
+             "pinned_helper_models": {"type": "object", "additionalProperties": {"type": "integer", "description": "How many pinned routing-helper models of this type are loaded."}, "description": "Loaded pinned routing-helper models, counted per model type."},
++            "beacon_listener": {
++                "type": "object",
++                "description": "State of the LAN beacon listener, controlled by the `beacon_listen` setting in [Server Configuration](../guide/configuration/README.md). The list is display-only: Lemonade never contacts a heard host, sends it credentials, or routes requests to it. When the listener is off, this is `{\"enabled\": false}`.",
++                "required": ["enabled"],
++                "properties": {
++                    "enabled": {"type": "boolean", "description": "Whether the listener is running."},
++                    "supported": {"type": "boolean", "description": "`false` on Windows, where the listener is not available in this release."},
++                    "listening": {"type": "boolean", "description": "Whether at least one UDP socket is bound."},
++                    "error": {"type": ["string", "null"], "description": "Platform-level error, or `null`."},
++                    "sockets": {"type": "array", "items": {"type": "object"}, "description": "One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each local RFC1918 interface's directed-broadcast address plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on."},
++                    "self_instance_id": {"type": "string", "description": "This server's beacon `instance_id`, used to drop its own beacons."},
++                    "self_port": {"type": "integer", "description": "This server's HTTP port, used to drop its own beacons."},
++                    "ttl_seconds": {"type": "integer", "description": "Seconds a host stays listed after its last beacon."},
++                    "max_hosts": {"type": "integer", "description": "Maximum listed hosts."},
++                    "distinct_instances": {"type": "integer", "description": "Number of distinct servers heard; a multi-homed server has one row per interface."},
++                    "hosts": {"type": "array", "items": {"type": "object"}, "description": "Heard servers, sorted by hostname: `hostname` (sanitised to `[A-Za-z0-9._-]`), `url`, `source_ip`, `instance_id` (or `null` for older servers), `first_seen` and `last_seen` (Unix seconds), `age_seconds`."},
++                    "stats": {"type": "object", "description": "Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch`, `rate_limited`, `table_full`, `evicted`."}
++                }
++            },
+             "server_process": {
+                 "type": "object",
+                 "description": "The Lemonade Server process itself.",
+@@ -203,6 +222,7 @@ public:
+         }
+ 
+         response["update_check_done"] = ctx_.server->update_check_done();
++        response["beacon_listener"] = ctx_.listener->beacon_listener_status();
+ 
+         if (ctx_.model_manager) {
+             const json sync = ctx_.model_manager->sync_status();
+diff --git a/src/cpp/server/runtime_config.cpp b/src/cpp/server/runtime_config.cpp
+index dae0a9d46..445913073 100644
+--- a/src/cpp/server/runtime_config.cpp
++++ b/src/cpp/server/runtime_config.cpp
+@@ -288,6 +288,9 @@ RuntimeConfig::RuntimeConfig(const json& config)
+     if (config_.contains("broadcast") && !config_["broadcast"].is_boolean()) {
+         throw std::invalid_argument("'broadcast' must be a boolean");
+     }
++    if (config_.contains("beacon_listen") && !config_["beacon_listen"].is_boolean()) {
++        throw std::invalid_argument("'beacon_listen' must be a boolean");
++    }
+     // Migrate legacy no_broadcast if present
+     if (config_.contains("no_broadcast")) {
+         if (!config_["no_broadcast"].is_boolean()) {
+@@ -501,6 +504,12 @@ bool RuntimeConfig::auto_evict() const {
+     return false;
+ }
+ 
++bool RuntimeConfig::beacon_listen() const {
++    std::shared_lock lock(mutex_);
++    auto it = config_.find("beacon_listen");
++    return it != config_.end() && it->is_boolean() && it->get<bool>();
++}
++
+ bool RuntimeConfig::inhibit_suspend() const {
+     std::shared_lock lock(mutex_);
+     if (config_.contains("inhibit_suspend")) {
+@@ -953,6 +962,10 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
+         if (!value.is_boolean()) {
+             throw std::invalid_argument("'inhibit_suspend' must be a boolean");
+         }
++    } else if (key == "beacon_listen") {
++        if (!value.is_boolean()) {
++            throw std::invalid_argument("'beacon_listen' must be a boolean");
++        }
+     } else if (key == "auto_evict_threshold_pct") {
+         if (!value.is_number()) {
+             throw std::invalid_argument("'auto_evict_threshold_pct' must be a number");
+diff --git a/src/cpp/server/utils/beacon_listener.cpp b/src/cpp/server/utils/beacon_listener.cpp
+new file mode 100644
+index 000000000..2f5c1277c
+--- /dev/null
++++ b/src/cpp/server/utils/beacon_listener.cpp
+@@ -0,0 +1,689 @@
++#include "lemon/utils/beacon_listener.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++#include <set>
++#include <tuple>
++#include <utility>
++
++#include "lemon/utils/aixlog.hpp"
++#include "lemon/utils/network_beacon.h"
++
++#ifndef _WIN32
++    #include <arpa/inet.h>
++    #include <netinet/in.h>
++    #include <poll.h>
++    #include <sys/socket.h>
++    #include <unistd.h>
++#endif
++
++namespace lemon {
++
++namespace utils {
++
++bool is_rfc1918_ipv4(uint32_t ip) {
++    if ((ip & 0xFF000000u) == 0x0A000000u) return true;
++    if ((ip & 0xFFF00000u) == 0xAC100000u) return true;
++    if ((ip & 0xFFFF0000u) == 0xC0A80000u) return true;
++    return false;
++}
++
++std::string ipv4_to_string(uint32_t ip) {
++    return std::to_string((ip >> 24) & 0xFF) + "." + std::to_string((ip >> 16) & 0xFF) + "." +
++           std::to_string((ip >> 8) & 0xFF) + "." + std::to_string(ip & 0xFF);
++}
++
++} // namespace utils
++
++namespace {
++
++using steady_clock = std::chrono::steady_clock;
++
++bool is_digit(char c) {
++    return c >= '0' && c <= '9';
++}
++
++bool parse_decimal(const std::string& s, size_t& pos, size_t max_digits, uint32_t& out) {
++    size_t start = pos;
++    uint32_t value = 0;
++    while (pos < s.size() && is_digit(s[pos])) {
++        if (pos - start >= max_digits) return false;
++        value = value * 10 + static_cast<uint32_t>(s[pos] - '0');
++        ++pos;
++    }
++    size_t digits = pos - start;
++    if (digits == 0) return false;
++    if (digits > 1 && s[start] == '0') return false;
++    out = value;
++    return true;
++}
++
++// Accepts exactly http://<dotted-quad>:<port>/api/v1/ with no leading-zero
++// octets, userinfo, alternate paths or trailing data.
++bool parse_beacon_url(const std::string& url, uint32_t& host, uint32_t& port) {
++    static const std::string kScheme = "http://";
++    static const std::string kPath = "/api/v1/";
++    if (url.compare(0, kScheme.size(), kScheme) != 0) return false;
++    size_t pos = kScheme.size();
++    uint32_t addr = 0;
++    for (int i = 0; i < 4; ++i) {
++        uint32_t octet = 0;
++        if (!parse_decimal(url, pos, 3, octet) || octet > 255) return false;
++        addr = (addr << 8) | octet;
++        if (i < 3) {
++            if (pos >= url.size() || url[pos] != '.') return false;
++            ++pos;
++        }
++    }
++    if (pos >= url.size() || url[pos] != ':') return false;
++    ++pos;
++    uint32_t p = 0;
++    if (!parse_decimal(url, pos, 5, p) || p == 0 || p > 65535) return false;
++    if (url.compare(pos, std::string::npos, kPath) != 0) return false;
++    host = addr;
++    port = p;
++    return true;
++}
++
++bool valid_instance_id(const std::string& id) {
++    if (id.empty() || id.size() > 32) return false;
++    return std::all_of(id.begin(), id.end(), [](char c) {
++        return is_digit(c) || (c >= 'a' && c <= 'f');
++    });
++}
++
++std::string sanitize_hostname(const std::string& raw) {
++    std::string out;
++    out.reserve(std::min<size_t>(raw.size(), 253));
++    for (char c : raw) {
++        if (out.size() >= 253) break;
++        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || is_digit(c) ||
++                  c == '.' || c == '_' || c == '-';
++        out.push_back(ok ? c : '_');
++    }
++    if (out.empty()) out = "_";
++    return out;
++}
++
++void refill(double& tokens, steady_clock::time_point& last, steady_clock::time_point now,
++            double rate, double burst) {
++    if (now > last) {
++        double elapsed = std::chrono::duration<double>(now - last).count();
++        tokens = std::min(burst, tokens + elapsed * rate);
++        last = now;
++    }
++}
++
++int64_t epoch_seconds(std::chrono::system_clock::time_point tp) {
++    return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
++}
++
++} // namespace
++
++const char* ingest_result_name(IngestResult result) {
++    switch (result) {
++        case IngestResult::Accepted: return "accepted";
++        case IngestResult::Refreshed: return "refreshed";
++        case IngestResult::Self: return "self";
++        case IngestResult::BadSource: return "bad_source";
++        case IngestResult::BadPayload: return "bad_payload";
++        case IngestResult::UrlMismatch: return "url_mismatch";
++        case IngestResult::RateLimited: return "rate_limited";
++        case IngestResult::TableFull: return "table_full";
++    }
++    return "unknown";
++}
++
++BeaconPeerTable::BeaconPeerTable() = default;
++
++void BeaconPeerTable::set_self(const std::string& instance_id, int self_port) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    self_instance_id_ = instance_id;
++    self_port_ = self_port;
++}
++
++void BeaconPeerTable::set_self_port(int port) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    self_port_ = port;
++}
++
++void BeaconPeerTable::set_local_addresses(std::vector<uint32_t> addrs) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    local_addresses_ = std::move(addrs);
++}
++
++bool BeaconPeerTable::is_pinned_locked(uint32_t src_ip) const {
++    for (const auto& [url, row] : rows_) {
++        if (row.source_ip_host_order == src_ip) return true;
++    }
++    return false;
++}
++
++// Pinned sources (those owning a live row) skip the global bucket so a flood
++// from other addresses cannot starve refreshes from already-known peers.
++bool BeaconPeerTable::admit_locked(uint32_t src_ip, steady_clock::time_point now) {
++    auto it = sources_.find(src_ip);
++    if (is_pinned_locked(src_ip)) {
++        if (it == sources_.end()) {
++            it = sources_.emplace(src_ip, SourceState{{kPerSourceBurst, now}, now}).first;
++        }
++        auto& st = it->second;
++        refill(st.bucket.tokens, st.bucket.last, now, kPerSourceRate, kPerSourceBurst);
++        st.last_seen = now;
++        if (st.bucket.tokens < 1.0) return false;
++        st.bucket.tokens -= 1.0;
++        return true;
++    }
++
++    if (!global_bucket_primed_) {
++        global_bucket_ = {kGlobalBurst, now};
++        global_bucket_primed_ = true;
++    }
++    refill(global_bucket_.tokens, global_bucket_.last, now, kGlobalRate, kGlobalBurst);
++    if (global_bucket_.tokens < 1.0) return false;
++    global_bucket_.tokens -= 1.0;
++
++    if (it == sources_.end()) {
++        size_t unpinned = 0;
++        auto oldest = sources_.end();
++        for (auto s = sources_.begin(); s != sources_.end(); ++s) {
++            if (is_pinned_locked(s->first)) continue;
++            ++unpinned;
++            if (oldest == sources_.end() || s->second.last_seen < oldest->second.last_seen) {
++                oldest = s;
++            }
++        }
++        if (unpinned >= kMaxSources && oldest != sources_.end()) {
++            sources_.erase(oldest);
++        }
++        it = sources_.emplace(src_ip, SourceState{{kPerSourceBurst, now}, now}).first;
++    }
++    auto& st = it->second;
++    refill(st.bucket.tokens, st.bucket.last, now, kPerSourceRate, kPerSourceBurst);
++    st.last_seen = now;
++    if (st.bucket.tokens < 1.0) return false;
++    st.bucket.tokens -= 1.0;
++    return true;
++}
++
++IngestResult BeaconPeerTable::record_locked(IngestResult result) {
++    ++stats_[result];
++    return result;
++}
++
++IngestResult BeaconPeerTable::ingest(const char* buf, std::size_t len, bool truncated, uint32_t src_ip,
++                                     steady_clock::time_point now) {
++    std::lock_guard<std::mutex> lock(mutex_);
++
++    if (!utils::is_rfc1918_ipv4(src_ip)) return record_locked(IngestResult::BadSource);
++    expire_locked(now);
++    if (!admit_locked(src_ip, now)) return record_locked(IngestResult::RateLimited);
++    if (buf == nullptr || len == 0 || len >= kMaxDatagram || truncated) {
++        return record_locked(IngestResult::BadPayload);
++    }
++
++    // Every field we keep is ASCII, and the hostname sanitiser maps each
++    // non-ASCII byte to '_' anyway, so folding high bytes first lets a peer
++    // with a non-UTF-8 hostname still be listed instead of failing the parse.
++    std::string text(buf, len);
++    for (char& c : text) {
++        if (static_cast<unsigned char>(c) >= 0x80) c = '_';
++    }
++    nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
++    if (j.is_discarded() || !j.is_object()) return record_locked(IngestResult::BadPayload);
++    auto service = j.find("service");
++    auto url_it = j.find("url");
++    auto host_it = j.find("hostname");
++    if (service == j.end() || !service->is_string() || service->get<std::string>() != "lemonade" ||
++        url_it == j.end() || !url_it->is_string() || host_it == j.end() || !host_it->is_string()) {
++        return record_locked(IngestResult::BadPayload);
++    }
++    std::string instance_id;
++    auto id_it = j.find("instance_id");
++    if (id_it != j.end()) {
++        if (!id_it->is_string()) return record_locked(IngestResult::BadPayload);
++        instance_id = id_it->get<std::string>();
++        if (!valid_instance_id(instance_id)) return record_locked(IngestResult::BadPayload);
++    }
++
++    const std::string url = url_it->get<std::string>();
++    uint32_t url_host = 0;
++    uint32_t url_port = 0;
++    if (!parse_beacon_url(url, url_host, url_port)) return record_locked(IngestResult::BadPayload);
++    if (url_host != src_ip) return record_locked(IngestResult::UrlMismatch);
++
++    std::string hostname = sanitize_hostname(host_it->get<std::string>());
++
++    if (!instance_id.empty()) {
++        if (instance_id == self_instance_id_) return record_locked(IngestResult::Self);
++    } else if (static_cast<int>(url_port) == self_port_ &&
++               std::find(local_addresses_.begin(), local_addresses_.end(), src_ip) !=
++                   local_addresses_.end()) {
++        return record_locked(IngestResult::Self);
++    }
++
++    auto wall = std::chrono::system_clock::now();
++    auto existing = rows_.find(url);
++    if (existing != rows_.end()) {
++        auto& row = existing->second;
++        row.hostname = hostname;
++        row.instance_id = instance_id;
++        row.source_ip = utils::ipv4_to_string(src_ip);
++        row.source_ip_host_order = src_ip;
++        row.last_seen = now;
++        row.last_seen_wall = wall;
++        return record_locked(IngestResult::Refreshed);
++    }
++
++    if (rows_.size() >= kMaxHosts) {
++        expire_locked(now);
++    }
++    if (rows_.size() >= kMaxHosts) {
++        auto oldest = rows_.begin();
++        for (auto r = rows_.begin(); r != rows_.end(); ++r) {
++            if (r->second.last_seen < oldest->second.last_seen) oldest = r;
++        }
++        if (now - oldest->second.last_seen > kEvictStale) {
++            rows_.erase(oldest);
++            ++evicted_;
++        } else {
++            return record_locked(IngestResult::TableFull);
++        }
++    }
++
++    HeardHost row;
++    row.hostname = hostname;
++    row.url = url;
++    row.source_ip = utils::ipv4_to_string(src_ip);
++    row.source_ip_host_order = src_ip;
++    row.instance_id = instance_id;
++    row.first_seen_wall = wall;
++    row.last_seen_wall = wall;
++    row.last_seen = now;
++    rows_.emplace(url, std::move(row));
++    return record_locked(IngestResult::Accepted);
++}
++
++void BeaconPeerTable::expire_locked(steady_clock::time_point now) {
++    for (auto it = rows_.begin(); it != rows_.end();) {
++        if (now - it->second.last_seen > kPeerTtl) {
++            it = rows_.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
++void BeaconPeerTable::expire(steady_clock::time_point now) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    expire_locked(now);
++}
++
++nlohmann::json BeaconPeerTable::to_json(steady_clock::time_point now) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    std::vector<const HeardHost*> live;
++    for (const auto& [url, row] : rows_) {
++        if (now - row.last_seen <= kPeerTtl) live.push_back(&row);
++    }
++    std::sort(live.begin(), live.end(), [](const HeardHost* a, const HeardHost* b) {
++        return std::tie(a->hostname, a->url) < std::tie(b->hostname, b->url);
++    });
++
++    nlohmann::json hosts = nlohmann::json::array();
++    std::set<std::string> ids;
++    size_t without_id = 0;
++    for (const auto* row : live) {
++        if (row->instance_id.empty()) {
++            ++without_id;
++        } else {
++            ids.insert(row->instance_id);
++        }
++        hosts.push_back({
++            {"hostname", row->hostname},
++            {"url", row->url},
++            {"source_ip", row->source_ip},
++            {"instance_id", row->instance_id.empty() ? nlohmann::json(nullptr) : nlohmann::json(row->instance_id)},
++            {"first_seen", epoch_seconds(row->first_seen_wall)},
++            {"last_seen", epoch_seconds(row->last_seen_wall)},
++            {"age_seconds", std::chrono::duration<double>(now - row->last_seen).count()},
++        });
++    }
++
++    nlohmann::json stats = nlohmann::json::object();
++    for (auto r : {IngestResult::Accepted, IngestResult::Refreshed, IngestResult::Self,
++                   IngestResult::BadSource, IngestResult::BadPayload, IngestResult::UrlMismatch,
++                   IngestResult::RateLimited, IngestResult::TableFull}) {
++        auto it = stats_.find(r);
++        stats[ingest_result_name(r)] = it == stats_.end() ? 0 : it->second;
++    }
++    stats["evicted"] = evicted_;
++
++    return {
++        {"self_instance_id", self_instance_id_},
++        {"self_port", self_port_},
++        {"ttl_seconds", kPeerTtl.count()},
++        {"max_hosts", kMaxHosts},
++        {"distinct_instances", ids.size() + without_id},
++        {"hosts", hosts},
++        {"stats", stats},
++    };
++}
++
++std::vector<HeardHost> BeaconPeerTable::hosts() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    std::vector<HeardHost> out;
++    for (const auto& [url, row] : rows_) out.push_back(row);
++    return out;
++}
++
++std::size_t BeaconPeerTable::size() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return rows_.size();
++}
++
++std::size_t BeaconPeerTable::tracked_source_count() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return sources_.size();
++}
++
++uint64_t BeaconPeerTable::stat(IngestResult result) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    auto it = stats_.find(result);
++    return it == stats_.end() ? 0 : it->second;
++}
++
++uint64_t BeaconPeerTable::evicted() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return evicted_;
++}
++
++void BeaconPeerTable::clear() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    rows_.clear();
++    sources_.clear();
++    stats_.clear();
++    evicted_ = 0;
++    global_bucket_primed_ = false;
++}
++
++BeaconListener::BeaconListener() = default;
++
++BeaconListener::~BeaconListener() {
++    stop();
++}
++
++bool BeaconListener::is_running() const {
++    return running_.load();
++}
++
++void BeaconListener::set_self_port(int port) {
++    table_.set_self_port(port);
++}
++
++void BeaconListener::start(const std::string& instance_id, int self_port) {
++    std::lock_guard<std::mutex> lock(lifecycle_mtx_);
++    table_.set_self(instance_id, self_port);
++    if (running_.load()) return;
++
++#ifdef _WIN32
++    {
++        std::lock_guard<std::mutex> status_lock(status_mtx_);
++        supported_ = false;
++        error_ = "beacon_listen is not supported on Windows in this release";
++        sockets_status_ = nlohmann::json::array();
++    }
++    running_ = true;
++    LOG(WARNING, "BeaconListener") << "beacon_listen is not supported on Windows in this release"
++                                   << std::endl;
++#else
++    {
++        std::lock_guard<std::mutex> status_lock(status_mtx_);
++        supported_ = true;
++        error_.clear();
++        sockets_status_ = nlohmann::json::array();
++    }
++    {
++        std::lock_guard<std::mutex> cv_lock(cv_mtx_);
++        stop_ = false;
++    }
++    running_ = true;
++    worker_ = std::thread(&BeaconListener::thread_loop, this);
++    LOG(INFO, "BeaconListener") << "Listening for LAN beacons on UDP " << kBeaconPort << std::endl;
++#endif
++}
++
++void BeaconListener::stop() {
++    std::lock_guard<std::mutex> lock(lifecycle_mtx_);
++    if (!running_.load()) return;
++    {
++        std::lock_guard<std::mutex> cv_lock(cv_mtx_);
++        stop_ = true;
++    }
++    cv_.notify_all();
++    if (worker_.joinable()) worker_.join();
++    running_ = false;
++    table_.clear();
++    last_warning_.clear();
++    {
++        std::lock_guard<std::mutex> status_lock(status_mtx_);
++        sockets_status_ = nlohmann::json::array();
++        error_.clear();
++    }
++    LOG(INFO, "BeaconListener") << "Stopped listening for LAN beacons" << std::endl;
++}
++
++nlohmann::json BeaconListener::status_json() const {
++    if (!running_.load()) {
++        return {{"enabled", false}};
++    }
++    auto now = std::chrono::steady_clock::now();
++    nlohmann::json out = table_.to_json(now);
++    std::lock_guard<std::mutex> status_lock(status_mtx_);
++    bool listening = false;
++    for (const auto& s : sockets_status_) {
++        if (s.value("bound", false)) listening = true;
++    }
++    out["enabled"] = true;
++    out["supported"] = supported_;
++    out["listening"] = listening;
++    out["error"] = error_.empty() ? nlohmann::json(nullptr) : nlohmann::json(error_);
++    out["sockets"] = sockets_status_;
++    return out;
++}
++
++void BeaconListener::wait_slice() {
++    std::unique_lock<std::mutex> lock(cv_mtx_);
++    cv_.wait_for(lock, kPollSlice, [this] { return stop_.load(); });
++}
++
++void BeaconListener::log_rejection(IngestResult result, uint32_t src_ip) {
++    switch (result) {
++        case IngestResult::Accepted:
++        case IngestResult::Refreshed:
++        case IngestResult::Self:
++            return;
++        default:
++            break;
++    }
++    auto now = std::chrono::steady_clock::now();
++    auto it = last_warning_.find(result);
++    if (it != last_warning_.end() && now - it->second < std::chrono::seconds(60)) return;
++    last_warning_[result] = now;
++    LOG(WARNING, "BeaconListener") << "Dropped beacon from " << utils::ipv4_to_string(src_ip) << ": "
++                                   << ingest_result_name(result)
++                                   << " (further drops for this reason suppressed for 60s)" << std::endl;
++}
++
++void BeaconListener::publish_socket_status() {
++    nlohmann::json arr = nlohmann::json::array();
++    for (const auto& s : sockets_) {
++        arr.push_back({
++            {"address", s.address + ":" + std::to_string(kBeaconPort)},
++            {"bound", s.bound},
++            {"error", s.error.empty() ? nlohmann::json(nullptr) : nlohmann::json(s.error)},
++        });
++    }
++    std::lock_guard<std::mutex> status_lock(status_mtx_);
++    sockets_status_ = std::move(arr);
++}
++
++#ifdef _WIN32
++
++void BeaconListener::thread_loop() {}
++void BeaconListener::refresh_sockets() {}
++void BeaconListener::close_all_sockets() {}
++
++#else
++
++void BeaconListener::close_all_sockets() {
++    for (auto& s : sockets_) {
++        if (s.fd >= 0) close(s.fd);
++        s.fd = -1;
++        s.bound = false;
++    }
++    sockets_.clear();
++}
++
++void BeaconListener::refresh_sockets() {
++    NetworkBeacon probe;
++    auto ifaces = probe.getLocalRFC1918Interfaces();
++
++    std::vector<uint32_t> local_addrs;
++    std::set<uint32_t> desired;
++    for (const auto& iface : ifaces) {
++        in_addr ip{};
++        if (inet_pton(AF_INET, iface.ipAddress.c_str(), &ip) != 1) continue;
++        uint32_t ip_host = ntohl(ip.s_addr);
++        local_addrs.push_back(ip_host);
++        if ((ip_host & 0xFF000000u) == 0x7F000000u) continue;
++        in_addr bcast{};
++        if (inet_pton(AF_INET, iface.broadcastAddress.c_str(), &bcast) != 1) continue;
++        desired.insert(ntohl(bcast.s_addr));
++    }
++    desired.insert(0xFFFFFFFFu);
++    table_.set_local_addresses(std::move(local_addrs));
++
++    for (auto it = sockets_.begin(); it != sockets_.end();) {
++        if (desired.count(it->bind_ip) == 0) {
++            if (it->fd >= 0) close(it->fd);
++            it = sockets_.erase(it);
++        } else {
++            ++it;
++        }
++    }
++
++    for (uint32_t addr : desired) {
++        auto existing = std::find_if(sockets_.begin(), sockets_.end(),
++                                     [addr](const SocketState& s) { return s.bind_ip == addr; });
++        if (existing == sockets_.end()) {
++            SocketState s;
++            s.address = utils::ipv4_to_string(addr);
++            s.bind_ip = addr;
++            sockets_.push_back(s);
++            existing = sockets_.end() - 1;
++        }
++        if (existing->bound) continue;
++
++        int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++        if (fd < 0) {
++            existing->error = std::string("socket: ") + std::strerror(errno);
++            continue;
++        }
++        int one = 1;
++        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++        sockaddr_in sa{};
++        sa.sin_family = AF_INET;
++        sa.sin_port = htons(kBeaconPort);
++        sa.sin_addr.s_addr = htonl(addr);
++        if (bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
++            existing->error = std::string("bind: ") + std::strerror(errno);
++            close(fd);
++            continue;
++        }
++        existing->fd = fd;
++        existing->bound = true;
++        existing->error.clear();
++    }
++    publish_socket_status();
++}
++
++void BeaconListener::thread_loop() {
++    auto next_refresh = std::chrono::steady_clock::now();
++    char buf[kMaxDatagram];
++
++    while (!stop_.load()) {
++        auto now = std::chrono::steady_clock::now();
++        if (now >= next_refresh) {
++            refresh_sockets();
++            next_refresh = now + kIfaceRefresh;
++        }
++
++        std::vector<pollfd> fds;
++        std::vector<size_t> owners;
++        for (size_t i = 0; i < sockets_.size(); ++i) {
++            if (!sockets_[i].bound) continue;
++            fds.push_back({sockets_[i].fd, POLLIN, 0});
++            owners.push_back(i);
++        }
++        if (fds.empty()) {
++            wait_slice();
++            continue;
++        }
++
++        int rc = poll(fds.data(), static_cast<nfds_t>(fds.size()),
++                      static_cast<int>(kPollSlice.count()));
++        if (rc < 0) {
++            if (errno != EINTR) wait_slice();
++            continue;
++        }
++
++        bool socket_state_changed = false;
++        for (size_t k = 0; k < fds.size(); ++k) {
++            if (fds[k].revents == 0) continue;
++            auto& sock = sockets_[owners[k]];
++            if (fds[k].revents & (POLLERR | POLLNVAL)) {
++                close(sock.fd);
++                sock.fd = -1;
++                sock.bound = false;
++                sock.error = "socket error; rebinding at next refresh";
++                socket_state_changed = true;
++                continue;
++            }
++            for (int drained = 0; drained < 64; ++drained) {
++                sockaddr_in from{};
++                socklen_t from_len = sizeof(from);
++                int flags = MSG_DONTWAIT;
++#ifdef __linux__
++                flags |= MSG_TRUNC;
++#endif
++                ssize_t n = recvfrom(sock.fd, buf, sizeof(buf), flags,
++                                     reinterpret_cast<sockaddr*>(&from), &from_len);
++                if (n < 0) {
++                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
++                    sock.error = std::string("recvfrom: ") + std::strerror(errno);
++                    close(sock.fd);
++                    sock.fd = -1;
++                    sock.bound = false;
++                    socket_state_changed = true;
++                    break;
++                }
++                size_t received = static_cast<size_t>(n);
++                bool truncated = received >= sizeof(buf);
++                size_t len = std::min(received, sizeof(buf));
++                uint32_t src = ntohl(from.sin_addr.s_addr);
++                IngestResult result =
++                    table_.ingest(buf, len, truncated, src, std::chrono::steady_clock::now());
++                log_rejection(result, src);
++            }
++        }
++        if (socket_state_changed) publish_socket_status();
++        table_.expire(std::chrono::steady_clock::now());
++    }
++
++    close_all_sockets();
++}
++
++#endif
++
++} // namespace lemon
+diff --git a/src/cpp/server/utils/network_beacon.cpp b/src/cpp/server/utils/network_beacon.cpp
+index 7018e91db..ffce95ce7 100644
+--- a/src/cpp/server/utils/network_beacon.cpp
++++ b/src/cpp/server/utils/network_beacon.cpp
+@@ -8,6 +8,10 @@
+ #include <stdexcept>
+ #include <thread>
+ 
++#include <nlohmann/json.hpp>
++
++#include "lemon/utils/beacon_listener.h"
++
+ #ifdef _WIN32
+     #include <ws2tcpip.h>
+     #include <iphlpapi.h>
+@@ -83,14 +87,7 @@ bool NetworkBeacon::isRFC1918(const std::string& ipAddress) {
+     // Convert to host byte order for easier comparison
+     uint32_t ip = ntohl(addr.s_addr);
+ 
+-    // 10.0.0.0/8
+-    if ((ip & 0xFF000000) == 0x0A000000) return true;
+-
+-    // 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
+-    if ((ip & 0xFFF00000) == 0xAC100000) return true;
+-
+-    // 192.168.0.0/16
+-    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
++    if (lemon::utils::is_rfc1918_ipv4(ip)) return true;
+ 
+     // 127.0.0.0/8 (loopback)
+     if ((ip & 0xFF000000) == 0x7F000000) return true;
+@@ -183,15 +180,22 @@ std::vector<NetworkInterfaceInfo> NetworkBeacon::getLocalRFC1918Interfaces() {
+ }
+ 
+ std::string NetworkBeacon::buildStandardPayloadPattern(std::string hostname, std::string hostUrl) {
+-    std::stringstream ss;
+-
+-    ss << "{";
+-    ss << "\"service\": \"lemonade\", ";
+-    ss << "\"hostname\": \"" << hostname << "\", ";
+-    ss << "\"url\": \"" << hostUrl << "\"";
+-    ss << "}";
++    std::string instanceId;
++    {
++        std::lock_guard<std::mutex> lock(_netMtx);
++        instanceId = _instanceId;
++    }
++    nlohmann::json j = {{"service", "lemonade"}, {"hostname", hostname}, {"url", hostUrl}};
++    if (!instanceId.empty()) {
++        j["instance_id"] = instanceId;
++    }
++    // replace, not strict: a non-UTF-8 hostname must not throw on the broadcast thread.
++    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
++}
+ 
+-    return ss.str();
++void NetworkBeacon::setInstanceId(const std::string& id) {
++    std::lock_guard<std::mutex> lock(_netMtx);
++    _instanceId = id;
+ }
+ 
+ void NetworkBeacon::startBroadcasting(int beaconPort, int serverPort, uint16_t intervalSeconds) {
+@@ -244,6 +248,9 @@ void NetworkBeacon::broadcastThreadLoop() {
+     loopbackAddr.sin_port = htons(port);
+     loopbackAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+ 
++    bool loggedFailure = false;
++    std::chrono::steady_clock::time_point lastFailureLog;
++
+     while (true)
+     {
+         {
+@@ -251,46 +258,55 @@ void NetworkBeacon::broadcastThreadLoop() {
+             if (!_netThreadRunning) break;
+         }
+ 
+-        // Enumerate all RFC1918 interfaces and send a beacon on each
+-        auto interfaces = getLocalRFC1918Interfaces();
+-        for (const auto& iface : interfaces) {
+-            // Skip loopback interfaces here, handled separately below
+-            struct sockaddr_in loopCheck{};
+-            if (inet_pton(AF_INET, iface.ipAddress.c_str(), &loopCheck.sin_addr) == 1) {
+-                uint32_t ip = ntohl(loopCheck.sin_addr.s_addr);
+-                if ((ip & 0xFF000000u) == 0x7F000000u) continue;
++        try {
++            // Enumerate all RFC1918 interfaces and send a beacon on each
++            auto interfaces = getLocalRFC1918Interfaces();
++            for (const auto& iface : interfaces) {
++                // Skip loopback interfaces here, handled separately below
++                struct sockaddr_in loopCheck{};
++                if (inet_pton(AF_INET, iface.ipAddress.c_str(), &loopCheck.sin_addr) == 1) {
++                    uint32_t ip = ntohl(loopCheck.sin_addr.s_addr);
++                    if ((ip & 0xFF000000u) == 0x7F000000u) continue;
++                }
++
++                std::string payload = buildStandardPayloadPattern(
++                    hostname,
++                    "http://" + iface.ipAddress + ":" + std::to_string(serverPort) + "/api/v1/"
++                );
++
++                sockaddr_in destAddr{};
++                destAddr.sin_family = AF_INET;
++                destAddr.sin_port = htons(port);
++                inet_pton(AF_INET, iface.broadcastAddress.c_str(), &destAddr.sin_addr);
++
++                if (sendto(_socket, payload.c_str(), (int)payload.size(), 0, (sockaddr*)&destAddr, sizeof(destAddr)) == -1) {
++#ifdef _WIN32
++                    std::cerr << "[NetworkBeacon] sendto failed, error=" << WSAGetLastError() << std::endl;
++#else
++                    std::cerr << "[NetworkBeacon] sendto failed, errno=" << errno << std::endl;
++#endif
++                }
+             }
+ 
+-            std::string payload = buildStandardPayloadPattern(
++            // Always send on loopback for same-machine discovery
++            std::string loopbackPayload = buildStandardPayloadPattern(
+                 hostname,
+-                "http://" + iface.ipAddress + ":" + std::to_string(serverPort) + "/api/v1/"
++                "http://127.0.0.1:" + std::to_string(serverPort) + "/api/v1/"
+             );
+-
+-            sockaddr_in destAddr{};
+-            destAddr.sin_family = AF_INET;
+-            destAddr.sin_port = htons(port);
+-            inet_pton(AF_INET, iface.broadcastAddress.c_str(), &destAddr.sin_addr);
+-
+-            if (sendto(_socket, payload.c_str(), (int)payload.size(), 0, (sockaddr*)&destAddr, sizeof(destAddr)) == -1) {
++            if (sendto(_socket, loopbackPayload.c_str(), (int)loopbackPayload.size(), 0, (sockaddr*)&loopbackAddr, sizeof(loopbackAddr)) == -1) {
+ #ifdef _WIN32
+                 std::cerr << "[NetworkBeacon] sendto failed, error=" << WSAGetLastError() << std::endl;
+ #else
+                 std::cerr << "[NetworkBeacon] sendto failed, errno=" << errno << std::endl;
+ #endif
+             }
+-        }
+-
+-        // Always send on loopback for same-machine discovery
+-        std::string loopbackPayload = buildStandardPayloadPattern(
+-            hostname,
+-            "http://127.0.0.1:" + std::to_string(serverPort) + "/api/v1/"
+-        );
+-        if (sendto(_socket, loopbackPayload.c_str(), (int)loopbackPayload.size(), 0, (sockaddr*)&loopbackAddr, sizeof(loopbackAddr)) == -1) {
+-#ifdef _WIN32
+-            std::cerr << "[NetworkBeacon] sendto failed, error=" << WSAGetLastError() << std::endl;
+-#else
+-            std::cerr << "[NetworkBeacon] sendto failed, errno=" << errno << std::endl;
+-#endif
++        } catch (const std::exception& e) {
++            auto now = std::chrono::steady_clock::now();
++            if (!loggedFailure || now - lastFailureLog >= std::chrono::seconds(60)) {
++                std::cerr << "[NetworkBeacon] beacon send failed: " << e.what() << std::endl;
++                lastFailureLog = now;
++                loggedFailure = true;
++            }
+         }
+ 
+         std::this_thread::sleep_for(std::chrono::seconds(interval));
+diff --git a/test/cpp/test_beacon_listener_socket.cpp b/test/cpp/test_beacon_listener_socket.cpp
+new file mode 100644
+index 000000000..0a2d222d5
+--- /dev/null
++++ b/test/cpp/test_beacon_listener_socket.cpp
+@@ -0,0 +1,187 @@
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <chrono>
++#include <cstdio>
++#include <functional>
++#include <string>
++#include <thread>
++
++#include <nlohmann/json.hpp>
++#include <lemon/utils/beacon_listener.h>
++#include <lemon/utils/network_beacon.h>
++
++#include "test_config_helpers.h"
++
++using json = nlohmann::json;
++using lemon::BeaconListener;
++using test_helpers::check;
++
++namespace {
++
++int bind_wildcard_no_reuse() {
++    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    if (fd < 0) return -1;
++    sockaddr_in sa{};
++    sa.sin_family = AF_INET;
++    sa.sin_port = htons(lemon::kBeaconPort);
++    sa.sin_addr.s_addr = htonl(INADDR_ANY);
++    if (bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
++        int err = errno;
++        close(fd);
++        errno = err;
++        return -1;
++    }
++    return fd;
++}
++
++bool wait_for(const std::function<bool()>& pred, std::chrono::milliseconds timeout) {
++    auto deadline = std::chrono::steady_clock::now() + timeout;
++    while (std::chrono::steady_clock::now() < deadline) {
++        if (pred()) return true;
++        std::this_thread::sleep_for(std::chrono::milliseconds(50));
++    }
++    return pred();
++}
++
++} // namespace
++
++int main() {
++    std::puts("=== RUNNING BEACON LISTENER SOCKET TESTS ===");
++
++    int probe = bind_wildcard_no_reuse();
++    if (probe < 0) {
++        std::printf("[SKIP] UDP %d is already held by another process (errno=%d)\n", lemon::kBeaconPort, errno);
++        return 0;
++    }
++    close(probe);
++
++    {
++        BeaconListener listener;
++        listener.start("1111111111111111", 18999);
++        bool listening = wait_for([&] { return listener.status_json().value("listening", false); },
++                                  std::chrono::milliseconds(2000));
++        check(listening, "listener reports listening with at least one bound socket");
++        json st = listener.status_json();
++        check(st["enabled"] == true && st["supported"] == true, "status is enabled and supported");
++        check(st["sockets"].is_array() && !st["sockets"].empty(), "sockets[] is non-empty");
++        bool has_limited = false;
++        for (const auto& s : st["sockets"]) {
++            if (s["address"] == "255.255.255.255:13305") has_limited = true;
++            if (s["address"] == "0.0.0.0:13305") check(false, "listener never binds INADDR_ANY");
++        }
++        check(has_limited, "limited broadcast address is bound");
++
++        int fd = bind_wildcard_no_reuse();
++        check(fd < 0 && errno == EADDRINUSE, "non-reuse wildcard bind fails while listener runs");
++        if (fd >= 0) close(fd);
++
++        NetworkBeacon nb;
++        std::string iface_ip;
++        std::string iface_bcast;
++        for (const auto& iface : nb.getLocalRFC1918Interfaces()) {
++            if (iface.ipAddress.rfind("127.", 0) == 0) continue;
++            iface_ip = iface.ipAddress;
++            iface_bcast = iface.broadcastAddress;
++            break;
++        }
++        if (iface_ip.empty()) {
++            std::puts("[SKIP] no RFC1918 interface; broadcast receive not tested");
++        } else {
++            int tx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++            int one = 1;
++            setsockopt(tx, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
++            sockaddr_in to{};
++            to.sin_family = AF_INET;
++            to.sin_port = htons(lemon::kBeaconPort);
++            inet_pton(AF_INET, iface_bcast.c_str(), &to.sin_addr);
++            std::string good_url = "http://" + iface_ip + ":65001/api/v1/";
++            std::string good = json({{"service", "lemonade"},
++                                     {"hostname", "peer-test"},
++                                     {"url", good_url},
++                                     {"instance_id", "abcdef0123456789"}})
++                                   .dump();
++            std::string mismatch = json({{"service", "lemonade"},
++                                         {"hostname", "peer-mismatch"},
++                                         {"url", "http://10.9.9.9:1/api/v1/"}})
++                                       .dump();
++            std::string self = json({{"service", "lemonade"},
++                                     {"hostname", "self"},
++                                     {"url", "http://" + iface_ip + ":18999/api/v1/"},
++                                     {"instance_id", "1111111111111111"}})
++                                   .dump();
++            for (const auto* p : {&good, &mismatch, &self}) {
++                sendto(tx, p->data(), p->size(), 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
++            }
++            close(tx);
++
++            bool heard = wait_for(
++                [&] {
++                    json st_now = listener.status_json();
++                    for (const auto& h : st_now["hosts"]) {
++                        if (h["url"] == good_url) return true;
++                    }
++                    return false;
++                },
++                std::chrono::milliseconds(3000));
++            check(heard, ("directed broadcast to " + iface_bcast + " is listed").c_str());
++            json after = listener.status_json();
++            check(after["stats"]["url_mismatch"].get<int>() >= 1, "url mismatch beacon counted, not listed");
++            check(after["stats"]["self"].get<int>() >= 1, "own instance_id beacon counted as self");
++            bool self_listed = false;
++            for (const auto& h : after["hosts"]) {
++                if (h["instance_id"] == "1111111111111111" || h["url"] == "http://10.9.9.9:1/api/v1/") {
++                    self_listed = true;
++                }
++            }
++            check(!self_listed, "self and mismatched beacons are not listed");
++        }
++
++        auto t0 = std::chrono::steady_clock::now();
++        listener.stop();
++        auto dt = std::chrono::steady_clock::now() - t0;
++        check(dt < std::chrono::seconds(1), "stop() joins in under 1s");
++        check(listener.status_json() == json({{"enabled", false}}), "status is {enabled:false} after stop");
++
++        fd = bind_wildcard_no_reuse();
++        check(fd >= 0, "non-reuse wildcard bind succeeds after stop");
++        if (fd >= 0) close(fd);
++    }
++
++    {
++        int blocker = bind_wildcard_no_reuse();
++        check(blocker >= 0, "pre-occupy UDP 13305 without reuse");
++        BeaconListener listener;
++        listener.start("2222222222222222", 18999);
++        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
++        json st = listener.status_json();
++        check(st["listening"] == false, "listener reports not listening when every bind fails");
++        bool has_error = false;
++        for (const auto& s : st["sockets"]) {
++            if (!s["error"].is_null()) has_error = true;
++        }
++        check(has_error, "bind failure is reported per socket");
++        auto t0 = std::chrono::steady_clock::now();
++        listener.stop();
++        auto dt = std::chrono::steady_clock::now() - t0;
++        check(dt < std::chrono::seconds(1), "stop() during bind-retry joins in under 1s");
++        if (blocker >= 0) close(blocker);
++    }
++
++    {
++        BeaconListener listener;
++        listener.start("3333333333333333", 18999);
++        listener.start("3333333333333333", 18999);
++        check(listener.is_running(), "start() is idempotent");
++        listener.stop();
++        listener.stop();
++        check(!listener.is_running(), "stop() is idempotent");
++        listener.start("3333333333333333", 18999);
++        check(listener.is_running(), "listener restarts after stop()");
++    }
++
++    return test_helpers::report_results("beacon listener socket");
++}
+diff --git a/test/cpp/test_beacon_peer_table.cpp b/test/cpp/test_beacon_peer_table.cpp
+new file mode 100644
+index 000000000..2866dfba5
+--- /dev/null
++++ b/test/cpp/test_beacon_peer_table.cpp
+@@ -0,0 +1,398 @@
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <vector>
++
++#include <nlohmann/json.hpp>
++#include <lemon/utils/beacon_listener.h>
++#include <lemon/utils/network_beacon.h>
++
++#include "test_config_helpers.h"
++
++using json = nlohmann::json;
++using lemon::BeaconPeerTable;
++using lemon::IngestResult;
++using test_helpers::check;
++using Clock = std::chrono::steady_clock;
++
++namespace {
++
++uint32_t ip(int a, int b, int c, int d) {
++    return (static_cast<uint32_t>(a) << 24) | (static_cast<uint32_t>(b) << 16) |
++           (static_cast<uint32_t>(c) << 8) | static_cast<uint32_t>(d);
++}
++
++std::string dotted(uint32_t v) {
++    return lemon::utils::ipv4_to_string(v);
++}
++
++std::string beacon(const std::string& url, const std::string& hostname = "peer",
++                   const std::string& instance_id = "") {
++    json j = {{"service", "lemonade"}, {"hostname", hostname}, {"url", url}};
++    if (!instance_id.empty()) j["instance_id"] = instance_id;
++    return j.dump();
++}
++
++std::string url_for(uint32_t host, int port = 13305) {
++    return "http://" + dotted(host) + ":" + std::to_string(port) + "/api/v1/";
++}
++
++IngestResult feed(BeaconPeerTable& t, const std::string& payload, uint32_t src, Clock::time_point now,
++                  bool truncated = false) {
++    return t.ingest(payload.data(), payload.size(), truncated, src, now);
++}
++
++void test_basic(Clock::time_point t0) {
++    BeaconPeerTable t;
++    t.set_self("ffffffffffffffff", 13305);
++    uint32_t src = ip(192, 168, 1, 40);
++    std::string p = beacon(url_for(src), "ai4", "0a1b2c3d4e5f6071");
++    check(feed(t, p, src, t0) == IngestResult::Accepted, "basic: first beacon is Accepted");
++    check(feed(t, p, src, t0 + std::chrono::seconds(2)) == IngestResult::Refreshed,
++          "basic: repeat 2s later is Refreshed");
++    check(t.size() == 1, "basic: table size stays 1");
++    auto hosts = t.hosts();
++    check(hosts.size() == 1 && hosts[0].last_seen == t0 + std::chrono::seconds(2),
++          "basic: last_seen advanced");
++    json j = t.to_json(t0 + std::chrono::seconds(2));
++    check(j["hosts"].size() == 1 && j["hosts"][0]["hostname"] == "ai4" &&
++              j["hosts"][0]["source_ip"] == "192.168.1.40" &&
++              j["hosts"][0]["instance_id"] == "0a1b2c3d4e5f6071",
++          "basic: to_json lists the host");
++    check(j["distinct_instances"] == 1, "basic: distinct_instances is 1");
++    check(j["stats"]["accepted"] == 1 && j["stats"]["refreshed"] == 1, "basic: stats counted");
++}
++
++void test_source_class(Clock::time_point t0) {
++    std::vector<uint32_t> bad = {ip(8, 8, 8, 8),   ip(169, 254, 1, 2), ip(100, 64, 0, 1),
++                                 ip(224, 0, 0, 1), ip(0, 0, 0, 0),     ip(255, 255, 255, 255),
++                                 ip(127, 0, 0, 1), ip(172, 32, 0, 1)};
++    for (uint32_t src : bad) {
++        BeaconPeerTable t;
++        bool ok = feed(t, beacon(url_for(src)), src, t0) == IngestResult::BadSource;
++        check(ok, ("source class: " + dotted(src) + " is BadSource").c_str());
++    }
++    std::vector<uint32_t> good = {ip(10, 0, 0, 1), ip(172, 16, 0, 1), ip(172, 31, 255, 254),
++                                  ip(192, 168, 0, 1)};
++    for (uint32_t src : good) {
++        BeaconPeerTable t;
++        bool ok = feed(t, beacon(url_for(src)), src, t0) == IngestResult::Accepted;
++        check(ok, ("source class: " + dotted(src) + " is accepted").c_str());
++    }
++}
++
++void test_url_binding(Clock::time_point t0) {
++    uint32_t src = ip(192, 168, 1, 40);
++    {
++        BeaconPeerTable t;
++        check(feed(t, beacon(url_for(ip(192, 168, 1, 41))), src, t0) == IngestResult::UrlMismatch,
++              "url: host differing from source is UrlMismatch");
++        check(t.stat(IngestResult::UrlMismatch) == 1, "url: url_mismatch counted");
++    }
++    std::vector<std::string> bad = {
++        "https://192.168.1.40:13305/api/v1/",
++        "http://ai4.local:13305/api/v1/",
++        "http://192.168.1.40/api/v1/",
++        "http://192.168.1.40:0/api/v1/",
++        "http://192.168.1.40:70000/api/v1/",
++        "http://192.168.001.40:13305/api/v1/",
++        "http://192.168.1.40:013305/api/v1/",
++        "http://192.168.1.40:13305/v1/",
++        "http://192.168.1.40:13305/api/v1/x",
++        "http://user@192.168.1.40:13305/api/v1/",
++        "http://192.168.1.40:13305/api/v1",
++        "http://192.168.1:13305/api/v1/",
++        "http://192.168.1.256:13305/api/v1/",
++    };
++    for (const auto& url : bad) {
++        BeaconPeerTable t;
++        bool ok = feed(t, beacon(url), src, t0) == IngestResult::BadPayload;
++        check(ok, ("url: '" + url + "' is BadPayload").c_str());
++    }
++}
++
++void test_payload_structure(Clock::time_point t0) {
++    uint32_t src = ip(10, 1, 2, 3);
++    std::string good_url = url_for(src);
++    std::vector<std::pair<std::string, std::string>> bad = {
++        {"not json", "non-JSON"},
++        {"[1,2,3]", "JSON array"},
++        {json({{"service", "other"}, {"hostname", "h"}, {"url", good_url}}).dump(), "service != lemonade"},
++        {json({{"service", "lemonade"}, {"hostname", "h"}, {"url", 5}}).dump(), "non-string url"},
++        {json({{"service", "lemonade"}, {"hostname", 7}, {"url", good_url}}).dump(), "non-string hostname"},
++        {json({{"service", "lemonade"}, {"url", good_url}}).dump(), "missing hostname"},
++        {beacon(good_url, "h", "XYZ"), "non-hex instance_id"},
++        {beacon(good_url, "h", std::string(33, 'a')), "33-char instance_id"},
++        {json({{"service", "lemonade"}, {"hostname", "h"}, {"url", good_url}, {"instance_id", 12}}).dump(),
++         "non-string instance_id"},
++        {"{\"service\":\"lemonade\",\"hostname\":\"h\",\"url\":", "truncated JSON"},
++    };
++    for (const auto& [payload, desc] : bad) {
++        BeaconPeerTable t;
++        bool ok = false;
++        try {
++            ok = feed(t, payload, src, t0) == IngestResult::BadPayload;
++        } catch (...) {
++            ok = false;
++        }
++        check(ok, ("payload: " + desc + " is BadPayload and does not throw").c_str());
++    }
++    {
++        BeaconPeerTable t;
++        check(feed(t, beacon(good_url), src, t0, true) == IngestResult::BadPayload,
++              "payload: truncated flag is BadPayload");
++    }
++    {
++        BeaconPeerTable t;
++        check(t.ingest("", 0, false, src, t0) == IngestResult::BadPayload, "payload: len 0 is BadPayload");
++    }
++    {
++        BeaconPeerTable t;
++        std::string big = beacon(good_url, std::string(1100, 'a'));
++        check(feed(t, big, src, t0) == IngestResult::BadPayload, "payload: >= 1024 bytes is BadPayload");
++    }
++    {
++        BeaconPeerTable t;
++        json j = {{"service", "lemonade"}, {"hostname", "h"}, {"url", good_url}, {"extra", {1, 2}}};
++        check(feed(t, j.dump(), src, t0) == IngestResult::Accepted, "payload: unknown fields are ignored");
++    }
++}
++
++void test_hostname_sanitising(Clock::time_point t0) {
++    uint32_t src = ip(192, 168, 7, 7);
++    std::vector<std::string> raws = {std::string(300, 'x'), "we\"ird", "new\nline", "<script>",
++                                     std::string("bad\xC3\x28utf8")};
++    for (const auto& raw : raws) {
++        BeaconPeerTable t;
++        std::string payload = "{\"service\":\"lemonade\",\"hostname\":\"";
++        for (char c : raw) {
++            if (c == '"') payload += "\\\"";
++            else if (c == '\n') payload += "\\n";
++            else payload += c;
++        }
++        payload += "\",\"url\":\"" + url_for(src) + "\"}";
++        IngestResult r = feed(t, payload, src, t0);
++        bool accepted = r == IngestResult::Accepted;
++        auto hosts = t.hosts();
++        bool clean = accepted && hosts.size() == 1 && hosts[0].hostname.size() <= 253 &&
++                     hosts[0].hostname.find_first_not_of(
++                         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") ==
++                         std::string::npos;
++        check(clean, "hostname: accepted and sanitised to [A-Za-z0-9._-]{1,253}");
++        json j = t.to_json(t0);
++        json round = json::parse(j.dump(), nullptr, false);
++        check(!round.is_discarded() && round["hosts"].size() == 1, "hostname: to_json round-trips");
++    }
++    {
++        BeaconPeerTable t;
++        std::string payload = json({{"service", "lemonade"}, {"hostname", "b\xEF\xBF\xBDx"}, {"url", url_for(src)}})
++                                  .dump();
++        check(feed(t, payload, src, t0) == IngestResult::Accepted && t.hosts()[0].hostname == "b___x",
++              "hostname: U+FFFD from a sanitising broadcaster becomes underscores");
++    }
++    {
++        BeaconPeerTable t;
++        check(feed(t, beacon(url_for(src), ""), src, t0) == IngestResult::Accepted &&
++                  t.hosts()[0].hostname == "_",
++              "hostname: empty becomes '_'");
++    }
++}
++
++void test_broadcaster_payload() {
++    NetworkBeacon nb;
++    std::string bad_host = std::string("h\xC3\x28") + "\"q";
++    bool threw = false;
++    std::string out;
++    try {
++        out = nb.buildStandardPayloadPattern(bad_host, "http://192.168.1.40:13305/api/v1/");
++    } catch (...) {
++        threw = true;
++    }
++    check(!threw, "broadcaster: invalid UTF-8 hostname does not throw");
++    json j = json::parse(out, nullptr, false);
++    check(!j.is_discarded() && j["service"] == "lemonade" && j["hostname"].is_string() &&
++              j["url"] == "http://192.168.1.40:13305/api/v1/",
++          "broadcaster: output parses with service/hostname/url");
++    check(!j.is_discarded() && !j.contains("instance_id"), "broadcaster: no instance_id until set");
++
++    nb.setInstanceId("9f3c2a61d04b7e18");
++    json j2 = json::parse(nb.buildStandardPayloadPattern("ai4", "http://192.168.1.40:13305/api/v1/"),
++                          nullptr, false);
++    check(!j2.is_discarded() && j2.value("instance_id", "") == "9f3c2a61d04b7e18",
++          "broadcaster: instance_id included after setInstanceId");
++}
++
++void test_self_filter(Clock::time_point t0) {
++    uint32_t local = ip(192, 168, 1, 10);
++    BeaconPeerTable t;
++    t.set_self("9f3c2a61d04b7e18", 13305);
++    t.set_local_addresses({local, ip(127, 0, 0, 1)});
++    check(feed(t, beacon(url_for(local), "me", "9f3c2a61d04b7e18"), local, t0) == IngestResult::Self,
++          "self: matching instance_id is Self");
++    check(feed(t, beacon(url_for(local), "me"), local, t0) == IngestResult::Self,
++          "self: legacy beacon from local address with our port is Self");
++    check(feed(t, beacon(url_for(local, 13306), "other"), local, t0) == IngestResult::Accepted,
++          "self: local address with a different port is Accepted");
++    check(feed(t, beacon(url_for(local), "me2", "0000000000000001"), local, t0 + std::chrono::seconds(1)) ==
++              IngestResult::Accepted,
++          "self: different instance_id from a local address is Accepted");
++
++    BeaconPeerTable t2;
++    t2.set_self("9f3c2a61d04b7e18", 13305);
++    t2.set_local_addresses({local});
++    t2.set_self_port(9000);
++    check(feed(t2, beacon(url_for(local), "me"), local, t0) == IngestResult::Accepted,
++          "self: after set_self_port(9000), legacy port 13305 from local is Accepted");
++}
++
++void test_expiry(Clock::time_point t0) {
++    BeaconPeerTable t;
++    uint32_t src = ip(10, 0, 0, 5);
++    feed(t, beacon(url_for(src)), src, t0);
++    t.expire(t0 + std::chrono::seconds(14));
++    check(t.size() == 1, "expiry: row kept at 14s");
++    check(t.to_json(t0 + std::chrono::seconds(16))["hosts"].empty(), "expiry: to_json hides expired rows");
++    t.expire(t0 + std::chrono::seconds(16));
++    check(t.size() == 0, "expiry: row removed at 16s");
++
++    // Once expired, the source is no longer pinned and must pay the global
++    // bucket again; exhaust the global bucket and confirm it is refused.
++    BeaconPeerTable t2;
++    feed(t2, beacon(url_for(src)), src, t0);
++    auto t1 = t0 + std::chrono::seconds(16);
++    for (int i = 0; i < 1100; ++i) {
++        uint32_t s = ip(10, 1, (i >> 8) & 0xFF, i & 0xFF);
++        feed(t2, beacon(url_for(s)), s, t1);
++    }
++    check(feed(t2, beacon(url_for(src)), src, t1) == IngestResult::RateLimited,
++          "expiry: expired source is unpinned and subject to the global bucket");
++}
++
++void test_cap_and_eviction(Clock::time_point t0) {
++    BeaconPeerTable t;
++    for (int i = 0; i < 32; ++i) {
++        uint32_t s = ip(10, 0, 1, i + 1);
++        feed(t, beacon(url_for(s)), s, t0 + std::chrono::milliseconds(i));
++    }
++    check(t.size() == 32, "cap: 32 rows accepted");
++    uint32_t extra = ip(10, 0, 2, 1);
++    check(feed(t, beacon(url_for(extra)), extra, t0 + std::chrono::seconds(1)) == IngestResult::TableFull,
++          "cap: 33rd key while all rows are fresh is TableFull");
++    check(t.size() == 32, "cap: size stays 32");
++
++    BeaconPeerTable t2;
++    uint32_t stale = ip(10, 0, 3, 1);
++    feed(t2, beacon(url_for(stale)), stale, t0);
++    for (int i = 0; i < 31; ++i) {
++        uint32_t s = ip(10, 0, 4, i + 1);
++        feed(t2, beacon(url_for(s)), s, t0 + std::chrono::seconds(8));
++    }
++    uint32_t newcomer = ip(10, 0, 5, 1);
++    check(feed(t2, beacon(url_for(newcomer)), newcomer, t0 + std::chrono::seconds(9)) == IngestResult::Accepted,
++          "eviction: new key accepted when oldest row is 9s stale");
++    check(t2.evicted() == 1, "eviction: evicted counter is 1");
++    check(t2.size() == 32, "eviction: size stays 32");
++}
++
++void test_rate_limit_global(Clock::time_point t0) {
++    BeaconPeerTable t;
++    int admitted = 0;
++    for (int i = 0; i < 2000; ++i) {
++        uint32_t s = ip(10, 2, (i >> 8) & 0xFF, i & 0xFF);
++        if (feed(t, beacon(url_for(s)), s, t0) != IngestResult::RateLimited) ++admitted;
++    }
++    check(admitted <= 1000, "global rate: at most 1000 admitted at one instant");
++    check(admitted >= 990, "global rate: burst of about 1000 admitted");
++    check(t.tracked_source_count() <= lemon::kMaxSources + lemon::kMaxHosts,
++          "global rate: tracked sources stay bounded");
++
++    int refill = 0;
++    auto t1 = t0 + std::chrono::seconds(1);
++    for (int i = 0; i < 1000; ++i) {
++        uint32_t s = ip(10, 3, (i >> 8) & 0xFF, i & 0xFF);
++        if (feed(t, beacon(url_for(s)), s, t1) != IngestResult::RateLimited) ++refill;
++    }
++    check(refill >= 490 && refill <= 510, "global rate: about 500 refilled after 1s");
++}
++
++void test_rate_limit_per_source(Clock::time_point t0) {
++    BeaconPeerTable t;
++    uint32_t src = ip(192, 168, 5, 5);
++    int admitted = 0;
++    int limited = 0;
++    for (int i = 0; i < 10; ++i) {
++        IngestResult r = feed(t, beacon(url_for(src)), src, t0);
++        if (r == IngestResult::RateLimited) ++limited;
++        else ++admitted;
++    }
++    check(admitted == 4 && limited == 6, "per-source: 4 admitted and 6 RateLimited");
++
++    BeaconPeerTable t2;
++    for (int i = 0; i < 500; ++i) {
++        uint32_t s = ip(10, 9, (i >> 8) & 0xFF, i & 0xFF);
++        feed(t2, beacon(url_for(ip(10, 250, 0, 1))), s, t0 + std::chrono::milliseconds(i));
++    }
++    check(t2.tracked_source_count() <= lemon::kMaxSources, "per-source: unpinned LRU never exceeds 64");
++}
++
++void test_flood_survival(Clock::time_point t0) {
++    BeaconPeerTable t;
++    std::vector<uint32_t> legit;
++    for (int i = 0; i < 32; ++i) legit.push_back(ip(192, 168, 1, 100 + i));
++    for (uint32_t s : legit) {
++        feed(t, beacon(url_for(s), "legit"), s, t0);
++    }
++
++    bool legit_ok = true;
++    uint64_t spoof_bad = 0;
++    uint64_t spoof_total = 0;
++    uint32_t rotating = 0;
++    for (int ms = 1; ms <= 20000; ++ms) {
++        auto now = t0 + std::chrono::milliseconds(ms);
++        uint32_t s = ip(10, 50 + ((rotating >> 16) & 0x3F), (rotating >> 8) & 0xFF, rotating & 0xFF);
++        ++rotating;
++        IngestResult r = feed(t, beacon(url_for(s), "spoof"), s, now);
++        ++spoof_total;
++        if (r == IngestResult::RateLimited || r == IngestResult::TableFull) ++spoof_bad;
++        if (ms % 2000 == 0) {
++            for (uint32_t l : legit) {
++                IngestResult lr = feed(t, beacon(url_for(l), "legit"), l, now);
++                if (lr != IngestResult::Refreshed) legit_ok = false;
++            }
++        }
++    }
++    auto end = t0 + std::chrono::milliseconds(20000);
++    t.expire(end);
++    auto hosts = t.hosts();
++    size_t legit_rows = 0;
++    for (const auto& h : hosts) {
++        if (h.hostname == "legit") ++legit_rows;
++    }
++    check(legit_ok, "flood: every legitimate refresh was admitted");
++    check(legit_rows == 32, "flood: all 32 legitimate rows present after 20s");
++    check(spoof_bad == spoof_total, "flood: every spoofed beacon was TableFull or RateLimited");
++    check(t.evicted() == 0, "flood: evicted stays 0");
++}
++
++} // namespace
++
++int main() {
++    std::puts("=== RUNNING BEACON PEER TABLE TESTS ===");
++    auto t0 = Clock::now();
++
++    test_basic(t0);
++    test_source_class(t0);
++    test_url_binding(t0);
++    test_payload_structure(t0);
++    test_hostname_sanitising(t0);
++    test_broadcaster_payload();
++    test_self_filter(t0);
++    test_expiry(t0);
++    test_cap_and_eviction(t0);
++    test_rate_limit_global(t0);
++    test_rate_limit_per_source(t0);
++    test_flood_survival(t0);
++
++    return test_helpers::report_results("beacon peer table");
++}
+diff --git a/test/cpp/test_config_discovery.cpp b/test/cpp/test_config_discovery.cpp
+index 7f21c9532..f1f728a3d 100644
+--- a/test/cpp/test_config_discovery.cpp
++++ b/test/cpp/test_config_discovery.cpp
+@@ -240,5 +240,38 @@ int main() {
+     }
+     fs::remove_all(malformed_dir);
+ 
++    // 11. beacon_listen: default, round-trip, and rejection of non-booleans
++    {
++        RuntimeConfig beacon_cfg(base_cfg);
++        check(beacon_cfg.beacon_listen() == false, "beacon_listen defaults to false");
++        beacon_cfg.set({{"beacon_listen", true}});
++        check(beacon_cfg.beacon_listen() == true, "beacon_listen set to true");
++        check(beacon_cfg.snapshot()["beacon_listen"] == true, "snapshot reflects beacon_listen: true");
++        beacon_cfg.set({{"beacon_listen", false}});
++        check(beacon_cfg.beacon_listen() == false, "beacon_listen set back to false");
++
++        bool threw_set = false;
++        try {
++            beacon_cfg.set({{"beacon_listen", "yes"}});
++        } catch (const std::invalid_argument&) {
++            threw_set = true;
++        }
++        check(threw_set, "set() rejects non-boolean beacon_listen");
++
++        bool threw_ctor = false;
++        try {
++            json bad = base_cfg;
++            bad["beacon_listen"] = "true";
++            RuntimeConfig bad_cfg(bad);
++        } catch (const std::invalid_argument&) {
++            threw_ctor = true;
++        }
++        check(threw_ctor, "constructor rejects non-boolean beacon_listen");
++
++        json defaults = ConfigFile::get_defaults();
++        check(defaults.contains("beacon_listen") && defaults["beacon_listen"] == false,
++              "ConfigFile defaults include beacon_listen: false");
++    }
++
+     return test_helpers::report_results("C++ config/discovery");
+ }
+-- 
+2.53.0
+

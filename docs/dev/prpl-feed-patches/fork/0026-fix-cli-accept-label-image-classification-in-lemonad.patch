@@ -1,0 +1,187 @@
+From 463a9866bacd3eb259182c7b6abe4a3d996d8e27 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 17:39:24 -0400
+Subject: [PATCH 26/58] fix(cli): accept --label image-classification in
+ lemonade pull
+
+A tflite model deploys as a text classifier unless its labels say
+otherwise, so registering a user.* image classifier from the CLI needs
+--label image-classification, which the CLI's allow-list rejected
+("image-classification not in {chat,...}"). The server already accepts
+the label for tflite.
+
+Move the allow-list into lemon_cli/pull_labels.h so a cpp-ci unit test
+(CliPullLabelsTest) can check it against the tflite descriptor.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                          | 19 ++++++++++
+ src/cpp/cli/main.cpp                    | 16 +-------
+ src/cpp/include/lemon_cli/pull_labels.h | 26 +++++++++++++
+ test/cpp/test_cli_pull_labels.cpp       | 50 +++++++++++++++++++++++++
+ 4 files changed, 97 insertions(+), 14 deletions(-)
+ create mode 100644 src/cpp/include/lemon_cli/pull_labels.h
+ create mode 100644 test/cpp/test_cli_pull_labels.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 85d189182..c2d6a5fc2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2789,6 +2789,25 @@ if(BUILD_TESTING AND EXISTS "${_BACKEND_MODE_CONTRACT_TEST_SRC}")
+     add_cpp_ci_test(BackendModeContractTest CI ON COMMAND test_backend_mode_contract)
+ endif()
+ 
++set(_CLI_PULL_LABELS_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_cli_pull_labels.cpp")
++if(BUILD_TESTING AND EXISTS "${_CLI_PULL_LABELS_TEST_SRC}")
++    add_executable(test_cli_pull_labels
++        test/cpp/test_cli_pull_labels.cpp
++        ${LEMON_BACKEND_DESCRIPTOR_SOURCES}
++    )
++    target_include_directories(test_cli_pull_labels PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
++        ${CMAKE_CURRENT_BINARY_DIR}/include
++    )
++    target_link_libraries(test_cli_pull_labels PRIVATE
++        nlohmann_json::nlohmann_json
++        lemonade-httplib
++    )
++
++    include(CTest)
++    add_cpp_ci_test(CliPullLabelsTest CI ON COMMAND test_cli_pull_labels)
++endif()
++
+ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_hrx_contract.cpp")
+     add_executable(test_hrx_contract test/cpp/test_hrx_contract.cpp)
+     target_link_libraries(test_hrx_contract PRIVATE lemonade-server-core)
+diff --git a/src/cpp/cli/main.cpp b/src/cpp/cli/main.cpp
+index d2a32b783..1cd32e362 100644
+--- a/src/cpp/cli/main.cpp
++++ b/src/cpp/cli/main.cpp
+@@ -2,6 +2,7 @@
+ #include "lemon_cli/model_selection.h"
+ #include "lemon_cli/recipe_import.h"
+ #include "lemon_cli/hf_pull.h"
++#include "lemon_cli/pull_labels.h"
+ #include "lemon_cli/bench.h"
+ #include "lemon_cli/chat_repl.h"
+ #include <lemon_cli/agent_config_file.h>
+@@ -50,19 +51,6 @@
+ 
+ #include "lemon/utils/aixlog.hpp"
+ 
+-static const std::vector<std::string> VALID_LABELS = {
+-    "chat",
+-    "coding",
+-    "dflash",
+-    "embeddings",
+-    "hot",
+-    "mtp",
+-    "reasoning",
+-    "reranking",
+-    "tool-calling",
+-    "vision"
+-};
+-
+ static const std::vector<std::string> SUPPORTED_AGENTS = {
+     "claude",
+     "codex",
+@@ -1658,7 +1646,7 @@ int main(int argc, char* argv[]) {
+         ->group("Manual Configuration Options")
+         ->type_name("LABEL")
+         ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll)
+-        ->check(CLI::IsMember(VALID_LABELS));
++        ->check(CLI::IsMember(lemon_cli::pull_labels()));
+     pull_cmd->add_option("--components", config.components,
+         "Components for a user.* omni collection (use with --recipe collection.omni). "
+         "Components must already be registered (built-in or previously pulled user.* models).")
+diff --git a/src/cpp/include/lemon_cli/pull_labels.h b/src/cpp/include/lemon_cli/pull_labels.h
+new file mode 100644
+index 000000000..f0e1a21a3
+--- /dev/null
++++ b/src/cpp/include/lemon_cli/pull_labels.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <string>
++#include <vector>
++
++namespace lemon_cli {
++
++// Labels `lemonade pull --label` accepts for a manual user.* registration.
++inline const std::vector<std::string>& pull_labels() {
++    static const std::vector<std::string> labels = {
++        "chat",
++        "coding",
++        "dflash",
++        "embeddings",
++        "hot",
++        "image-classification",
++        "mtp",
++        "reasoning",
++        "reranking",
++        "tool-calling",
++        "vision"
++    };
++    return labels;
++}
++
++} // namespace lemon_cli
+diff --git a/test/cpp/test_cli_pull_labels.cpp b/test/cpp/test_cli_pull_labels.cpp
+new file mode 100644
+index 000000000..ec2e0d7a3
+--- /dev/null
++++ b/test/cpp/test_cli_pull_labels.cpp
+@@ -0,0 +1,50 @@
++// A tflite model's default mode is text classification, so an image classifier
++// registered with `lemonade pull` needs `--label image-classification`; if the
++// CLI rejects that label the model can only be registered as a text classifier.
++
++#include "lemon/backends/backend_descriptor_registry.h"
++#include "lemon/model_types.h"
++#include "lemon_cli/pull_labels.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <string>
++
++using lemon::ModelType;
++
++namespace {
++
++int failures = 0;
++
++void check(const std::string& what, bool ok) {
++    std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
++    if (!ok) ++failures;
++}
++
++bool cli_accepts(const std::string& label) {
++    const auto& labels = lemon_cli::pull_labels();
++    return std::find(labels.begin(), labels.end(), label) != labels.end();
++}
++
++} // namespace
++
++int main() {
++    ModelType mode = ModelType::LLM;
++    check("image-classification names the IMAGE_CLASSIFICATION mode",
++          lemon::deployment_mode_of("image-classification", mode) &&
++              mode == ModelType::IMAGE_CLASSIFICATION);
++    check("tflite serves image-classification",
++          lemon::backends::backend_serves_mode("tflite", ModelType::IMAGE_CLASSIFICATION));
++    check("tflite defaults to a different mode, so the label is required",
++          lemon::backends::default_mode_for("tflite") != "image-classification");
++    check("lemonade pull --label accepts image-classification",
++          cli_accepts("image-classification"));
++
++    const auto& labels = lemon_cli::pull_labels();
++    check("pull labels are sorted and unique",
++          std::is_sorted(labels.begin(), labels.end()) &&
++              std::adjacent_find(labels.begin(), labels.end()) == labels.end());
++
++    std::printf("%d failure(s)\n", failures);
++    return failures == 0 ? 0 : 1;
++}
+-- 
+2.53.0
+

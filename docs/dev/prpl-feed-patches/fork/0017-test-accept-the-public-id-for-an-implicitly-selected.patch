@@ -1,0 +1,29 @@
+From aca315a14f8a7ed6aa1d2774149fdf712b8d7f13 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:25:56 -0400
+Subject: [PATCH 17/58] test: accept the public id for an implicitly selected
+ image model
+
+Assisted-by: claude:opus-5.5
+---
+ test/server_image_classify.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index f62081a3b..c5e3d58db 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -311,7 +311,9 @@ class ImageClassifyTests(ServerTestBase):
+         self._assert_status(response, 200, "classification")
+         body = response.json()
+         self.assertEqual(body["object"], "image_classification")
+-        self.assertEqual(body["model"], MODEL)
++        # The public id of a user model drops the "user." prefix when echoed
++        # for an implicitly selected model.
++        self.assertIn(body["model"], (MODEL, MODEL[len("user.") :]))
+         data = body["data"]
+         self.assertEqual(len(data), top_k)
+         scores = [d["score"] for d in data]
+-- 
+2.53.0
+

@@ -1,0 +1,37 @@
+From 26b1ad8cca074a8f4d72e64cc52a0e595028e449 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 26 Sep 2026 22:06:26 -0400
+Subject: [PATCH 06/58] feat(litert): add Gemma3-1B-IT-LiteRT as the suggested
+ litert model
+
+Flat ~0.5 GiB anonymous RSS across requests on a 2 GB x86 gateway, where
+Qwen3-0.6B peaks near 2 GiB. The repo is gated; pulls use HF_TOKEN.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/resources/server_models.json | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/cpp/resources/server_models.json b/src/cpp/resources/server_models.json
+index fe18ee9aa..e2c075016 100644
+--- a/src/cpp/resources/server_models.json
++++ b/src/cpp/resources/server_models.json
+@@ -2966,6 +2966,15 @@
+         "size": 81.0,
+         "min_resident_gb": 16.0
+     },
++    "Gemma3-1B-IT-LiteRT": {
++        "checkpoint": "litert-community/Gemma3-1B-IT:gemma3-1b-it-int4.litertlm",
++        "recipe": "litert",
++        "suggested": true,
++        "labels": [
++            "chat"
++        ],
++        "size": 0.58
++    },
+     "Qwen3-0.6B-LiteRT": {
+         "checkpoint": "litert-community/Qwen3-0.6B:qwen3_0_6b_mixed_int4.litertlm",
+         "recipe": "litert",
+-- 
+2.53.0
+

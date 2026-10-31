@@ -1,0 +1,430 @@
+From 8be9ba57c0c5aec517c8b45d5191ba1ff8da2868 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 18:51:03 -0400
+Subject: [PATCH 39/58] fix(server): make single-stream completion and journal
+ removal durable
+
+Confirmation-round follow-ups on the download path.
+
+A completed single-stream transfer is now flushed (fdatasync; fsync on
+macOS; _commit on Windows) before download_attempt reports success, and
+.partial -> final uses rename plus a parent-directory fsync on POSIX
+(MoveFileExW with MOVEFILE_WRITE_THROUGH on Windows); the copy fallback
+syncs the copy and its directory. A failed flush is reported as a
+resumable failure. What remains is the window between the last write and
+that flush, the same exposure every append-based resume has at any
+partial size, so a guard on only the 416-at-EOF shortcut would not close
+it; the content hash is the gate there.
+
+Journal removal is durable: the parent directory is synced after the
+unlink on POSIX. On success the journal is first rewritten to the full
+size, so a removal lost to power failure (possible on Windows, which has
+no directory sync) cannot truncate the finished file. A resurrected
+journal can only discard progress, never vouch for missing bytes.
+
+local_failure reports can_resume from the result of normalizing the
+partial; the write-failure path, reached only after a successful
+normalization, keeps the prefix. Between attempts the resume offset
+follows the partial's real size when it shrank, not only when it grew.
+Progress callback exceptions in the parallel loop now cancel the attempt
+instead of unwinding past live curl handles.
+
+A single-stream resume answered with 200 was checked, not assumed:
+libcurl already fails it with CURLE_RANGE_ERROR and leaves the partial
+untouched. The new test keeps that as a regression guard.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/utils/http_client.cpp | 205 +++++++++++++++++----------
+ test/cpp/test_parallel_download.cpp  |  73 ++++++++++
+ 2 files changed, 207 insertions(+), 71 deletions(-)
+
+diff --git a/src/cpp/server/utils/http_client.cpp b/src/cpp/server/utils/http_client.cpp
+index cf6d55daf..4e13e476b 100644
+--- a/src/cpp/server/utils/http_client.cpp
++++ b/src/cpp/server/utils/http_client.cpp
+@@ -1216,6 +1216,103 @@ HttpResponse HttpClient::post_stream(const std::string& url,
+     return response;
+ }
+ 
++namespace {
++
++FILE* open_binary_file(const fs::path& path, const char* mode) {
++#ifdef _WIN32
++    const std::string narrow_mode(mode);
++    const std::wstring wide_mode(narrow_mode.begin(), narrow_mode.end());
++    return _wfopen(path.c_str(), wide_mode.c_str());
++#else
++    return fopen(path.c_str(), mode);
++#endif
++}
++
++// Power-loss ordering: the journal may only claim bytes that are already on
++// the device, and it must itself be on the device before any out-of-order byte
++// is written. Without these syncs a restart could trust zero-filled holes.
++bool sync_stdio_file(FILE* fp) {
++    if (fflush(fp) != 0) {
++        return false;
++    }
++#ifdef _WIN32
++    return _commit(_fileno(fp)) == 0;
++#elif defined(__APPLE__)
++    return fsync(fileno(fp)) == 0;
++#else
++    return fdatasync(fileno(fp)) == 0;
++#endif
++}
++
++bool sync_path(const fs::path& path) {
++    FILE* fp = open_binary_file(path, "r+b");
++    if (!fp) {
++        return false;
++    }
++    const bool synced = sync_stdio_file(fp);
++    return (fclose(fp) == 0) && synced;
++}
++
++bool sync_parent_directory(const fs::path& path) {
++#ifdef _WIN32
++    (void)path;
++    return true;
++#else
++    fs::path dir = path.parent_path();
++    if (dir.empty()) {
++        dir = ".";
++    }
++    const int fd = ::open(dir.c_str(), O_RDONLY);
++    if (fd < 0) {
++        return false;
++    }
++    const bool synced = ::fsync(fd) == 0;
++    ::close(fd);
++    return synced;
++#endif
++}
++
++// Returns false only when the rename itself failed; *synced reports whether
++// the new directory entry is known to be on the device.
++bool rename_with_sync(const fs::path& from, const fs::path& to, bool* synced) {
++#ifdef _WIN32
++    const bool moved = MoveFileExW(from.c_str(), to.c_str(),
++                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
++    *synced = moved;
++    return moved;
++#else
++    std::error_code ec;
++    fs::rename(from, to, ec);
++    if (ec) {
++        *synced = false;
++        return false;
++    }
++    *synced = sync_parent_directory(to);
++    return true;
++#endif
++}
++
++bool durable_rename(const fs::path& from, const fs::path& to) {
++    bool synced = false;
++    return rename_with_sync(from, to, &synced) && synced;
++}
++
++// Returns false only when the file could not be removed. The directory sync
++// is best effort: a removal lost to power failure resurrects a journal, which
++// can only discard progress, never vouch for missing bytes. Windows offers no
++// directory sync, so there the delete reaches the disk with NTFS's own log.
++bool durable_remove(const fs::path& path) {
++    std::error_code ec;
++    fs::remove(path, ec);
++    if (ec) {
++        return false;
++    }
++    sync_parent_directory(path);
++    return true;
++}
++
++} // namespace
++
+ DownloadResult HttpClient::download_attempt(const std::string& url,
+                                             const std::string& output_path,
+                                             size_t resume_from,
+@@ -1371,7 +1468,10 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
+     result.bytes_downloaded = static_cast<size_t>(downloaded);
+     result.total_bytes = (total > 0) ? static_cast<size_t>(total) : 0;
+ 
+-    fclose(fp);
++    // A completed transfer must be on the device before the caller renames
++    // it, or a power loss can leave a full-size partial of unwritten bytes.
++    const bool data_synced = (res != CURLE_OK) || sync_stdio_file(fp);
++    const bool closed_cleanly = fclose(fp) == 0;
+     curl_slist_free_all(header_list);
+     curl_slist_free_all(range_list);
+     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.http_code);
+@@ -1545,6 +1645,13 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
+         return result;
+     }
+ 
++    if (!data_synced || !closed_cleanly) {
++        result.error_message = "Download finished but could not be flushed to disk: " + output_path;
++        result.curl_error = result.error_message;
++        result.can_resume = true;
++        return result;
++    }
++
+     result.success = true;
+     return result;
+ }
+@@ -1608,65 +1715,6 @@ std::optional<uint64_t> read_range_journal(const fs::path& journal) {
+     }
+ }
+ 
+-FILE* open_binary_file(const fs::path& path, const char* mode) {
+-#ifdef _WIN32
+-    const std::string narrow_mode(mode);
+-    const std::wstring wide_mode(narrow_mode.begin(), narrow_mode.end());
+-    return _wfopen(path.c_str(), wide_mode.c_str());
+-#else
+-    return fopen(path.c_str(), mode);
+-#endif
+-}
+-
+-// Power-loss ordering: the journal may only claim bytes that are already on
+-// the device, and it must itself be on the device before any out-of-order byte
+-// is written. Without these syncs a restart could trust zero-filled holes.
+-bool sync_stdio_file(FILE* fp) {
+-    if (fflush(fp) != 0) {
+-        return false;
+-    }
+-#ifdef _WIN32
+-    return _commit(_fileno(fp)) == 0;
+-#elif defined(__APPLE__)
+-    return fsync(fileno(fp)) == 0;
+-#else
+-    return fdatasync(fileno(fp)) == 0;
+-#endif
+-}
+-
+-bool sync_path(const fs::path& path) {
+-    FILE* fp = open_binary_file(path, "r+b");
+-    if (!fp) {
+-        return false;
+-    }
+-    const bool synced = sync_stdio_file(fp);
+-    return (fclose(fp) == 0) && synced;
+-}
+-
+-bool durable_rename(const fs::path& from, const fs::path& to) {
+-#ifdef _WIN32
+-    return MoveFileExW(from.c_str(), to.c_str(),
+-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+-#else
+-    std::error_code ec;
+-    fs::rename(from, to, ec);
+-    if (ec) {
+-        return false;
+-    }
+-    fs::path dir = to.parent_path();
+-    if (dir.empty()) {
+-        dir = ".";
+-    }
+-    const int fd = ::open(dir.c_str(), O_RDONLY);
+-    if (fd < 0) {
+-        return false;
+-    }
+-    const bool synced = ::fsync(fd) == 0;
+-    ::close(fd);
+-    return synced;
+-#endif
+-}
+-
+ bool write_range_journal(const fs::path& journal, uint64_t prefix) {
+     fs::path tmp = journal;
+     tmp += ".tmp";
+@@ -1709,8 +1757,7 @@ bool normalize_partial_file(const fs::path& partial) {
+             }
+         }
+     }
+-    fs::remove(journal, ec);
+-    return !ec;
++    return durable_remove(journal);
+ }
+ 
+ bool seek_binary_file(FILE* fp, uint64_t offset) {
+@@ -1989,10 +2036,9 @@ DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
+     // normalized), so its bytes stay resumable.
+     auto local_failure = [&](const std::string& message) {
+         sync_fp_closer.close();
+-        normalize_partial_file(partial_fs);
+         result.error_message = message;
+         result.curl_error = message;
+-        result.can_resume = true;
++        result.can_resume = normalize_partial_file(partial_fs);
+         return result;
+     };
+ 
+@@ -2223,8 +2269,13 @@ DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
+             cancelled = true;
+         } else if (callback && now - last_report >= kParallelProgressInterval) {
+             last_report = now;
+-            if (!callback(static_cast<size_t>(completed_bytes + in_flight),
+-                          static_cast<size_t>(remaining))) {
++            // An exception must not unwind past the live curl handles.
++            try {
++                if (!callback(static_cast<size_t>(completed_bytes + in_flight),
++                              static_cast<size_t>(remaining))) {
++                    cancelled = true;
++                }
++            } catch (...) {
+                 cancelled = true;
+             }
+         }
+@@ -2250,9 +2301,15 @@ DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
+         const uintmax_t size = fs::file_size(partial_fs, ec);
+         if (!ec && size == total_size && sync_stdio_file(sync_fp)) {
+             sync_fp_closer.close();
+-            fs::remove(journal, ec);
++            // Record completion first so a resurrected journal cannot truncate
++            // the finished file.
++            write_range_journal(journal, total_size);
++            durable_remove(journal);
+             if (callback) {
+-                callback(static_cast<size_t>(remaining), static_cast<size_t>(remaining));
++                try {
++                    callback(static_cast<size_t>(remaining), static_cast<size_t>(remaining));
++                } catch (...) {
++                }
+             }
+             result.success = true;
+             result.http_code = 206;
+@@ -2300,6 +2357,7 @@ DownloadResult HttpClient::parallel_download_attempt(const std::string& url,
+         return result;
+     }
+     if (write_failed) {
++        result.can_resume = true;
+         result.curl_code = static_cast<int>(CURLE_WRITE_ERROR);
+         result.curl_error = curl_easy_strerror(CURLE_WRITE_ERROR);
+         result.disk_full = disk_nearly_full(get_disk_space_probe_path(partial_fs));
+@@ -2480,7 +2538,7 @@ DownloadResult HttpClient::download_file(const std::string& url,
+ 
+             if (options.resume_partial && fs::exists(partial_path_fs)) {
+                 size_t new_offset = fs::file_size(partial_path_fs);
+-                if (new_offset > resume_offset) {
++                if (new_offset != resume_offset) {
+                     resume_offset = new_offset;
+                     LOG(INFO, "Download") << "Resuming from "
+                               << std::fixed << std::setprecision(1)
+@@ -2570,14 +2628,19 @@ DownloadResult HttpClient::download_file(const std::string& url,
+ 
+             // Download complete - rename .partial to final path
+             std::error_code ec;
+-            fs::rename(partial_path_fs, output_path_fs, ec);
+-            if (ec) {
++            bool rename_synced = false;
++            if (!rename_with_sync(partial_path_fs, output_path_fs, &rename_synced)) {
+                 // Rename failed - try copy and delete
+                 fs::copy_file(partial_path_fs, output_path_fs, fs::copy_options::overwrite_existing, ec);
+                 if (!ec) {
++                    rename_synced = sync_path(output_path_fs) && sync_parent_directory(output_path_fs);
+                     fs::remove(partial_path_fs, ec);
+                 }
+             }
++            if (!ec && !rename_synced) {
++                LOG(WARNING, "Download") << "Could not confirm the completed file reached the disk: "
++                                         << output_path << std::endl;
++            }
+             if (ec) {
+                 final_result.success = false;
+                 final_result.error_message = "Download succeeded but failed to rename file: " + ec.message();
+diff --git a/test/cpp/test_parallel_download.cpp b/test/cpp/test_parallel_download.cpp
+index 7640b8a36..636ba7337 100644
+--- a/test/cpp/test_parallel_download.cpp
++++ b/test/cpp/test_parallel_download.cpp
+@@ -239,6 +239,16 @@ int main() {
+         res.set_content(payload, "application/octet-stream");
+     });
+ 
++    // The next ranged request stays silent long enough to trip a 1 s stall.
++    std::atomic<bool> stall_next_range{false};
++    server.Get("/stall-first.bin", [&](const httplib::Request& req, httplib::Response& res) {
++        log.add(req);
++        if (!req.get_header_value("Range").empty() && stall_next_range.exchange(false)) {
++            std::this_thread::sleep_for(std::chrono::seconds(2));
++        }
++        res.set_content(payload, "application/octet-stream");
++    });
++
+     const int port = server.bind_to_any_port("127.0.0.1");
+     std::thread server_thread([&server]() { server.listen_after_bind(); });
+     server.wait_until_ready();
+@@ -551,6 +561,69 @@ int main() {
+         r.check(elapsed_ms < 2500, "the range probe honours cancellation before the server answers");
+     }
+ 
++    {
++        // A partial that shrinks between attempts must be resumed from its
++        // real size, not the larger offset of the previous attempt.
++        const fs::path f = dir / "shrunk.bin";
++        const size_t initial = 400000;
++        const size_t shrunk = 100000;
++        write_all(partial_of(f), payload.substr(0, initial));
++        stall_next_range = true;
++        bool truncated = false;
++        auto shrink_once = [&](size_t, size_t) {
++            if (!truncated) {
++                fs::resize_file(partial_of(f), shrunk);
++                truncated = true;
++            }
++            return true;
++        };
++        DownloadOptions options = parallel_options();
++        options.allow_parallel = false;
++        options.no_progress_timeout = 1;
++        options.max_retries = 1;
++        log.take();
++        auto result = HttpClient::download_file(base + "/stall-first.bin", f.string(), shrink_once,
++                                                {}, options, policy);
++        const auto ranges = log.take();
++        bool resumed_at_shrunk = false;
++        for (const auto& range : ranges) {
++            if (range == "bytes=" + std::to_string(shrunk) + "-") {
++                resumed_at_shrunk = true;
++            }
++        }
++        r.check(truncated, "the partial was shrunk during the first attempt");
++        r.check(result.success && read_all(f) == payload,
++                "a partial that shrank between attempts still completes byte-identical");
++        r.check(resumed_at_shrunk, "the retry resumes from the shrunk partial size");
++    }
++
++    {
++        // A single-stream resume answered with 200 (Range ignored) must not
++        // append the whole body after the kept prefix.
++        const fs::path f = dir / "resume-200.bin";
++        const size_t kept = 400000;
++        write_all(partial_of(f), payload.substr(0, kept));
++        DownloadOptions options = parallel_options();
++        options.allow_parallel = false;
++        log.take();
++        auto result = HttpClient::download_file(base + "/norange.bin", f.string(), nullptr, {},
++                                                options, policy);
++        log.take();
++        const std::string partial = read_all(partial_of(f));
++        printf("  resume-200: curl_code=%d http_code=%ld partial=%zu\n", result.curl_code,
++               result.http_code, partial.size());
++        r.check(!result.success, "a resume answered with 200 is not accepted");
++        r.check(partial.size() == kept && partial == payload.substr(0, kept),
++                "a resume answered with 200 leaves the partial untouched");
++
++        options.max_retries = 1;
++        auto retried = HttpClient::download_file(base + "/norange.bin", f.string(), nullptr, {},
++                                                 options, policy);
++        log.take();
++        r.check(retried.success && read_all(f) == payload,
++                "after a refused resume the retry restarts and completes byte-identical");
++    }
++
+     server.stop();
+     server_thread.join();
+ 
+-- 
+2.53.0
+

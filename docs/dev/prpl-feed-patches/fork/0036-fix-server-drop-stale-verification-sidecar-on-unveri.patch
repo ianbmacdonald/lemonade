@@ -1,0 +1,131 @@
+From d3bbe9ca5e00e877a17675594f6e16900311e105 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Wed, 12 Aug 2026 00:06:30 -0400
+Subject: [PATCH 36/58] fix(server): drop stale verification sidecar on
+ unverified replacement
+
+Review round 1 intake (5 families). A download that replaces a file
+without an expected hash now removes any prior .verified attestation: a
+sidecar must never attest an inode it did not see. All five reviewer
+families examined this seam; the accidental routes are coarse-mtime
+filesystems (FAT/exFAT 2s ticks) and backward clock steps combined with
+a same-size replacement. Also: warn when a sidecar cannot be written,
+document the bit-rot acceptance, and add loopback-server tests covering
+the post-rename attest site and the replacement regression (RED-proven).
+
+Assisted-by: openai:gpt-5.5
+Assisted-by: alibaba:qwen3.8-max
+Assisted-by: moonshot:kimi-for-coding
+Assisted-by: zai:glm-5.2
+Assisted-by: deepseek:deepseek-v4-pro
+Assisted-by: claude:fable-5
+---
+ src/cpp/server/utils/http_client.cpp |  9 +++++
+ test/cpp/test_verify_once.cpp        | 50 ++++++++++++++++++++++++++++
+ 2 files changed, 59 insertions(+)
+
+diff --git a/src/cpp/server/utils/http_client.cpp b/src/cpp/server/utils/http_client.cpp
+index 6ad20ef14..b380b29d2 100644
+--- a/src/cpp/server/utils/http_client.cpp
++++ b/src/cpp/server/utils/http_client.cpp
+@@ -269,6 +269,9 @@ static HashCheckResult verify_file_hash(const fs::path& path, const ExpectedHash
+ // large models that re-hash dominates repeat pulls (hashing runs ~280 MB/s, so
+ // a 340 GiB model costs ~20 min per pull with no bytes to download). Any
+ // mismatch, including a touched or replaced file, falls back to the full hash.
++// Accepted tradeoff: corruption that preserves both size and mtime (bit rot) is
++// no longer caught on repeat pulls; deleting the .verified file forces a full
++// re-verification.
+ 
+ static fs::path verified_sidecar_path(const fs::path& file) {
+     fs::path p = file;
+@@ -303,6 +306,8 @@ static void write_verified_sidecar(const fs::path& file, const ExpectedHash& exp
+     }
+     std::ofstream out(verified_sidecar_path(file), std::ios::trunc);
+     if (!out.is_open()) {
++        LOG(WARNING, "Download") << "Could not record verification sidecar (repeat pulls will re-hash): "
++                                 << verified_sidecar_path(file).string() << std::endl;
+         return;
+     }
+     out << expected.algorithm << "\n"
+@@ -1751,6 +1756,10 @@ DownloadResult HttpClient::download_file(const std::string& url,
+                 final_result.error_message = "Download succeeded but failed to rename file: " + ec.message();
+             } else if (expected_hash.present()) {
+                 write_verified_sidecar(output_path_fs, expected_hash);
++            } else {
++                // An unverified replacement invalidates any prior attestation:
++                // a sidecar must never attest an inode it did not see.
++                remove_verified_sidecar(output_path_fs);
+             }
+             return final_result;
+         }
+diff --git a/test/cpp/test_verify_once.cpp b/test/cpp/test_verify_once.cpp
+index 1cb9bae71..3734ac3d7 100644
+--- a/test/cpp/test_verify_once.cpp
++++ b/test/cpp/test_verify_once.cpp
+@@ -17,6 +17,9 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <string>
++#include <thread>
++
++#include <httplib.h>
+ 
+ #include <lemon/utils/http_client.h>
+ 
+@@ -159,6 +162,53 @@ int main() {
+         r.check(!result.success, "garbled sidecar falls back to the full hash (which fails)");
+     }
+ 
++    {
++        // Real-download legs against a loopback server: the post-rename write
++        // site attests a fresh hashed download, and an UNVERIFIED (no-hash)
++        // replacement drops a prior attestation rather than leaving it to
++        // guard bytes it never saw.
++        httplib::Server server;
++        server.Get("/content.bin", [](const httplib::Request&, httplib::Response& res) {
++            res.set_content(kContent, "application/octet-stream");
++        });
++        int port = server.bind_to_any_port("127.0.0.1");
++        std::thread server_thread([&server]() { server.listen_after_bind(); });
++        server.wait_until_ready();
++        const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/content.bin";
++
++        {
++            // Fresh hashed download writes the attestation at the rename site.
++            const fs::path f = dir / "fresh.bin";
++            auto options = fast_fail_options(kContentSha256);
++            auto result = HttpClient::download_file(url, f.string(), nullptr, {}, options,
++                                                    lemon::utils::HttpSecurityPolicy::TrustedLoopback);
++            r.check(result.success, "fresh hashed download succeeds");
++            const fs::path sidecar = fs::path(f) += ".verified";
++            r.check(fs::exists(sidecar), "post-download rename site writes the sidecar");
++        }
++
++        {
++            // A no-hash download that REPLACES the file removes the stale
++            // attestation (a sidecar must never attest an inode it did not see).
++            const fs::path f = dir / "replaced.bin";
++            write_file(f, kContent);
++            write_sidecar(f, "sha256", kContentSha256, fs::file_size(f), mtime_count(f));
++            write_file(fs::path(f) += ".partial", "partial-bytes");
++            DownloadOptions options;
++            options.max_retries = 0;
++            options.resume_partial = false;
++            options.connect_timeout = 2;
++            auto result = HttpClient::download_file(url, f.string(), nullptr, {}, options,
++                                                    lemon::utils::HttpSecurityPolicy::TrustedLoopback);
++            r.check(result.success, "no-hash replacement download succeeds");
++            r.check(!fs::exists(fs::path(f) += ".verified"),
++                    "unverified replacement removes the stale sidecar");
++        }
++
++        server.stop();
++        server_thread.join();
++    }
++
+     fs::remove_all(dir);
+     printf("\n%d passed, %d failed\n", r.passed, r.failed);
+     return r.failed == 0 ? 0 : 1;
+-- 
+2.53.0
+
