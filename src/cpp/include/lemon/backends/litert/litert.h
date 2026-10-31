@@ -2,9 +2,23 @@
 
 #include "lemon/backends/backend_descriptor.h"
 
+#include <set>
+#include <string>
+
 namespace lemon {
 namespace backends {
 namespace litert {
+
+// Arguments litert_args must not carry. litert_args comes from the /load
+// request body: --host would publish the engine on the LAN without lemond's
+// API key, and --cache-dir would make the engine write its weight cache at a
+// path the caller chooses.
+inline const std::set<std::string>& reserved_custom_arg_flags() {
+    static const std::set<std::string> flags = {
+        "--model", "--port", "--host", "--cache-dir",
+    };
+    return flags;
+}
 
 // The LiteRT backend descriptor (plain data). Header-only `inline const` so it
 // links into both the lemonade CLI and lemond without a separate source file.

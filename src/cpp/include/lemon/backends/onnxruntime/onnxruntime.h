@@ -2,9 +2,20 @@
 
 #include "lemon/backends/backend_descriptor.h"
 
+#include <set>
+#include <string>
+
 namespace lemon {
 namespace backends {
 namespace onnxruntime {
+
+// Arguments onnxruntime_args must not carry. onnxruntime_args comes from the
+// /load request body, and --host would publish the engine on the LAN without
+// lemond's API key.
+inline const std::set<std::string>& reserved_custom_arg_flags() {
+    static const std::set<std::string> flags = {"--model-path", "--port", "--host"};
+    return flags;
+}
 
 // The ONNX Runtime backend descriptor (plain data). A generic ORT model server
 // (see lemonade-sdk/ort-server); v1 serves text classification for the router's

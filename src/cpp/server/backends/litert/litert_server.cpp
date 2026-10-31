@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <filesystem>
 #include <optional>
-#include <set>
 #include <string>
 #include <vector>
 #include <lemon/utils/aixlog.hpp>
@@ -88,12 +87,8 @@ void LiteRtServer::load(const std::string& model_name,
         "--port", std::to_string(port_),
     };
 
-    // --host is reserved: litert-lm-server binds loopback by design (it is
-    // reached only by this in-process forwarder), and a recipe must not be able
-    // to widen that to the gateway LAN.
-    std::set<std::string> reserved_flags = {"--model", "--port", "--host"};
     if (!extra_args.empty()) {
-        std::string validation_error = validate_custom_args(extra_args, reserved_flags);
+        std::string validation_error = validate_custom_args(extra_args, litert::reserved_custom_arg_flags());
         if (!validation_error.empty()) {
             throw std::invalid_argument("Invalid custom litert-lm-server arguments:\n" + validation_error);
         }
