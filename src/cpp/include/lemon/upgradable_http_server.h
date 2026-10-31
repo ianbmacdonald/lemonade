@@ -40,6 +40,12 @@
 #include <utility>
 #include <vector>
 
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
+#endif
+
 #include "lemon/connection_guard.h"
 #include "lemon/utils/aixlog.hpp"
 #include "lemon/utils/network_utils.h"
@@ -124,6 +130,24 @@ httplib::TaskQueue* new_bounded_thread_pool(size_t threads, size_t max_queued) {
 inline bool peek_websocket_upgrade(socket_t sock) {
     char buf[4096];
     for (int attempt = 0; attempt < 50; ++attempt) {  // up to ~500 ms for headers
+        // The socket is blocking and nothing has set a receive timeout yet, so
+        // a recv on a silent peer would hold this worker forever.
+#ifdef _WIN32
+        WSAPOLLFD pfd{sock, POLLRDNORM, 0};
+        const int ready = ::WSAPoll(&pfd, 1, 10);
+#else
+        pollfd pfd{sock, POLLIN, 0};
+        const int ready = ::poll(&pfd, 1, 10);
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+#endif
+        if (ready < 0) {
+            return false;
+        }
+        if (ready == 0) {
+            continue;
+        }
 #ifdef _WIN32
         int n = ::recv(sock, buf, static_cast<int>(sizeof(buf)), MSG_PEEK);
 #else
@@ -197,6 +221,11 @@ public:
 
 private:
     bool process_and_close_socket(socket_t sock) override {
+#ifndef _WIN32
+        // httplib accepts without SOCK_CLOEXEC; a backend forked while this
+        // connection is open would otherwise keep it open after lemond closes it.
+        ::fcntl(sock, F_SETFD, FD_CLOEXEC);
+#endif
         ConnectionGuard::Ticket ticket;
         if (guard_) {
             const std::string client = ConnectionGuard::peer_address(sock);

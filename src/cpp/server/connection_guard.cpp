@@ -9,6 +9,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -34,7 +35,8 @@ socket_t duplicate_socket(socket_t sock) {
     (void)sock;
     return kInvalidSocket;
 #else
-    return ::dup(sock);
+    // Close-on-exec, or every backend launched later keeps the client connection open.
+    return ::fcntl(sock, F_DUPFD_CLOEXEC, 0);
 #endif
 }
 

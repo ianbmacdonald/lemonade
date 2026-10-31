@@ -2,6 +2,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -204,6 +205,66 @@ static void test_untrackable_fails_closed() {
     ::close(fds[0]);
     ::close(fds[1]);
 }
+
+#ifdef __linux__
+static int inheritable_descriptors() {
+    int n = 0;
+    for (int fd = 0; fd < 1024; ++fd) {
+        const int flags = ::fcntl(fd, F_GETFD);
+        if (flags >= 0 && !(flags & FD_CLOEXEC)) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+static void test_watch_socket_is_close_on_exec() {
+    ConnectionGuard::Limits limits;
+    limits.receive_timeout = 30s;
+    ConnectionGuard guard(limits);
+    int fds[2];
+    check(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0, "socketpair");
+    const int before = inheritable_descriptors();
+    {
+        ConnectionGuard::Ticket t;
+        check(admitted(guard.admit(fds[0], "192.0.2.5", t)), "connection admitted");
+        check(inheritable_descriptors() == before,
+              "the watchdog's duplicate is not inherited by child processes");
+    }
+    ::close(fds[0]);
+    ::close(fds[1]);
+}
+#endif
+
+// A peer that connects and sends nothing, or stops mid-headers, must not hold
+// the worker: the peek gives up and leaves the socket to httplib's timeouts.
+static void check_peek_returns(const char* sent, const char* label) {
+    int fds[2];
+    check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
+    if (*sent) {
+        check(::send(fds[1], sent, std::strlen(sent), 0) > 0, "send partial request");
+    }
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread peek([fd = fds[0], done] {
+        lemon::detail::peek_websocket_upgrade(fd);
+        *done = true;
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!*done && std::chrono::steady_clock::now() - t0 < 3s) {
+        std::this_thread::sleep_for(10ms);
+    }
+    check(*done, label);
+    ::shutdown(fds[0], SHUT_RDWR);
+    peek.join();
+    ::close(fds[0]);
+    ::close(fds[1]);
+}
+
+static void test_peek_is_bounded() {
+    check_peek_returns("", "the upgrade peek returns for a silent peer");
+    check_peek_returns("GET /realtime HTTP/1.1\r\nHost: x\r\n",
+                       "the upgrade peek returns for headers that never finish");
+}
 #endif
 
 int main() {
@@ -216,6 +277,10 @@ int main() {
     test_watchdog_shuts_down_socket();
     test_received_request_is_not_shut_down();
     test_untrackable_fails_closed();
+    test_peek_is_bounded();
+#ifdef __linux__
+    test_watch_socket_is_close_on_exec();
+#endif
 #endif
     return report_results("connection guard");
 }

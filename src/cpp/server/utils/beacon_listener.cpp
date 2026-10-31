@@ -13,6 +13,7 @@
 
 #ifndef _WIN32
     #include <arpa/inet.h>
+    #include <fcntl.h>
     #include <net/if.h>
     #include <netinet/in.h>
     #include <poll.h>
@@ -953,6 +954,7 @@ void BeaconListener::refresh_sockets() {
             existing->error = std::string("socket: ") + std::strerror(errno);
             continue;
         }
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #ifdef IP_PKTINFO
