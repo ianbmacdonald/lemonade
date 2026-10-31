@@ -1,0 +1,502 @@
+From 5d169fe3de187c493fbec8918f320e334947363f Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:35:51 -0400
+Subject: [PATCH 24/58] fix(executorch): keep a failed classifier load from
+ evicting resident models
+
+A failed et-server load used to fall into the Router's nuclear path: evict
+every loaded model, then load the classifier a second time. An OOM-killed load
+on a small gateway therefore cost the resident LLM and repeated the load that
+had just been killed.
+
+- error_types: NonRetryableLoadException; Router::load_error_skips_nuclear_retry
+  treats it, and the existing file-not-found messages, as rethrow-only.
+- executorch: every load failure is non-retryable. Only SIGKILL skips the
+  stderr-capture relaunch; cancel and the readiness timeout (child still
+  running) now throw at once instead of relaunching; other signals and exits
+  keep the capture and report the signal or code with it.
+- executorch: choose_port() instead of an unchecked find_free_port; classify
+  text over 1 MiB is refused with 413; include order and continuation alignment.
+- test_backend_load_failure (cpp-ci): classification of load errors and
+  startup_exit_code() for SIGKILL, exit 3, cancel and timeout children.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                                |   9 ++
+ .../backends/executorch/executorch_server.h   |   5 +-
+ src/cpp/include/lemon/error_types.h           |   8 +
+ src/cpp/include/lemon/router.h                |   4 +
+ .../backends/executorch/executorch_server.cpp |  85 ++++++----
+ src/cpp/server/router.cpp                     |  26 ++--
+ test/cpp/test_backend_load_failure.cpp        | 146 ++++++++++++++++++
+ 7 files changed, 244 insertions(+), 39 deletions(-)
+ create mode 100644 test/cpp/test_backend_load_failure.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bb1de01a5..dcc0aa7e3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4109,6 +4109,15 @@ if(BUILD_TESTING AND EXISTS "${_ROUTING_HELPER_RECONCILE_TEST_SRC}")
+                     COMMAND test_routing_helper_reconcile)
+ endif()
+ 
++# A backend that dies while loading: its exit status survives wait_for_ready(),
++# and an unfixable load failure skips the Router's evict-all-and-retry.
++set(_BACKEND_LOAD_FAILURE_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_backend_load_failure.cpp")
++if(BUILD_TESTING AND EXISTS "${_BACKEND_LOAD_FAILURE_TEST_SRC}")
++    add_executable(test_backend_load_failure test/cpp/test_backend_load_failure.cpp)
++    target_link_libraries(test_backend_load_failure PRIVATE lemonade-server-core)
++    add_cpp_ci_test(BackendLoadFailureTest CI ON COMMAND test_backend_load_failure)
++endif()
++
+ # Launch command bookkeeping: the command recorded at spawn must keep describing
+ # the process currently held, so a restart replaces it and cleanup erases it.
+ set(_LAUNCH_COMMAND_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_launch_command.cpp")
+diff --git a/src/cpp/include/lemon/backends/executorch/executorch_server.h b/src/cpp/include/lemon/backends/executorch/executorch_server.h
+index f04e34129..d1fec47c5 100644
+--- a/src/cpp/include/lemon/backends/executorch/executorch_server.h
++++ b/src/cpp/include/lemon/backends/executorch/executorch_server.h
+@@ -1,10 +1,9 @@
+ #pragma once
+ 
+ #include "lemon/backends/backend_registry.h"
+-
+-#include "lemon/wrapped_server.h"
+-#include "lemon/server_capabilities.h"
+ #include "lemon/backends/backend_utils.h"
++#include "lemon/server_capabilities.h"
++#include "lemon/wrapped_server.h"
+ #include <string>
+ 
+ namespace lemon {
+diff --git a/src/cpp/include/lemon/error_types.h b/src/cpp/include/lemon/error_types.h
+index d5fac5c95..5681c1d79 100644
+--- a/src/cpp/include/lemon/error_types.h
++++ b/src/cpp/include/lemon/error_types.h
+@@ -116,6 +116,14 @@ private:
+     int status_code_;
+ };
+ 
++// A backend load failure that evicting every other model and retrying cannot
++// fix, or would make worse: the Router rethrows it without the nuclear retry.
++class NonRetryableLoadException : public LemonException {
++public:
++    explicit NonRetryableLoadException(const std::string& message)
++        : LemonException(message, ErrorType::PROCESS_ERROR) {}
++};
++
+ class NetworkException : public LemonException {
+ public:
+     NetworkException(const std::string& message)
+diff --git a/src/cpp/include/lemon/router.h b/src/cpp/include/lemon/router.h
+index a92ef8410..1742287e9 100644
+--- a/src/cpp/include/lemon/router.h
++++ b/src/cpp/include/lemon/router.h
+@@ -137,6 +137,10 @@ public:
+ 
+     ~Router();
+ 
++    // True when a failed backend load must be rethrown as is, without evicting
++    // the other loaded models and retrying.
++    static bool load_error_skips_nuclear_retry(const std::exception& error);
++
+     // Wires the cloud provider registry so the Router can construct
+     // CloudServer instances with a credential source. Pointer (not
+     // ownership) — Server owns the registry.
+diff --git a/src/cpp/server/backends/executorch/executorch_server.cpp b/src/cpp/server/backends/executorch/executorch_server.cpp
+index b79469bee..6b2292cfc 100644
+--- a/src/cpp/server/backends/executorch/executorch_server.cpp
++++ b/src/cpp/server/backends/executorch/executorch_server.cpp
+@@ -1,13 +1,15 @@
+ #include "lemon/backends/executorch/executorch_server.h"
+-#include "lemon/backends/executorch/executorch.h"
+-#include "lemon/backends/backend_registry.h"
++
++#include "lemon/backend_manager.h"
+ #include "lemon/backends/backend_ops.h"
++#include "lemon/backends/backend_registry.h"
+ #include "lemon/backends/backend_utils.h"
++#include "lemon/backends/executorch/executorch.h"
+ #include "lemon/backends/hf_cache_util.h"
+-#include "lemon/backend_manager.h"
+-#include "lemon/utils/path_utils.h"
++#include "lemon/error_types.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
++#include "lemon/utils/path_utils.h"
+ #include "lemon/utils/process_manager.h"
+ #include <algorithm>
+ #include <filesystem>
+@@ -24,6 +26,10 @@ namespace lemon {
+ namespace backends {
+ 
+ namespace {
++// et-server rejects larger bodies itself; refusing here keeps an oversized
++// request from being copied into a second body just to be refused.
++constexpr size_t kMaxClassifyTextBytes = 1024 * 1024;
++
+ // The config is mandatory even when a manifest is present: the manifest
+ // describes the output contract only, and et-server still needs the config to
+ // check the architecture against its supported input convention.
+@@ -103,8 +109,11 @@ std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
+ // Subprocess contract (ort-server's):
+ //   GET  /health             -> 200 once every method in the .pte is loaded
+ //   POST /classify {text}    -> 200 {"labels": {"<label>": <score in [0,1]>, ...}}
++//   refusing a model         -> one "et-server: ..." stderr line, then exit(1)
++// Exit statuses above 128 are read as signal deaths, so a launcher wrapper must
++// exec et-server rather than propagate its status from a shell.
+ InstallParams ExecutorchServer::get_install_params(const std::string& backend,
+-                                               const std::string& version) {
++                                                   const std::string& version) {
+     (void)backend;
+     (void)version;
+     throw std::runtime_error(
+@@ -113,7 +122,7 @@ InstallParams ExecutorchServer::get_install_params(const std::string& backend,
+ }
+ 
+ ExecutorchServer::ExecutorchServer(const std::string& log_level, ModelManager* model_manager,
+-                                     BackendManager* backend_manager)
++                                   BackendManager* backend_manager)
+     : WrappedServer("et-server", log_level, model_manager, backend_manager) {
+ }
+ 
+@@ -122,9 +131,9 @@ ExecutorchServer::~ExecutorchServer() {
+ }
+ 
+ void ExecutorchServer::load(const std::string& model_name,
+-                             const ModelInfo& model_info,
+-                             const RecipeOptions& options,
+-                             bool do_not_upgrade) {
++                            const ModelInfo& model_info,
++                            const RecipeOptions& options,
++                            bool do_not_upgrade) {
+     (void)do_not_upgrade;
+     LOG(INFO, "ExecutorchServer") << "Loading model: " << model_name << std::endl;
+     LOG(INFO, "ExecutorchServer") << "Per-model settings: " << options.to_log_string() << std::endl;
+@@ -146,7 +155,7 @@ void ExecutorchServer::load(const std::string& model_name,
+     // the resolved path is the only candidate.
+     auto candidates = find_complete_model_dirs(path_from_utf8(model_path));
+     if (candidates.empty()) {
+-        throw std::runtime_error(
++        throw NonRetryableLoadException(
+             "No servable model directory under '" + model_path +
+             "': need model.pte + tokenizer.json + config.json "
+             "(manifest.json is optional and overrides the output contract)");
+@@ -154,7 +163,7 @@ void ExecutorchServer::load(const std::string& model_name,
+     if (candidates.size() > 1) {
+         std::string listing;
+         for (const auto& c : candidates) listing += "\n  " + path_to_utf8(c);
+-        throw std::runtime_error(
++        throw NonRetryableLoadException(
+             "Ambiguous model layout under '" + model_path + "': " +
+             std::to_string(candidates.size()) +
+             " complete model directories found — keep exactly one:" + listing);
+@@ -165,14 +174,11 @@ void ExecutorchServer::load(const std::string& model_name,
+     std::string executable = BackendUtils::get_backend_binary_path(*executorch::spec(), "system");
+     LOG(INFO, "ExecutorchServer") << "Using executable: " << executable << std::endl;
+ 
+-    port_ = utils::ProcessManager::find_free_port(8001);
+-    if (port_ == 0) {
+-        throw std::runtime_error("Failed to find an available port for et-server");
+-    }
++    const int port = choose_port();
+ 
+     std::vector<std::string> args = {
+         "--model-path", model_path,
+-        "--port", std::to_string(port_),
++        "--port", std::to_string(port),
+     };
+ 
+     std::set<std::string> reserved_flags = {"--model-path", "--port"};
+@@ -195,21 +201,36 @@ void ExecutorchServer::load(const std::string& model_name,
+     }
+     LOG(INFO, "ExecutorchServer") << "Process started with PID: " << started_handle.pid << std::endl;
+ 
+-    if (!wait_for_ready("/health")) {
++    constexpr long kReadyTimeoutSeconds = 600;
++    if (!wait_for_ready("/health", kReadyTimeoutSeconds)) {
+         unload();
+-        // A signal death during load is almost always the OOM killer. Relaunching
+-        // to capture stderr would repeat the full load under the same memory
+-        // pressure and could take a resident LLM down with it, so report it as is.
++        // Every failure below is non-retryable: et-server is CPU-only, so the
++        // Router's evict-everything-and-retry would only cost the resident LLM
++        // and repeat a load that failed for reasons eviction does not change.
+         const int exit_code = startup_exit_code();
+-        if (exit_code > 128 && exit_code <= 128 + 64) {
+-            const int sig = exit_code - 128;
+-            throw std::runtime_error(
+-                "et-server was killed by signal " + std::to_string(sig) +
+-                (sig == 9 ? " (likely out of memory)" : ""));
++        if (load_cancel_ && load_cancel_->load()) {
++            throw NonRetryableLoadException("et-server load cancelled");
++        }
++        if (exit_code < 0) {
++            // Still running at the deadline: on a small box that is memory
++            // thrash, and a capture relaunch would load the model a second time.
++            throw NonRetryableLoadException("et-server did not become ready within " +
++                                            std::to_string(kReadyTimeoutSeconds) + " s");
++        }
++        if (exit_code == 128 + 9) {
++            // SIGKILL during load is the OOM killer's signature; relaunching to
++            // capture stderr would repeat the full load under the same pressure.
++            throw NonRetryableLoadException(
++                "et-server was killed by signal 9 (likely out of memory)");
+         }
++        // A fast refusal or crash (abort, segfault) is cheap to repeat, and the
++        // relaunch is the only way to show the diagnostic line it printed.
+         std::string details = capture_startup_error(executable, args);
+-        throw std::runtime_error("et-server failed to start or become ready" +
+-                                 (details.empty() ? "" : ": " + details));
++        std::string status = exit_code > 128
++            ? "killed by signal " + std::to_string(exit_code - 128)
++            : "exited with code " + std::to_string(exit_code);
++        throw NonRetryableLoadException("et-server " + status + " during startup" +
++                                        (details.empty() ? "" : ": " + details));
+     }
+     start_backend_watchdog("/health");
+     LOG(INFO, "ExecutorchServer") << "Server is ready!" << std::endl;
+@@ -246,6 +267,16 @@ json ExecutorchServer::classify(const json& request) {
+             }}
+         };
+     }
++    if (text.size() > kMaxClassifyTextBytes) {
++        return json{
++            {"error", {
++                {"message", "Classify text exceeds " + std::to_string(kMaxClassifyTextBytes) +
++                            " bytes"},
++                {"type", "invalid_request_error"},
++                {"status_code", 413},
++            }}
++        };
++    }
+     return forward_classify(text, request);
+ }
+ 
+diff --git a/src/cpp/server/router.cpp b/src/cpp/server/router.cpp
+index 008c7bdba..e291d1b61 100644
+--- a/src/cpp/server/router.cpp
++++ b/src/cpp/server/router.cpp
+@@ -123,6 +123,18 @@ Router::Router(RuntimeConfig* config, ModelManager* model_manager, BackendManage
+     eviction_engine_->start();
+ }
+ 
++bool Router::load_error_skips_nuclear_retry(const std::exception& error) {
++    if (dynamic_cast<const NonRetryableLoadException*>(&error) != nullptr) {
++        return true;
++    }
++    // A missing file stays missing after an eviction, so it is the one
++    // message-classified exception to the nuclear policy.
++    const std::string message = error.what();
++    return message.find("not found") != std::string::npos ||
++           message.find("does not exist") != std::string::npos ||
++           message.find("No such file") != std::string::npos;
++}
++
+ Router::~Router() {
+     LOG(DEBUG, "Router") << "Destructor: stopping monitors and unloading all models" << std::endl;
+     if (eviction_engine_) eviction_engine_->stop();
+@@ -1096,6 +1108,7 @@ void Router::load_model(const std::string& model_name,
+         LOG(DEBUG, "Router") << "Starting backend (this may take a moment)..." << std::endl;
+         bool load_success = false;
+         bool unrecoverable_config = false;
++        bool skip_nuclear_retry = false;
+         std::string error_message;
+         auto load_start = std::chrono::steady_clock::now();
+ 
+@@ -1115,6 +1128,7 @@ void Router::load_model(const std::string& model_name,
+         } catch (const std::exception& e) {
+             error_message = e.what();
+             load_success = false;
++            skip_nuclear_retry = load_error_skips_nuclear_retry(e);
+             LOG(ERROR, "Router") << "Backend load failed: " << error_message << std::endl;
+         }
+ 
+@@ -1156,12 +1170,6 @@ void Router::load_model(const std::string& model_name,
+             LOG(INFO, "Router") << "Model loaded successfully. Total loaded: "
+                       << loaded_servers_.size() << std::endl;
+         } else {
+-            // ERROR HANDLING (from spec: Error Handling section)
+-            // Check if error is "file not found" (exception to nuclear policy)
+-            bool is_file_not_found = (error_message.find("not found") != std::string::npos ||
+-                                     error_message.find("does not exist") != std::string::npos ||
+-                                     error_message.find("No such file") != std::string::npos);
+-
+             is_loading_ = false;
+             load_cv_.notify_all();
+ 
+@@ -1178,8 +1186,8 @@ void Router::load_model(const std::string& model_name,
+                 throw ConfigurationException(error_message);
+             }
+ 
+-            if (is_file_not_found) {
+-                LOG(ERROR, "Router") << "File not found error, NOT evicting other models" << std::endl;
++            if (skip_nuclear_retry) {
++                LOG(ERROR, "Router") << "Non-retryable load error, NOT evicting other models" << std::endl;
+                 throw std::runtime_error(error_message);
+             }
+ 
+@@ -1196,7 +1204,7 @@ void Router::load_model(const std::string& model_name,
+             }
+ 
+             // Nuclear option: evict all models and retry
+-            LOG(WARNING, "Router") << "Load failed with non-file-not-found error, "
++            LOG(WARNING, "Router") << "Load failed with a retryable error, "
+                       << "evicting all models and retrying..." << std::endl;
+ 
+             evict_all_servers();
+diff --git a/test/cpp/test_backend_load_failure.cpp b/test/cpp/test_backend_load_failure.cpp
+new file mode 100644
+index 000000000..a75d79b96
+--- /dev/null
++++ b/test/cpp/test_backend_load_failure.cpp
+@@ -0,0 +1,146 @@
++// A backend that dies while loading must be reported with how it died, and the
++// Router must not answer an unfixable failure by evicting every other model and
++// loading the failed one a second time. The exit status is only observable
++// inside wait_for_ready(), which reaps the child, so the Linux cases start real
++// /bin/sh children rather than faking ProcessManager.
++
++#include "lemon/error_types.h"
++#include "lemon/router.h"
++#include "lemon/utils/process_manager.h"
++#include "lemon/wrapped_server.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++
++int failures = 0;
++
++void check(const std::string& what, bool ok) {
++    std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
++    if (!ok) ++failures;
++}
++
++}  // namespace
++
++namespace lemon {
++
++class ShellWrappedServer : public WrappedServer {
++public:
++    ShellWrappedServer() : WrappedServer("shell", "error", nullptr, nullptr) {}
++
++    void load(const std::string&, const ModelInfo&, const RecipeOptions&, bool) override {}
++
++    void unload() override {
++        const ProcessHandle handle = consume_process_handle_for_cleanup();
++        if (has_process_handle(handle)) utils::ProcessManager::stop_process(handle);
++    }
++
++    // Returns wait_for_ready's verdict and leaves startup_exit_code() readable.
++    bool start_and_wait(const std::string& script, long timeout_seconds) {
++        choose_port();
++        const std::vector<std::string> args = {"-c", script};
++        ProcessHandle handle = utils::ProcessManager::start_process("/bin/sh", args);
++        set_process_handle(handle, "/bin/sh", args);
++        return wait_for_ready("/health", timeout_seconds, 50);
++    }
++
++    using WrappedServer::startup_exit_code;
++};
++
++}  // namespace lemon
++
++using lemon::NonRetryableLoadException;
++using lemon::Router;
++using lemon::ShellWrappedServer;
++
++static void test_nuclear_retry_classification() {
++    check("NonRetryableLoadException skips the nuclear retry",
++          Router::load_error_skips_nuclear_retry(
++              NonRetryableLoadException("et-server was killed by signal 9 (likely out of memory)")));
++    check("the same text as a plain runtime_error does not",
++          !Router::load_error_skips_nuclear_retry(
++              std::runtime_error("et-server was killed by signal 9 (likely out of memory)")));
++    check("a missing file still skips it",
++          Router::load_error_skips_nuclear_retry(
++              std::runtime_error("Model directory not found for checkpoint: x")));
++    check("a generic failure keeps it",
++          !Router::load_error_skips_nuclear_retry(
++              std::runtime_error("llama-server failed to allocate VRAM")));
++}
++
++#ifdef __linux__
++static void test_startup_exit_code() {
++    {
++        ShellWrappedServer server;
++        check("startup_exit_code is -1 before any wait", server.startup_exit_code() == -1);
++    }
++    {
++        ShellWrappedServer server;
++        const bool ready = server.start_and_wait("kill -9 $$", 10);
++        check("SIGKILL child is not ready", !ready);
++        check("SIGKILL child reports 137, got " + std::to_string(server.startup_exit_code()),
++              server.startup_exit_code() == 137);
++    }
++    {
++        ShellWrappedServer server;
++        const bool ready = server.start_and_wait("exit 3", 10);
++        check("exit 3 child is not ready", !ready);
++        check("exit 3 child reports 3, got " + std::to_string(server.startup_exit_code()),
++              server.startup_exit_code() == 3);
++    }
++    {
++        ShellWrappedServer server;
++        std::atomic<bool> cancel{false};
++        server.set_load_cancel_flag(&cancel);
++        std::thread canceller([&cancel] {
++            std::this_thread::sleep_for(std::chrono::milliseconds(300));
++            cancel.store(true);
++        });
++        const auto start = std::chrono::steady_clock::now();
++        const bool ready = server.start_and_wait("exec sleep 30", 20);
++        const auto elapsed = std::chrono::steady_clock::now() - start;
++        canceller.join();
++        server.set_load_cancel_flag(nullptr);
++        check("cancelled child is not ready", !ready);
++        check("cancelled child reports -1, got " + std::to_string(server.startup_exit_code()),
++              server.startup_exit_code() == -1);
++        check("cancel returns promptly",
++              elapsed < std::chrono::seconds(5));
++    }
++    {
++        ShellWrappedServer server;
++        const bool ready = server.start_and_wait("exec sleep 30", 1);
++        check("timed-out child is not ready", !ready);
++        check("timed-out child reports -1, got " + std::to_string(server.startup_exit_code()),
++              server.startup_exit_code() == -1);
++        server.unload();
++    }
++    {
++        ShellWrappedServer server;
++        server.start_and_wait("exit 3", 10);
++        server.start_and_wait("exec sleep 30", 1);
++        check("a later timeout resets the previous exit status",
++              server.startup_exit_code() == -1);
++        server.unload();
++    }
++}
++#endif
++
++int main() {
++    test_nuclear_retry_classification();
++#ifdef __linux__
++    test_startup_exit_code();
++#endif
++    if (failures > 0) {
++        std::printf("%d check(s) failed\n", failures);
++        return 1;
++    }
++    std::printf("all checks passed\n");
++    return 0;
++}
+-- 
+2.53.0
+

@@ -1,0 +1,579 @@
+From 8fb855025b3041cb93c5b5c3ed984a2a9979b37a Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 21:21:33 -0400
+Subject: [PATCH 44/58] test(beacon): trusted relay allow-list for relayed
+ beacons (RED)
+
+Config validation for beacon_trusted_relays, peer-table accept/refuse
+decisions for relayed beacons, and a netns datagram sent by a relay that
+advertises another host's URL. The API is stubbed, so these fail.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/runtime_config.h        |   1 +
+ src/cpp/include/lemon/utils/beacon_listener.h |  34 +++-
+ src/cpp/server/core/config_effects.cpp        |   2 +-
+ src/cpp/server/core/http_listener.cpp         |   7 +
+ src/cpp/server/runtime_config.cpp             |  13 ++
+ src/cpp/server/utils/beacon_listener.cpp      |  25 +++
+ test/cpp/test_beacon_listener_socket.cpp      |  43 +++++
+ test/cpp/test_beacon_peer_table.cpp           | 149 ++++++++++++++++++
+ test/cpp/test_config_discovery.cpp            |  90 +++++++++++
+ 9 files changed, 362 insertions(+), 2 deletions(-)
+
+diff --git a/src/cpp/include/lemon/runtime_config.h b/src/cpp/include/lemon/runtime_config.h
+index 9f3d6d6d7..13a4ee3ff 100644
+--- a/src/cpp/include/lemon/runtime_config.h
++++ b/src/cpp/include/lemon/runtime_config.h
+@@ -55,6 +55,7 @@ public:
+     bool inhibit_suspend() const;
+     bool beacon_listen() const;
+     std::vector<std::string> beacon_listen_interfaces() const;
++    json beacon_trusted_relays() const;
+ 
+     // Telemetry settings
+     bool telemetry_enabled() const;
+diff --git a/src/cpp/include/lemon/utils/beacon_listener.h b/src/cpp/include/lemon/utils/beacon_listener.h
+index 11a608125..d1b2a3bb1 100644
+--- a/src/cpp/include/lemon/utils/beacon_listener.h
++++ b/src/cpp/include/lemon/utils/beacon_listener.h
+@@ -24,6 +24,11 @@ constexpr double kGlobalBurst = 1000.0;
+ constexpr double kPerSourceRate = 2.0;
+ constexpr double kPerSourceBurst = 4.0;
+ constexpr std::size_t kMaxSources = 64;
++constexpr double kRelayRate = 8.0;
++constexpr double kRelayBurst = 16.0;
++constexpr std::size_t kMaxRelayedHostsPerRelay = kMaxHosts / 2;
++constexpr std::size_t kMaxTrustedRelays = 16;
++constexpr std::size_t kMaxRelayAllowHosts = 32;
+ constexpr std::size_t kMaxDatagram = 1024;
+ constexpr std::chrono::seconds kIfaceRefresh{10};
+ constexpr std::chrono::milliseconds kPollSlice{500};
+@@ -43,7 +48,10 @@ enum class IngestResult {
+     RateLimited,
+     TableFull,
+     WrongInterface,
+-    UnknownInterface
++    UnknownInterface,
++    RelayedAccepted,
++    RelayedRefreshed,
++    RelayHostRefused
+ };
+ 
+ const char* ingest_result_name(IngestResult result);
+@@ -52,12 +60,34 @@ const char* ingest_result_name(IngestResult result);
+ bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
+                              const std::vector<unsigned>& listened_ifindexes);
+ 
++struct BeaconHostRange {
++    uint32_t network = 0;
++    int prefix = 32;
++    bool contains(uint32_t ip) const;
++    std::string to_string() const;
++};
++
++// A datagram whose source is `source` may advertise a URL on any host in
++// `allow_hosts`, which must lie inside RFC1918.
++struct BeaconTrustedRelay {
++    uint32_t source = 0;
++    std::vector<BeaconHostRange> allow_hosts;
++};
++
++// Parses the beacon_trusted_relays config value; throws std::invalid_argument
++// naming the offending entry.
++std::vector<BeaconTrustedRelay> parse_beacon_trusted_relays(const nlohmann::json& value);
++nlohmann::json beacon_trusted_relays_to_json(const std::vector<BeaconTrustedRelay>& relays);
++
+ struct HeardHost {
+     std::string hostname;
+     std::string url;
+     std::string source_ip;
+     std::string instance_id;
+     uint32_t source_ip_host_order = 0;
++    uint32_t url_host = 0;
++    // Datagram source when the host was heard through a trusted relay, else 0.
++    uint32_t via = 0;
+     std::chrono::system_clock::time_point first_seen_wall;
+     std::chrono::system_clock::time_point last_seen_wall;
+     std::chrono::steady_clock::time_point last_seen;
+@@ -72,6 +102,7 @@ public:
+     void set_self(const std::string& instance_id, int self_port);
+     void set_self_port(int port);
+     void set_local_addresses(std::vector<uint32_t> addrs);
++    void set_trusted_relays(std::vector<BeaconTrustedRelay> relays);
+ 
+     IngestResult ingest(const char* buf, std::size_t len, bool truncated, uint32_t src_ip,
+                         std::chrono::steady_clock::time_point now);
+@@ -133,6 +164,7 @@ public:
+     void set_self_port(int port);
+     // Interface names to listen on; empty means every RFC1918 interface.
+     void set_interface_allowlist(std::vector<std::string> names);
++    void set_trusted_relays(std::vector<BeaconTrustedRelay> relays);
+     bool is_running() const;
+     nlohmann::json status_json() const;
+ 
+diff --git a/src/cpp/server/core/config_effects.cpp b/src/cpp/server/core/config_effects.cpp
+index a3bc8a0d5..4e322f541 100644
+--- a/src/cpp/server/core/config_effects.cpp
++++ b/src/cpp/server/core/config_effects.cpp
+@@ -25,7 +25,7 @@ void ConfigEffects::apply(const std::string& key, const json& value) {
+     if (key == "port" || key == "host" || key == "websocket_port" ||
+         key == "broadcast" || key == "no_broadcast") {
+         ctx_.listener->rebind();
+-    } else if (key == "beacon_listen_interfaces") {
++    } else if (key == "beacon_listen_interfaces" || key == "beacon_trusted_relays") {
+         ctx_.listener->sync_beacon_listener();
+     } else if (key == "beacon_listen") {
+         LOG(INFO, "Server") << "Beacon listener "
+diff --git a/src/cpp/server/core/http_listener.cpp b/src/cpp/server/core/http_listener.cpp
+index 976e468db..a95611735 100644
+--- a/src/cpp/server/core/http_listener.cpp
++++ b/src/cpp/server/core/http_listener.cpp
+@@ -407,6 +407,13 @@ void HttpListener::start() {
+ void HttpListener::sync_beacon_listener() {
+     std::lock_guard<std::mutex> lock(beacon_listener_mtx_);
+     beacon_listener_.set_interface_allowlist(config_->beacon_listen_interfaces());
++    try {
++        beacon_listener_.set_trusted_relays(
++            parse_beacon_trusted_relays(config_->beacon_trusted_relays()));
++    } catch (const std::exception& e) {
++        LOG(ERROR, "Server") << "Ignoring beacon_trusted_relays: " << e.what() << std::endl;
++        beacon_listener_.set_trusted_relays({});
++    }
+     if (!beacon_listener_shutdown_ && config_->beacon_listen()) {
+         beacon_listener_.start(instance_id_, port_.load());
+     } else {
+diff --git a/src/cpp/server/runtime_config.cpp b/src/cpp/server/runtime_config.cpp
+index ddc38a653..f2c3f4cc6 100644
+--- a/src/cpp/server/runtime_config.cpp
++++ b/src/cpp/server/runtime_config.cpp
+@@ -3,6 +3,7 @@
+ #include "lemon/models/configured_catalog.h"
+ #include "lemon/system_info.h"
+ #include "lemon/utils/aixlog.hpp"
++#include "lemon/utils/beacon_listener.h"
+ #include "lemon/utils/http_client.h"
+ #include "lemon/utils/path_utils.h"
+ #include "lemon/utils/rate_limit_utils.h"
+@@ -307,6 +308,9 @@ RuntimeConfig::RuntimeConfig(const json& config)
+     if (config_.contains("beacon_listen_interfaces")) {
+         validate_beacon_listen_interfaces(config_["beacon_listen_interfaces"]);
+     }
++    if (config_.contains("beacon_trusted_relays")) {
++        parse_beacon_trusted_relays(config_["beacon_trusted_relays"]);
++    }
+     // Migrate legacy no_broadcast if present
+     if (config_.contains("no_broadcast")) {
+         if (!config_["no_broadcast"].is_boolean()) {
+@@ -552,6 +556,13 @@ std::vector<std::string> RuntimeConfig::beacon_listen_interfaces() const {
+     return names;
+ }
+ 
++json RuntimeConfig::beacon_trusted_relays() const {
++    std::shared_lock lock(mutex_);
++    auto it = config_.find("beacon_trusted_relays");
++    if (it == config_.end() || !it->is_array()) return json::array();
++    return *it;
++}
++
+ bool RuntimeConfig::inhibit_suspend() const {
+     std::shared_lock lock(mutex_);
+     if (config_.contains("inhibit_suspend")) {
+@@ -1020,6 +1031,8 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
+         }
+     } else if (key == "beacon_listen_interfaces") {
+         validate_beacon_listen_interfaces(value);
++    } else if (key == "beacon_trusted_relays") {
++        parse_beacon_trusted_relays(value);
+     } else if (key == "auto_evict_threshold_pct") {
+         if (!value.is_number()) {
+             throw std::invalid_argument("'auto_evict_threshold_pct' must be a number");
+diff --git a/src/cpp/server/utils/beacon_listener.cpp b/src/cpp/server/utils/beacon_listener.cpp
+index 69dadd9b8..c873917e1 100644
+--- a/src/cpp/server/utils/beacon_listener.cpp
++++ b/src/cpp/server/utils/beacon_listener.cpp
+@@ -135,6 +135,9 @@ const char* ingest_result_name(IngestResult result) {
+         case IngestResult::TableFull: return "table_full";
+         case IngestResult::WrongInterface: return "wrong_interface";
+         case IngestResult::UnknownInterface: return "unknown_interface";
++        case IngestResult::RelayedAccepted: return "relayed_accepted";
++        case IngestResult::RelayedRefreshed: return "relayed_refreshed";
++        case IngestResult::RelayHostRefused: return "relay_host_refused";
+     }
+     return "unknown";
+ }
+@@ -145,8 +148,26 @@ bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
+     return std::find(listened_ifindexes.begin(), listened_ifindexes.end(), ifindex) != listened_ifindexes.end();
+ }
+ 
++bool BeaconHostRange::contains(uint32_t) const {
++    return false;
++}
++
++std::string BeaconHostRange::to_string() const {
++    return utils::ipv4_to_string(network) + "/" + std::to_string(prefix);
++}
++
++std::vector<BeaconTrustedRelay> parse_beacon_trusted_relays(const nlohmann::json&) {
++    return {};
++}
++
++nlohmann::json beacon_trusted_relays_to_json(const std::vector<BeaconTrustedRelay>&) {
++    return nlohmann::json::array();
++}
++
+ BeaconPeerTable::BeaconPeerTable() = default;
+ 
++void BeaconPeerTable::set_trusted_relays(std::vector<BeaconTrustedRelay>) {}
++
+ void BeaconPeerTable::set_self(const std::string& instance_id, int self_port) {
+     std::lock_guard<std::mutex> lock(mutex_);
+     self_instance_id_ = instance_id;
+@@ -447,6 +468,10 @@ BeaconListener::~BeaconListener() {
+     stop();
+ }
+ 
++void BeaconListener::set_trusted_relays(std::vector<BeaconTrustedRelay> relays) {
++    table_.set_trusted_relays(std::move(relays));
++}
++
+ bool BeaconListener::is_running() const {
+     return running_.load();
+ }
+diff --git a/test/cpp/test_beacon_listener_socket.cpp b/test/cpp/test_beacon_listener_socket.cpp
+index 5976212de..06e9477d6 100644
+--- a/test/cpp/test_beacon_listener_socket.cpp
++++ b/test/cpp/test_beacon_listener_socket.cpp
+@@ -228,6 +228,49 @@ int run_netns_tests() {
+         listener.stop();
+     }
+ 
++    {
++        BeaconListener listener;
++        listener.start("6666666666666666", 18999);
++        check(wait_for([&] { return listener.status_json().value("listening", false); },
++                       std::chrono::milliseconds(2000)),
++              "relay listener is listening");
++        const std::string relayed_url = "http://10.99.0.20:65005/api/v1/";
++        check(send_beacon("10.213.0.1", "10.213.0.255", relayed_url, "0123456789abcdef"),
++              "relay sent a beacon advertising another host's URL");
++        check(wait_for([&] { return listener.status_json()["stats"]["url_mismatch"].get<int>() >= 1; },
++                       std::chrono::milliseconds(3000)),
++              "without a trusted relay the relayed beacon is a url_mismatch");
++        check(!host_listed(listener, relayed_url), "without a trusted relay the relayed host is not listed");
++
++        listener.set_trusted_relays(lemon::parse_beacon_trusted_relays(
++            json::array({{{"source", "10.213.0.1"}, {"allow_hosts", json::array({"10.99.0.0/24"})}}})));
++        check(listener.status_json()["trusted_relays"] ==
++                  json::array({{{"source", "10.213.0.1"}, {"allow_hosts", json::array({"10.99.0.0/24"})}}}),
++              "status echoes the trusted relays");
++        send_beacon("10.214.0.1", "10.214.0.255", relayed_url, "0123456789abcdef");
++        send_beacon("10.213.0.1", "10.213.0.255", "http://10.98.0.20:65006/api/v1/", "123456789abcdef0");
++        check(send_beacon("10.213.0.1", "10.213.0.255", relayed_url, "0123456789abcdef"),
++              "trusted relay re-sent the beacon");
++        check(wait_for([&] { return host_listed(listener, relayed_url); }, std::chrono::milliseconds(3000)),
++              "relayed beacon from a trusted relay is listed");
++        json st = listener.status_json();
++        bool via_ok = false;
++        for (const auto& h : st["hosts"]) {
++            if (h["url"] == relayed_url) via_ok = h["via"] == "10.213.0.1" && h["source_ip"] == "10.213.0.1";
++        }
++        check(via_ok, "relayed host shows via = the relay's address");
++        check(st["stats"].value("relayed_accepted", -1) == 1 && st["stats"].value("accepted", -1) == 0,
++              "relayed host counted in relayed_accepted, not accepted");
++        check(st["stats"].value("relay_host_refused", -1) >= 1,
++              "relayed URL outside allow_hosts counted as relay_host_refused");
++        check(st["stats"]["url_mismatch"].get<int>() >= 2, "an untrusted sender advertising the host stays url_mismatch");
++        check(!host_listed(listener, "http://10.98.0.20:65006/api/v1/"), "host outside allow_hosts is not listed");
++
++        listener.set_trusted_relays({});
++        check(!host_listed(listener, relayed_url), "clearing the trusted relays drops the relayed host");
++        listener.stop();
++    }
++
+     return test_helpers::report_results("beacon listener netns broadcast");
+ }
+ 
+diff --git a/test/cpp/test_beacon_peer_table.cpp b/test/cpp/test_beacon_peer_table.cpp
+index bb6373055..a7723bb20 100644
+--- a/test/cpp/test_beacon_peer_table.cpp
++++ b/test/cpp/test_beacon_peer_table.cpp
+@@ -407,6 +407,154 @@ void test_single_source_flood(Clock::time_point t0) {
+     check(feed(t, beacon(url_for(fresh)), fresh, t0) == IngestResult::Accepted,
+           "single source: a new peer is still accepted during the flood");
+ }
++
++std::vector<lemon::BeaconTrustedRelay> relays_from(const json& j) {
++    return lemon::parse_beacon_trusted_relays(j);
++}
++
++void test_trusted_relay(Clock::time_point t0) {
++    uint32_t relay = ip(192, 168, 60, 10);
++    uint32_t ai4 = ip(192, 168, 79, 20);
++    std::string p = beacon(url_for(ai4), "ai4-resolute", "0a1b2c3d4e5f6071");
++    json config = json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.20"})}}});
++
++    {
++        BeaconPeerTable t;
++        check(feed(t, p, relay, t0) == IngestResult::UrlMismatch, "relay: default [] keeps url_mismatch");
++        check(t.size() == 0, "relay: default [] lists nothing");
++    }
++    {
++        BeaconPeerTable t;
++        t.set_trusted_relays(relays_from(config));
++        check(feed(t, p, relay, t0) == IngestResult::RelayedAccepted, "relay: listed source + allowed host accepted");
++        check(feed(t, p, relay, t0 + std::chrono::seconds(2)) == IngestResult::RelayedRefreshed,
++              "relay: repeat is RelayedRefreshed");
++        json j = t.to_json(t0 + std::chrono::seconds(2));
++        check(j["hosts"].size() == 1 && j["hosts"][0]["url"] == url_for(ai4) &&
++                  j["hosts"][0]["via"] == "192.168.60.10" && j["hosts"][0]["source_ip"] == "192.168.60.10",
++              "relay: host listed with via = relay source");
++        check(j["stats"]["relayed_accepted"] == 1 && j["stats"]["accepted"] == 0 &&
++                  j["stats"]["relayed_refreshed"] == 1 && j["stats"]["refreshed"] == 0,
++              "relay: relayed_accepted counted separately from accepted");
++
++        uint32_t direct = ip(192, 168, 60, 11);
++        check(feed(t, beacon(url_for(direct)), direct, t0) == IngestResult::Accepted,
++              "relay: a direct peer alongside is Accepted");
++        json k = t.to_json(t0 + std::chrono::seconds(2));
++        bool direct_via_null = false;
++        for (const auto& h : k["hosts"]) {
++            if (h["url"] == url_for(direct)) direct_via_null = h["via"].is_null();
++        }
++        check(direct_via_null, "relay: a direct host has via null");
++
++        check(feed(t, p, ai4, t0 + std::chrono::seconds(3)) == IngestResult::Refreshed,
++              "relay: the same URL heard directly refreshes the row");
++        json d = t.to_json(t0 + std::chrono::seconds(3));
++        bool cleared = false;
++        for (const auto& h : d["hosts"]) {
++            if (h["url"] == url_for(ai4)) cleared = h["via"].is_null() && h["source_ip"] == "192.168.79.20";
++        }
++        check(cleared, "relay: a direct refresh clears via");
++    }
++    {
++        BeaconPeerTable t;
++        t.set_trusted_relays(relays_from(config));
++        uint32_t other = ip(192, 168, 79, 21);
++        check(feed(t, beacon(url_for(other)), relay, t0) == IngestResult::RelayHostRefused,
++              "relay: URL host outside allow_hosts refused");
++        check(t.size() == 0 && t.stat(IngestResult::RelayHostRefused) == 1 &&
++                  t.stat(IngestResult::UrlMismatch) == 0,
++              "relay: refusal counted as relay_host_refused, nothing listed");
++    }
++    {
++        BeaconPeerTable t;
++        t.set_trusted_relays(relays_from(config));
++        uint32_t stranger = ip(192, 168, 60, 12);
++        check(feed(t, p, stranger, t0) == IngestResult::UrlMismatch, "relay: unlisted source stays url_mismatch");
++        check(t.size() == 0, "relay: unlisted source lists nothing");
++    }
++    {
++        BeaconPeerTable t;
++        lemon::BeaconTrustedRelay wide;
++        wide.source = relay;
++        wide.allow_hosts.push_back({0, 0});
++        t.set_trusted_relays({wide});
++        check(feed(t, beacon(url_for(ip(8, 8, 8, 8))), relay, t0) == IngestResult::RelayHostRefused,
++              "relay: public URL host refused even when allow_hosts would cover it");
++        check(feed(t, beacon(url_for(ip(100, 64, 0, 1))), relay, t0 + std::chrono::seconds(1)) ==
++                  IngestResult::RelayHostRefused,
++              "relay: CGNAT URL host refused");
++        check(feed(t, beacon(url_for(ai4)), ip(8, 8, 8, 8), t0) == IngestResult::BadSource,
++              "relay: public datagram source is still BadSource");
++    }
++    {
++        BeaconPeerTable t;
++        t.set_self("ffffffffffffffff", 13305);
++        t.set_trusted_relays(relays_from(config));
++        check(feed(t, beacon(url_for(ai4), "me", "ffffffffffffffff"), relay, t0) == IngestResult::Self,
++              "relay: our own beacon relayed back is Self");
++        BeaconPeerTable u;
++        u.set_self("ffffffffffffffff", 13305);
++        u.set_local_addresses({ai4});
++        u.set_trusted_relays(relays_from(config));
++        check(feed(u, beacon(url_for(ai4), "me"), relay, t0) == IngestResult::Self,
++              "relay: our own id-less beacon relayed back is Self");
++    }
++    {
++        BeaconPeerTable t;
++        t.set_trusted_relays(relays_from(config));
++        feed(t, p, relay, t0);
++        t.set_trusted_relays({});
++        check(t.size() == 0, "relay: removing the relay drops the rows it vouched for");
++        check(feed(t, p, relay, t0 + std::chrono::seconds(1)) == IngestResult::UrlMismatch,
++              "relay: removal takes effect for the next datagram");
++    }
++    {
++        BeaconPeerTable t;
++        t.set_trusted_relays(relays_from(
++            json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.0/24"})}}})));
++        int admitted = 0;
++        for (int i = 0; i < 20; ++i) {
++            IngestResult r = feed(t, p, relay, t0);
++            if (r == IngestResult::RelayedAccepted || r == IngestResult::RelayedRefreshed) ++admitted;
++        }
++        check(admitted == static_cast<int>(lemon::kPerSourceBurst),
++              "relay: one relayed host is held to the per-source burst");
++
++        int accepted = 0;
++        for (int h = 1; h <= 40; ++h) {
++            auto now = t0 + std::chrono::seconds(10) + std::chrono::milliseconds(h * 200);
++            if (feed(t, beacon(url_for(ip(192, 168, 79, 100 + h))), relay, now) == IngestResult::RelayedAccepted) {
++                ++accepted;
++            }
++        }
++        check(accepted == static_cast<int>(lemon::kMaxRelayedHostsPerRelay),
++              "relay: one relay lists at most kMaxRelayedHostsPerRelay hosts");
++
++        int burst = 0;
++        auto later = t0 + std::chrono::milliseconds(18200);
++        for (int i = 0; i < 100; ++i) {
++            uint32_t host = ip(192, 168, 79, 101 + (i % 16));
++            IngestResult r = feed(t, beacon(url_for(host)), relay, later);
++            if (r != IngestResult::RateLimited) ++burst;
++        }
++        check(burst <= static_cast<int>(lemon::kRelayBurst), "relay: a relay's total burst is bounded");
++    }
++    {
++        BeaconPeerTable t;
++        t.set_trusted_relays(relays_from(
++            json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.0/24"})}}})));
++        int admitted = 0;
++        for (int i = 0; i < 10; ++i) {
++            for (uint32_t host : {ip(192, 168, 79, 20), ip(192, 168, 79, 21)}) {
++                IngestResult r = feed(t, beacon(url_for(host)), relay, t0);
++                if (r == IngestResult::RelayedAccepted || r == IngestResult::RelayedRefreshed) ++admitted;
++            }
++        }
++        check(admitted == 2 * static_cast<int>(lemon::kPerSourceBurst),
++              "relay: each relayed host gets its own per-source burst");
++    }
++}
+ } // namespace
+ 
+ int main() {
+@@ -427,6 +575,7 @@ int main() {
+     test_flood_survival(t0);
+     test_pinned_junk_flood(t0);
+     test_single_source_flood(t0);
++    test_trusted_relay(t0);
+ 
+     return test_helpers::report_results("beacon peer table");
+ }
+diff --git a/test/cpp/test_config_discovery.cpp b/test/cpp/test_config_discovery.cpp
+index 7cec9046f..ee67ff498 100644
+--- a/test/cpp/test_config_discovery.cpp
++++ b/test/cpp/test_config_discovery.cpp
+@@ -4,12 +4,14 @@
+ #include <iostream>
+ #include <stdexcept>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include <nlohmann/json.hpp>
+ #include <lemon/cli_parser.h>
+ #include <lemon/config_file.h>
+ #include <lemon/runtime_config.h>
++#include <lemon/utils/beacon_listener.h>
+ 
+ #include "test_config_helpers.h"
+ 
+@@ -311,5 +313,93 @@ int main() {
+               "ConfigFile defaults include beacon_listen_interfaces: []");
+     }
+ 
++    // 13. beacon_trusted_relays: default, round-trip, and rejection of bad shapes
++    {
++        RuntimeConfig relay_cfg(base_cfg);
++        check(relay_cfg.beacon_trusted_relays() == json::array(), "beacon_trusted_relays defaults to []");
++        json good = json::array({{{"source", "192.168.60.10"},
++                                  {"allow_hosts", json::array({"192.168.79.20", "10.20.0.0/16"})}}});
++        relay_cfg.set({{"beacon_trusted_relays", good}});
++        check(relay_cfg.beacon_trusted_relays() == good, "beacon_trusted_relays round-trips");
++        check(relay_cfg.snapshot()["beacon_trusted_relays"] == good, "snapshot reflects beacon_trusted_relays");
++        auto parsed = lemon::parse_beacon_trusted_relays(good);
++        check(parsed.size() == 1 && parsed[0].source == 0xC0A83C0Au && parsed[0].allow_hosts.size() == 2 &&
++                  parsed[0].allow_hosts[0].prefix == 32 && parsed[0].allow_hosts[1].network == 0x0A140000u &&
++                  parsed[0].allow_hosts[1].prefix == 16,
++              "parse_beacon_trusted_relays decodes source, a bare host and a CIDR");
++        check(lemon::beacon_trusted_relays_to_json(parsed) ==
++                  json::array({{{"source", "192.168.60.10"},
++                                {"allow_hosts", json::array({"192.168.79.20/32", "10.20.0.0/16"})}}}),
++              "trusted relays serialise with canonical CIDRs");
++        relay_cfg.set({{"beacon_trusted_relays", json::array()}});
++        check(relay_cfg.beacon_trusted_relays() == json::array(), "beacon_trusted_relays cleared");
++
++        auto relay = [](const json& source, const json& hosts) {
++            return json::array({{{"source", source}, {"allow_hosts", hosts}}});
++        };
++        json too_many = json::array();
++        for (int i = 0; i < 17; ++i) {
++            too_many.push_back({{"source", "10.0.0." + std::to_string(i + 1)},
++                                {"allow_hosts", json::array({"10.1.0.1"})}});
++        }
++        json duplicate = relay("10.0.0.1", json::array({"10.1.0.1"}));
++        duplicate.push_back(duplicate[0]);
++        std::vector<std::pair<std::string, json>> bad_values = {
++            {"not an array", json({{"source", "10.0.0.1"}})},
++            {"entry not an object", json::array({"10.0.0.1"})},
++            {"missing source", json::array({{{"allow_hosts", json::array({"10.1.0.1"})}}})},
++            {"missing allow_hosts", json::array({{{"source", "10.0.0.1"}}})},
++            {"unknown field", json::array({{{"source", "10.0.0.1"},
++                                            {"allow_hosts", json::array({"10.1.0.1"})},
++                                            {"trust", true}}})},
++            {"source not a string", relay(42, json::array({"10.1.0.1"}))},
++            {"source hostname", relay("relay.lan", json::array({"10.1.0.1"}))},
++            {"source leading zero", relay("192.168.060.10", json::array({"10.1.0.1"}))},
++            {"source with prefix", relay("192.168.60.10/32", json::array({"10.1.0.1"}))},
++            {"source public", relay("8.8.8.8", json::array({"10.1.0.1"}))},
++            {"allow_hosts empty", relay("10.0.0.1", json::array())},
++            {"allow_hosts not array", relay("10.0.0.1", "10.1.0.1")},
++            {"allow_hosts entry not string", relay("10.0.0.1", json::array({1}))},
++            {"allow_hosts garbage", relay("10.0.0.1", json::array({"ai4"}))},
++            {"allow_hosts public host", relay("10.0.0.1", json::array({"8.8.8.8"}))},
++            {"allow_hosts public cidr", relay("10.0.0.1", json::array({"0.0.0.0/0"}))},
++            {"allow_hosts cidr wider than rfc1918", relay("10.0.0.1", json::array({"192.168.0.0/15"}))},
++            {"allow_hosts cidr straddles rfc1918", relay("10.0.0.1", json::array({"172.0.0.0/8"}))},
++            {"allow_hosts prefix out of range", relay("10.0.0.1", json::array({"10.1.0.0/33"}))},
++            {"allow_hosts empty prefix", relay("10.0.0.1", json::array({"10.1.0.0/"}))},
++            {"allow_hosts host bits set", relay("10.0.0.1", json::array({"10.1.0.5/24"}))},
++            {"allow_hosts too many", relay("10.0.0.1", json(std::vector<std::string>(33, "10.1.0.1")))},
++            {"too many relays", too_many},
++            {"duplicate source", duplicate},
++        };
++        for (const auto& [label, bad] : bad_values) {
++            bool threw = false;
++            std::string message;
++            try {
++                relay_cfg.set({{"beacon_trusted_relays", bad}});
++            } catch (const std::invalid_argument& e) {
++                threw = true;
++                message = e.what();
++            }
++            check(threw && message.find("beacon_trusted_relays") != std::string::npos,
++                  ("set() rejects beacon_trusted_relays: " + label).c_str());
++        }
++        check(relay_cfg.beacon_trusted_relays() == json::array(), "a rejected set() leaves the relays unchanged");
++
++        bool threw_ctor = false;
++        try {
++            json bad = base_cfg;
++            bad["beacon_trusted_relays"] = relay("8.8.8.8", json::array({"10.1.0.1"}));
++            RuntimeConfig bad_cfg(bad);
++        } catch (const std::invalid_argument&) {
++            threw_ctor = true;
++        }
++        check(threw_ctor, "constructor rejects a malformed beacon_trusted_relays");
++
++        json defaults = ConfigFile::get_defaults();
++        check(defaults.contains("beacon_trusted_relays") && defaults["beacon_trusted_relays"] == json::array(),
++              "ConfigFile defaults include beacon_trusted_relays: []");
++    }
++
+     return test_helpers::report_results("C++ config/discovery");
+ }
+-- 
+2.53.0
+

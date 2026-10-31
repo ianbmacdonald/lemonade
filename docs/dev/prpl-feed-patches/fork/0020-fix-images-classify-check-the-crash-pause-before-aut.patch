@@ -1,0 +1,140 @@
+From 3e9c8fe6a5e57c2ee0ba9191ab1fe1cc37d6106f Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:43:46 -0400
+Subject: [PATCH 20/58] fix(images/classify): check the crash pause before
+ auto-loading the model
+
+A named model whose backend had crashed was reloaded by
+auto_load_model_if_needed before Router::classify_image saw the pause, so
+paused requests still restarted the backend. The handler now asks the router
+first, and the pause is keyed by the resolved model name so the public and
+user. forms of a name share it.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/router.h                |  4 +++
+ src/cpp/server/router.cpp                     | 31 ++++++++++++-------
+ .../lemonade/inference/images_classify.cpp    | 11 +++++++
+ test/server_image_classify.py                 |  4 +++
+ 4 files changed, 39 insertions(+), 11 deletions(-)
+
+diff --git a/src/cpp/include/lemon/router.h b/src/cpp/include/lemon/router.h
+index 4f45f5a5e..a92ef8410 100644
+--- a/src/cpp/include/lemon/router.h
++++ b/src/cpp/include/lemon/router.h
+@@ -231,6 +231,10 @@ public:
+     json classify(const json& request);
+     nlohmann::ordered_json systemone(const nlohmann::ordered_json& request);
+     json classify_image(const json& params, std::string image_bytes);
++    // The 503 error to return while image classification for this model is
++    // paused after repeated backend crashes; checked before any auto-load so a
++    // paused model is not reloaded either.
++    std::optional<json> image_classify_cooldown_error(const std::string& model_name);
+     json get_slots();
+     json slots_action(int slot_id, const std::string& action, const json& request_body);
+     json tokenize(const json& request);
+diff --git a/src/cpp/server/router.cpp b/src/cpp/server/router.cpp
+index 426a31171..008c7bdba 100644
+--- a/src/cpp/server/router.cpp
++++ b/src/cpp/server/router.cpp
+@@ -2216,18 +2216,26 @@ nlohmann::ordered_json Router::systemone(const nlohmann::ordered_json& request)
+     }
+ }
+ 
++std::optional<json> Router::image_classify_cooldown_error(const std::string& model_name) {
++    const long long wait = image_crash_breaker_.blocked_seconds(
++        resolve_model_name(model_name), CrashBreaker::Clock::now());
++    if (wait == 0) {
++        return std::nullopt;
++    }
++    return json{{"error", {
++        {"message", "The backend for model '" + model_name +
++                        "' crashed repeatedly on recent inputs; image classification is paused"},
++        {"type", ErrorType::BACKEND_ERROR},
++        {"code", "backend_crash_cooldown"},
++        {"status_code", 503},
++        {"retry_after", wait},
++        {"retryable", true}}}};
++}
++
+ json Router::classify_image(const json& params, std::string image_bytes) {
+     std::string requested_model = params.value("model", "");
+-    if (const long long wait = image_crash_breaker_.blocked_seconds(
+-            requested_model, CrashBreaker::Clock::now())) {
+-        return json{{"error", {
+-            {"message", "The backend for model '" + requested_model +
+-                            "' crashed repeatedly on recent inputs; image classification is paused"},
+-            {"type", ErrorType::BACKEND_ERROR},
+-            {"code", "backend_crash_cooldown"},
+-            {"status_code", 503},
+-            {"retry_after", wait},
+-            {"retryable", true}}}};
++    if (auto paused = image_classify_cooldown_error(requested_model)) {
++        return *paused;
+     }
+     std::shared_ptr<telemetry::InferenceSpan> span = telemetry::TelemetryTracker::start_span(
+         "CLASSIFIER", "image_classify", requested_model, params);
+@@ -2252,7 +2260,8 @@ json Router::classify_image(const json& params, std::string image_bytes) {
+ 
+         if (response.contains("error") && response["error"].is_object() &&
+             response["error"].value("code", "") == "backend_crashed_on_input" &&
+-            image_crash_breaker_.record_crash(requested_model, CrashBreaker::Clock::now())) {
++            image_crash_breaker_.record_crash(resolve_model_name(requested_model),
++                                              CrashBreaker::Clock::now())) {
+             LOG(WARNING, "Router") << "Image classification for '" << requested_model
+                                    << "' paused after repeated backend crashes" << std::endl;
+         }
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index a458a7ff7..3c38675e5 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -179,6 +179,15 @@ public:
+ 
+     void handle(RouteRequest& req, httplib::Response& res) override {
+         const httplib::Request& http = req.http;
++        auto send_if_paused = [this, &res](const std::string& model) {
++            auto paused = ctx_.router->image_classify_cooldown_error(model);
++            if (!paused) return false;
++            res.status = 503;
++            res.set_header("Retry-After",
++                           std::to_string((*paused)["error"]["retry_after"].get<long long>()));
++            res.set_content(paused->dump(), "application/json");
++            return true;
++        };
+         try {
+             std::uint64_t received = http.body.size();
+             for (const auto& [name, field] : http.form.fields) received += name.size() + field.content.size();
+@@ -234,6 +243,7 @@ public:
+                                        "model '" + model + "' is not an image-classification model");
+                     return;
+                 }
++                if (send_if_paused(model)) return;
+                 try {
+                     ctx_.model_loader->ensure_loaded(model);
+                 } catch (const std::exception& e) {
+@@ -251,6 +261,7 @@ public:
+                         "is loaded (load one, or name it in the request)");
+                     return;
+                 }
++                if (send_if_paused(model)) return;
+                 params["model"] = model;
+             }
+ 
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index 7a6673905..6e65c4c67 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -599,6 +599,10 @@ class ImageClassifyTests(ServerTestBase):
+             data={"model": MODEL, "top_k": "1"},
+         )
+         self._assert_status(response, 503, "good image while paused")
++        implicit = self._post_form(
++            {"image": ("g.jpg", self._fixture(), "image/jpeg")}, data={"top_k": "1"}
++        )
++        self._assert_status(implicit, 503, "implicit model while paused")
+         self.assertEqual(lines(crashes), crashes_before, "paused model crashed again")
+         self.assertEqual(lines(starts), starts_before, "paused model was reloaded")
+ 
+-- 
+2.53.0
+

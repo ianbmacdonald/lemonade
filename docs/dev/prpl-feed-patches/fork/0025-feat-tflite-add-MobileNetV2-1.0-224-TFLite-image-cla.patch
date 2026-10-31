@@ -1,0 +1,37 @@
+From 81047ec9de5a03809d7b4cf70601a8821d541667 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 17:28:33 -0400
+Subject: [PATCH 25/58] feat(tflite): add MobileNetV2-1.0-224-TFLite image
+ classifier to the registry
+
+The checkpoint is a complete tflite-server image model directory
+(model.tflite, labels.txt, manifest.json with task image-classification);
+the tflite recipe pulls the whole repo and resolves the directory holding
+model.tflite.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/resources/server_models.json | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/cpp/resources/server_models.json b/src/cpp/resources/server_models.json
+index f6788c9fd..831dc3c75 100644
+--- a/src/cpp/resources/server_models.json
++++ b/src/cpp/resources/server_models.json
+@@ -3001,5 +3001,13 @@
+             "reasoning"
+         ],
+         "size": 0.5
++    },
++    "MobileNetV2-1.0-224-TFLite": {
++        "checkpoint": "imacdonald/mobilenet_v2_1.0_224-tflite",
++        "recipe": "tflite",
++        "labels": [
++            "image-classification"
++        ],
++        "size": 0.014
+     }
+ }
+-- 
+2.53.0
+

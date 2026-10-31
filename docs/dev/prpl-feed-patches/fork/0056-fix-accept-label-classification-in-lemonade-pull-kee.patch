@@ -1,0 +1,53 @@
+From 44c777828185be827179cadb62a2d2308535e0bf Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 02:41:57 -0400
+Subject: [PATCH 56/58] fix: accept --label classification in lemonade pull;
+ keep pull route off the models layer
+
+llamacpp now serves classification for systemone models, so the CLI label
+list needs it. FacadeShapeTest keeps routes off models-layer headers.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon_cli/pull_labels.h        | 1 +
+ src/cpp/server/routes/lemonade/models/pull.cpp | 5 ++---
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/cpp/include/lemon_cli/pull_labels.h b/src/cpp/include/lemon_cli/pull_labels.h
+index 45558e855..fe607aeee 100644
+--- a/src/cpp/include/lemon_cli/pull_labels.h
++++ b/src/cpp/include/lemon_cli/pull_labels.h
+@@ -10,6 +10,7 @@ inline const std::vector<std::string>& pull_labels() {
+     static const std::vector<std::string> labels = {
+         "audio-generation",
+         "chat",
++        "classification",
+         "coding",
+         "dflash",
+         "embeddings",
+diff --git a/src/cpp/server/routes/lemonade/models/pull.cpp b/src/cpp/server/routes/lemonade/models/pull.cpp
+index 9e85ead8e..f2d3501f5 100644
+--- a/src/cpp/server/routes/lemonade/models/pull.cpp
++++ b/src/cpp/server/routes/lemonade/models/pull.cpp
+@@ -7,7 +7,6 @@
+ #include "lemon/server/model_sync.h"
+ #include "lemon/model_manager.h"
+ #include "lemon/model_types.h"
+-#include "lemon/models/registry_descriptors.h"
+ #include "lemon/models/registry_types.h"
+ #include "lemon/runtime_config.h"
+ #include "lemon/server/api_route.h"
+@@ -471,8 +470,8 @@ private:
+         }
+         bool hugging_face = false;
+         try {
+-            hugging_face = parse_remote_registry_source(pinned_registry) ==
+-                           models::huggingface_descriptor().id;
++            hugging_face = remote_registry_source_name(
++                               parse_remote_registry_source(pinned_registry)) == "huggingface";
+         } catch (const std::exception&) {
+             // An unrecognized registry name cannot be pinned either.
+         }
+-- 
+2.53.0
+

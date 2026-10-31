@@ -1,0 +1,1216 @@
+From 8d7f6d0e5b4843664f8e18f6cf4e1909de676915 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Fri, 9 Oct 2026 02:18:39 -0400
+Subject: [PATCH 47/58] feat(server): gateway limits - body limit setting,
+ receive deadline, per-client cap, classify text checks
+
+max_request_body_mb (default 100) replaces cpp-httplib's compile-time payload
+default. request_receive_timeout (default 0, off) bounds the time from accept
+to the route handler, enforced by a watchdog that shuts down a duplicate of the
+socket; while it is set each connection carries one request.
+max_connections_per_client (default 0, off) refuses further connections from
+one address with 503; loopback is exempt. All three rebuild the HTTP listeners
+when changed. The onnxruntime and tflite classify backends now refuse text over
+1 MiB before forwarding, sharing the check executorch had.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                                |  27 ++
+ docs/guide/configuration/README.md            |   6 +
+ src/cpp/include/lemon/classify_text_limit.h   |  32 +++
+ src/cpp/include/lemon/connection_guard.h      | 107 ++++++++
+ src/cpp/include/lemon/runtime_config.h        |   8 +
+ src/cpp/include/lemon/server/http_listener.h  |   8 +
+ .../include/lemon/upgradable_http_server.h    |  72 +++++
+ src/cpp/resources/defaults.json               |   3 +
+ .../backends/executorch/executorch_server.cpp |  16 +-
+ .../onnxruntime/onnxruntime_server.cpp        |   4 +
+ .../server/backends/tflite/tflite_server.cpp  |   4 +
+ src/cpp/server/connection_guard.cpp           | 257 ++++++++++++++++++
+ src/cpp/server/core/config_effects.cpp        |   5 +
+ src/cpp/server/core/http_listener.cpp         |  59 ++++
+ src/cpp/server/runtime_config.cpp             |  52 ++++
+ test/cpp/test_config_gateway_limits.cpp       |  69 +++++
+ test/cpp/test_connection_guard.cpp            | 152 +++++++++++
+ 17 files changed, 868 insertions(+), 13 deletions(-)
+ create mode 100644 src/cpp/include/lemon/classify_text_limit.h
+ create mode 100644 src/cpp/include/lemon/connection_guard.h
+ create mode 100644 src/cpp/server/connection_guard.cpp
+ create mode 100644 test/cpp/test_config_gateway_limits.cpp
+ create mode 100644 test/cpp/test_connection_guard.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e8c11855f..53ed611be 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1123,6 +1123,7 @@ set(SOURCES_CORE
+     src/cpp/server/routing_policy_parser.cpp
+     src/cpp/server/routing_policy_store.cpp
+     src/cpp/server/route_decision_response.cpp
++    src/cpp/server/connection_guard.cpp
+     src/cpp/server/runtime_config.cpp
+     src/cpp/server/telemetry.cpp
+     src/cpp/server/logging_config.cpp
+@@ -3794,6 +3795,32 @@ if(BUILD_TESTING AND EXISTS "${_CONFIG_DOWNLOAD_RATE_LIMIT_TEST_SRC}")
+     )
+ endif()
+ 
++set(_CONFIG_GATEWAY_LIMITS_TEST_SRC
++    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_config_gateway_limits.cpp"
++)
++if(BUILD_TESTING AND EXISTS "${_CONFIG_GATEWAY_LIMITS_TEST_SRC}")
++    add_executable(test_config_gateway_limits
++        test/cpp/test_config_gateway_limits.cpp
++    )
++    target_link_libraries(test_config_gateway_limits PRIVATE lemonade-server-core)
++    add_cpp_ci_test(ConfigGatewayLimitsTest CI ON
++        COMMAND test_config_gateway_limits
++    )
++endif()
++
++set(_CONNECTION_GUARD_TEST_SRC
++    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_connection_guard.cpp"
++)
++if(BUILD_TESTING AND EXISTS "${_CONNECTION_GUARD_TEST_SRC}")
++    add_executable(test_connection_guard
++        test/cpp/test_connection_guard.cpp
++    )
++    target_link_libraries(test_connection_guard PRIVATE lemonade-server-core)
++    add_cpp_ci_test(ConnectionGuardTest CI ON
++        COMMAND test_connection_guard
++    )
++endif()
++
+ set(_CONFIG_ALLOWED_ORIGINS_TEST_SRC
+     "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_config_allowed_origins.cpp"
+ )
+diff --git a/docs/guide/configuration/README.md b/docs/guide/configuration/README.md
+index b48c90631..c1bbb23fb 100644
+--- a/docs/guide/configuration/README.md
++++ b/docs/guide/configuration/README.md
+@@ -102,7 +102,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
+   "log_level": "info",
+   "log_max_file_size_mb": 10,
+   "log_max_files": 5,
++  "max_connections_per_client": 0,
+   "max_loaded_models": 1,
++  "max_request_body_mb": 100,
+   "model_catalogs": [],
+   "models_dir": "auto",
+   "moonshine": {
+@@ -123,6 +125,7 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
+     "vulkan_bin": "builtin"
+   },
+   "port": 13305,
++  "request_receive_timeout": 0,
+   "rocm_channel": "stable",
+   "rocm_install_method": "auto",
+   "ryzenai": {
+@@ -225,6 +228,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
+ | `log_max_files` | int | 5 | Max number of rotated log backup files to retain (.1 through .N); legacy oversized files are rotated into .1 and pruned over cycles |
+ | `global_timeout` | int | 600 | Timeout in seconds for HTTP, inference, and readiness checks |
+ | `max_loaded_models` | int | 1 | Max models per type slot. Use -1 for unlimited |
++| `max_request_body_mb` | int | 100 | Largest request body the server accepts, in MB (1–4096). A larger body is refused with 413 before it is buffered. On a memory-constrained gateway set it lower, for example `32`: that still fits a 25 MB audio upload. Changing it restarts the HTTP listeners. |
++| `request_receive_timeout` | int | 0 | Seconds a client has to send a complete request, headers and body, measured from when the connection is accepted (0–3600). `0` turns the limit off. The read timeout alone only limits the gap between two reads, so a client that sends a byte every few seconds can otherwise hold a worker thread indefinitely. While it is set, each connection carries one request (no keep-alive reuse). Not enforced on Windows. Changing it restarts the HTTP listeners. |
++| `max_connections_per_client` | int | 0 | Most connections one client address may have open at once (0–1024). `0` means no limit. Further connections are refused with 503. Loopback clients are exempt. Changing it restarts the HTTP listeners. |
+ | `auto_evict` | bool | false | Enable dynamic VRAM management based on idle time and global GPU memory pressure. Can be overridden per model. |
+ | `auto_evict_threshold_pct` | number | 0.90 | Global VRAM fraction at which pressure eviction is evaluated. Must be greater than 0 and at most 1.0; `0.90` means 90%. |
+ | `beacon_listen` | bool | false | Linux/macOS only. Listen on UDP 13305 for other Lemonade servers' LAN broadcast beacons from on-link RFC1918 senders and list them under `beacon_listener` in `/v1/health`. Heard hosts are never contacted and never used as providers. The list is as readable as `/health`, so set `LEMONADE_API_KEY` when `host` is not localhost. `stats.url_mismatch` counts multi-homed peers whose source IP differs from their advertised URL, and beacons re-sent by a relay that is not listed in `beacon_trusted_relays`. UDP 13305 must be allowed inbound on the LAN side. By default it hears every RFC1918 interface, so on a gateway whose WAN side is also RFC1918 (double NAT), set `beacon_listen_interfaces` to the LAN bridges, or WAN-side hosts are listed too. |
+diff --git a/src/cpp/include/lemon/classify_text_limit.h b/src/cpp/include/lemon/classify_text_limit.h
+new file mode 100644
+index 000000000..297d41e42
+--- /dev/null
++++ b/src/cpp/include/lemon/classify_text_limit.h
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <cstddef>
++#include <optional>
++#include <string>
++
++#include <nlohmann/json.hpp>
++
++namespace lemon {
++namespace classify_text {
++
++// Upper bound on the text a classify backend forwards to its engine server.
++// The engine servers refuse far smaller bodies themselves (64 KiB); checking
++// here keeps lemond from serializing and sending a large request at all.
++constexpr size_t kMaxTextBytes = 1024 * 1024;
++
++// The error response for text over the limit, or nullopt when it fits.
++inline std::optional<nlohmann::json> too_large_error(const std::string& text) {
++    if (text.size() <= kMaxTextBytes) {
++        return std::nullopt;
++    }
++    return nlohmann::json{
++        {"error", {
++            {"message", "Classify text exceeds " + std::to_string(kMaxTextBytes) + " bytes"},
++            {"type", "invalid_request_error"},
++            {"status_code", 413},
++        }}
++    };
++}
++
++} // namespace classify_text
++} // namespace lemon
+diff --git a/src/cpp/include/lemon/connection_guard.h b/src/cpp/include/lemon/connection_guard.h
+new file mode 100644
+index 000000000..7f94da0e4
+--- /dev/null
++++ b/src/cpp/include/lemon/connection_guard.h
+@@ -0,0 +1,107 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "lemon/utils/network_utils.h"
++
++namespace lemon {
++
++// Per-connection limits for the LAN-facing HTTP listener: a cap on concurrent
++// connections per client address, and a deadline for receiving each request.
++//
++// cpp-httplib's read timeout is per read, so a client that sends one byte just
++// inside it can hold a worker thread indefinitely. The deadline is measured
++// from accept until the route handler starts, which is the point where the
++// headers and body have both been read. The server limits each connection to
++// one request while the deadline is enabled, so every request starts at
++// accept. A watchdog thread shuts down connections that miss the deadline.
++class ConnectionGuard {
++public:
++    using Clock = std::chrono::steady_clock;
++
++    struct Limits {
++        std::chrono::seconds receive_timeout{0};  // 0 = no deadline
++        size_t max_connections_per_client = 0;     // 0 = no cap
++    };
++
++    struct Entry {
++        socket_t watch_sock;  // a dup of the accepted socket; owned by the entry
++        std::string client;
++        Clock::time_point accepted;
++        std::atomic<bool> receiving{true};
++        std::atomic<bool> expired{false};
++    };
++
++    // Held by the thread serving a connection for its whole lifetime.
++    class Ticket {
++    public:
++        Ticket() = default;
++        Ticket(ConnectionGuard* guard, std::shared_ptr<Entry> entry);
++        Ticket(Ticket&& other) noexcept;
++        Ticket& operator=(Ticket&& other) noexcept;
++        Ticket(const Ticket&) = delete;
++        Ticket& operator=(const Ticket&) = delete;
++        ~Ticket();
++
++    private:
++        void release();
++        ConnectionGuard* guard_ = nullptr;
++        std::shared_ptr<Entry> entry_;
++    };
++
++    explicit ConnectionGuard(Limits limits, bool start_watchdog = true);
++    ~ConnectionGuard();
++    ConnectionGuard(const ConnectionGuard&) = delete;
++    ConnectionGuard& operator=(const ConnectionGuard&) = delete;
++
++    const Limits& limits() const { return limits_; }
++    bool deadline_enabled() const { return limits_.receive_timeout.count() > 0; }
++
++    // Admits a connection from `client` (normalized address). Returns false when
++    // the client is at its cap; the caller then refuses and closes the socket.
++    // On success `ticket` tracks the connection until it is destroyed.
++    bool admit(socket_t sock, const std::string& client, Ticket& ticket,
++               Clock::time_point now = Clock::now());
++
++    // Called on the serving thread when the route handler starts.
++    static void mark_request_received();
++
++    // Entries whose deadline has passed at `now`, marked expired. The watchdog
++    // shuts their sockets down; exposed so tests can drive time directly.
++    std::vector<std::shared_ptr<Entry>> collect_expired(Clock::time_point now);
++
++    size_t connections_for(const std::string& client) const;
++    size_t tracked() const;
++
++    // Peer address of an accepted socket as a string, with IPv4-mapped IPv6
++    // addresses reduced to IPv4. Empty when the address cannot be read.
++    static std::string peer_address(socket_t sock);
++    static std::string normalize_address(const std::string& addr);
++    static bool is_loopback(const std::string& addr);
++
++private:
++    void release(const std::shared_ptr<Entry>& entry);
++    std::vector<std::shared_ptr<Entry>> expire_locked(Clock::time_point now, bool shutdown_sockets);
++    void watchdog_loop();
++
++    const Limits limits_;
++    mutable std::mutex mu_;
++    std::map<std::string, size_t> per_client_;
++    std::vector<std::shared_ptr<Entry>> entries_;
++
++    std::mutex stop_mu_;
++    std::condition_variable stop_cv_;
++    bool stop_ = false;
++    std::thread watchdog_;
++};
++
++} // namespace lemon
+diff --git a/src/cpp/include/lemon/runtime_config.h b/src/cpp/include/lemon/runtime_config.h
+index 13a4ee3ff..3995fdb0c 100644
+--- a/src/cpp/include/lemon/runtime_config.h
++++ b/src/cpp/include/lemon/runtime_config.h
+@@ -47,6 +47,14 @@ public:
+     int64_t download_rate_limit_bytes_per_second() const;
+     int download_connections() const;
+     std::string allowed_origins() const;
++    int max_request_body_mb() const;
++    int request_receive_timeout() const;
++    int max_connections_per_client() const;
++
++    static constexpr int kDefaultMaxRequestBodyMb = 100;
++    static constexpr int kMaxMaxRequestBodyMb = 4096;
++    static constexpr int kMaxRequestReceiveTimeout = 3600;
++    static constexpr int kMaxConnectionsPerClient = 1024;
+ 
+     std::string models_dir() const;
+     int ctx_size() const;
+diff --git a/src/cpp/include/lemon/server/http_listener.h b/src/cpp/include/lemon/server/http_listener.h
+index a05a8c332..75e13ff13 100644
+--- a/src/cpp/include/lemon/server/http_listener.h
++++ b/src/cpp/include/lemon/server/http_listener.h
+@@ -9,6 +9,7 @@
+ 
+ #include <httplib.h>
+ 
++#include "lemon/connection_guard.h"
+ #include "lemon/upgradable_http_server.h"
+ #include "lemon/utils/beacon_listener.h"
+ #include "lemon/utils/network_beacon.h"
+@@ -46,6 +47,10 @@ public:
+     // the running listeners. Only what changed is restarted.
+     void rebind();
+ 
++    // Recreates the HTTP servers so settings applied only at creation (the request body
++    // limit, receive deadline and per-client cap) take effect.
++    void rebuild();
++
+     // Idempotent: start(), stop() and the config side-effect path all converge on config.
+     void sync_beacon_listener();
+     nlohmann::json beacon_listener_status() const { return beacon_listener_.status_json(); }
+@@ -84,6 +89,9 @@ private:
+     int websocket_requested_port_;
+     bool broadcast_;
+ 
++    // Declared before the front listeners so it outlives them.
++    std::unique_ptr<ConnectionGuard> connection_guard_;
++
+     // The routed servers carry every route and never listen; the fronts own the main
+     // port and hand WebSocket upgrades to websocket_server_ (see upgradable_http_server.h).
+     std::unique_ptr<RoutedHttpServer> http_server_;
+diff --git a/src/cpp/include/lemon/upgradable_http_server.h b/src/cpp/include/lemon/upgradable_http_server.h
+index 1628d514c..5715cb909 100644
+--- a/src/cpp/include/lemon/upgradable_http_server.h
++++ b/src/cpp/include/lemon/upgradable_http_server.h
+@@ -27,13 +27,19 @@
+ #include <httplib.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
+ #include <chrono>
++#include <cstdint>
+ #include <cstring>
+ #include <functional>
++#include <memory>
+ #include <string>
+ #include <thread>
++#include <utility>
++#include <vector>
+ 
++#include "lemon/connection_guard.h"
+ #include "lemon/utils/aixlog.hpp"
+ #include "lemon/utils/network_utils.h"
+ 
+@@ -66,6 +72,39 @@ struct ProcessAndCloseSocketTag {
+     using type = ProcessAndCloseSocketFn;
+ };
+ 
++// httplib's route tables (private). Spelled out because the Handlers alias is
++// private too. Only the non-content-reader tables: lemond registers no
++// content-reader routes.
++using RouteHandlerList =
++    std::vector<std::pair<std::unique_ptr<httplib::detail::MatcherBase>, httplib::Server::Handler>>;
++using RouteHandlerListMember = RouteHandlerList httplib::Server::*;
++struct GetHandlersTag { using type = RouteHandlerListMember; };
++struct PostHandlersTag { using type = RouteHandlerListMember; };
++struct PutHandlersTag { using type = RouteHandlerListMember; };
++struct PatchHandlersTag { using type = RouteHandlerListMember; };
++struct DeleteHandlersTag { using type = RouteHandlerListMember; };
++struct OptionsHandlersTag { using type = RouteHandlerListMember; };
++
++// Runs `on_enter` at the start of every route handler registered so far.
++// httplib calls a handler only after it has read the request body, so this is
++// the first point where a request is known to be fully received.
++inline void wrap_route_handlers(httplib::Server& srv, const std::function<void()>& on_enter) {
++    for (RouteHandlerListMember member : {PrivateMemberHolder<GetHandlersTag>::value,
++                                          PrivateMemberHolder<PostHandlersTag>::value,
++                                          PrivateMemberHolder<PutHandlersTag>::value,
++                                          PrivateMemberHolder<PatchHandlersTag>::value,
++                                          PrivateMemberHolder<DeleteHandlersTag>::value,
++                                          PrivateMemberHolder<OptionsHandlersTag>::value}) {
++        for (auto& route : srv.*member) {
++            route.second = [on_enter, inner = std::move(route.second)](
++                               const httplib::Request& req, httplib::Response& res) {
++                on_enter();
++                inner(req, res);
++            };
++        }
++    }
++}
++
+ // Peek the first bytes of an accepted connection (without consuming them) and
+ // decide whether it is a WebSocket upgrade for one of our realtime paths.
+ inline bool peek_websocket_upgrade(socket_t sock) {
+@@ -140,8 +179,18 @@ public:
+ 
+     socket_t listen_socket() const { return svr_sock_; }
+ 
++    void set_connection_guard(ConnectionGuard* guard) { guard_ = guard; }
++
+ private:
+     bool process_and_close_socket(socket_t sock) override {
++        ConnectionGuard::Ticket ticket;
++        if (guard_) {
++            const std::string client = ConnectionGuard::peer_address(sock);
++            if (!guard_->admit(sock, client, ticket)) {
++                refuse_over_cap(sock, client);
++                return true;
++            }
++        }
+         if (!lemon::utils::configure_tcp_keepalive(sock)) {
+             LOG(DEBUG, "Server") << "Failed to configure TCP keep-alive on accepted socket" << std::endl;
+         }
+@@ -154,8 +203,31 @@ private:
+         return (delegate_->*fn)(sock);
+     }
+ 
++    void refuse_over_cap(socket_t sock, const std::string& client) {
++        static const std::string kBody =
++            "{\"error\": \"Too many connections from this client; retry shortly\"}";
++        static const std::string kBusy =
++            "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\n"
++            "Content-Type: application/json\r\nContent-Length: " +
++            std::to_string(kBody.size()) + "\r\n\r\n" + kBody;
++        httplib::detail::send_socket(sock, kBusy.data(), kBusy.size(), 0);
++        httplib::detail::shutdown_socket(sock);
++        httplib::detail::close_socket(sock);
++        // A client at its cap is usually retrying in a loop; log the first
++        // refusal and then every 100th rather than every one.
++        const auto n = refused_.fetch_add(1) + 1;
++        if (n == 1 || n % 100 == 0) {
++            LOG(WARNING, "Server") << "Refused connection from " << client << ": "
++                                   << guard_->limits().max_connections_per_client
++                                   << " connections already open (" << n << " refused so far)"
++                                   << std::endl;
++        }
++    }
++
+     RoutedHttpServer* delegate_;
+     UpgradeHandler upgrade_handler_;
++    ConnectionGuard* guard_ = nullptr;
++    std::atomic<uint64_t> refused_{0};
+ };
+ 
+ } // namespace lemon
+diff --git a/src/cpp/resources/defaults.json b/src/cpp/resources/defaults.json
+index 77d7eb026..97ce7a45f 100644
+--- a/src/cpp/resources/defaults.json
++++ b/src/cpp/resources/defaults.json
+@@ -64,7 +64,9 @@
+   "log_level": "info",
+   "log_max_file_size_mb": 10,
+   "log_max_files": 5,
++  "max_connections_per_client": 0,
+   "max_loaded_models": 1,
++  "max_request_body_mb": 100,
+   "model_catalogs": [],
+   "models_dir": "auto",
+   "moonshine": {
+@@ -85,6 +87,7 @@
+     "vulkan_bin": "builtin"
+   },
+   "port": 13305,
++  "request_receive_timeout": 0,
+   "rocm_channel": "stable",
+   "rocm_install_method": "auto",
+   "ryzenai": {
+diff --git a/src/cpp/server/backends/executorch/executorch_server.cpp b/src/cpp/server/backends/executorch/executorch_server.cpp
+index 6b2292cfc..7762e3487 100644
+--- a/src/cpp/server/backends/executorch/executorch_server.cpp
++++ b/src/cpp/server/backends/executorch/executorch_server.cpp
+@@ -6,6 +6,7 @@
+ #include "lemon/backends/backend_utils.h"
+ #include "lemon/backends/executorch/executorch.h"
+ #include "lemon/backends/hf_cache_util.h"
++#include "lemon/classify_text_limit.h"
+ #include "lemon/error_types.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
+@@ -26,10 +27,6 @@ namespace lemon {
+ namespace backends {
+ 
+ namespace {
+-// et-server rejects larger bodies itself; refusing here keeps an oversized
+-// request from being copied into a second body just to be refused.
+-constexpr size_t kMaxClassifyTextBytes = 1024 * 1024;
+-
+ // The config is mandatory even when a manifest is present: the manifest
+ // describes the output contract only, and et-server still needs the config to
+ // check the architecture against its supported input convention.
+@@ -267,15 +264,8 @@ json ExecutorchServer::classify(const json& request) {
+             }}
+         };
+     }
+-    if (text.size() > kMaxClassifyTextBytes) {
+-        return json{
+-            {"error", {
+-                {"message", "Classify text exceeds " + std::to_string(kMaxClassifyTextBytes) +
+-                            " bytes"},
+-                {"type", "invalid_request_error"},
+-                {"status_code", 413},
+-            }}
+-        };
++    if (auto err = classify_text::too_large_error(text)) {
++        return *err;
+     }
+     return forward_classify(text, request);
+ }
+diff --git a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+index 91e2a81bb..05f043021 100644
+--- a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
++++ b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+@@ -6,6 +6,7 @@
+ #include "lemon/backends/backend_utils.h"
+ #include "lemon/backends/hf_cache_util.h"
+ #include "lemon/backend_manager.h"
++#include "lemon/classify_text_limit.h"
+ #include "lemon/utils/path_utils.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
+@@ -273,6 +274,9 @@ json OnnxRuntimeServer::classify(const json& request) {
+             }}
+         };
+     }
++    if (auto err = classify_text::too_large_error(text)) {
++        return *err;
++    }
+     return forward_classify(text, request);
+ }
+ 
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index f7f16d9ef..282b8ea63 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -6,6 +6,7 @@
+ #include "lemon/backends/backend_utils.h"
+ #include "lemon/backends/hf_cache_util.h"
+ #include "lemon/backend_manager.h"
++#include "lemon/classify_text_limit.h"
+ #include "lemon/image_classify_request.h"
+ #include "lemon/utils/path_utils.h"
+ #include "lemon/utils/custom_args.h"
+@@ -314,6 +315,9 @@ json TfliteServer::classify(const json& request) {
+             }}
+         };
+     }
++    if (auto err = classify_text::too_large_error(text)) {
++        return *err;
++    }
+     return forward_classify(text, request);
+ }
+ 
+diff --git a/src/cpp/server/connection_guard.cpp b/src/cpp/server/connection_guard.cpp
+new file mode 100644
+index 000000000..14ba814b6
+--- /dev/null
++++ b/src/cpp/server/connection_guard.cpp
+@@ -0,0 +1,257 @@
++#include "lemon/connection_guard.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstring>
++
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#else
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
++
++#include "lemon/utils/aixlog.hpp"
++
++namespace lemon {
++
++namespace {
++
++thread_local ConnectionGuard::Entry* t_current_entry = nullptr;
++
++#ifndef _WIN32
++constexpr socket_t kInvalidSocket = -1;
++#else
++constexpr socket_t kInvalidSocket = INVALID_SOCKET;
++#endif
++
++socket_t duplicate_socket(socket_t sock) {
++#ifdef _WIN32
++    // Windows has no dup() for sockets; the deadline is not enforced there.
++    (void)sock;
++    return kInvalidSocket;
++#else
++    return ::dup(sock);
++#endif
++}
++
++void close_watch_socket(socket_t sock) {
++    if (sock == kInvalidSocket) {
++        return;
++    }
++#ifdef _WIN32
++    ::closesocket(sock);
++#else
++    ::close(sock);
++#endif
++}
++
++void shutdown_watch_socket(socket_t sock) {
++    if (sock == kInvalidSocket) {
++        return;
++    }
++#ifdef _WIN32
++    ::shutdown(sock, SD_BOTH);
++#else
++    ::shutdown(sock, SHUT_RDWR);
++#endif
++}
++
++} // namespace
++
++ConnectionGuard::Ticket::Ticket(ConnectionGuard* guard, std::shared_ptr<Entry> entry)
++    : guard_(guard), entry_(std::move(entry)) {}
++
++ConnectionGuard::Ticket::Ticket(Ticket&& other) noexcept
++    : guard_(other.guard_), entry_(std::move(other.entry_)) {
++    other.guard_ = nullptr;
++}
++
++ConnectionGuard::Ticket& ConnectionGuard::Ticket::operator=(Ticket&& other) noexcept {
++    if (this != &other) {
++        release();
++        guard_ = other.guard_;
++        entry_ = std::move(other.entry_);
++        other.guard_ = nullptr;
++    }
++    return *this;
++}
++
++ConnectionGuard::Ticket::~Ticket() { release(); }
++
++void ConnectionGuard::Ticket::release() {
++    if (guard_ && entry_) {
++        guard_->release(entry_);
++    }
++    guard_ = nullptr;
++    entry_.reset();
++}
++
++ConnectionGuard::ConnectionGuard(Limits limits, bool start_watchdog) : limits_(limits) {
++    if (start_watchdog && deadline_enabled()) {
++        watchdog_ = std::thread([this] { watchdog_loop(); });
++    }
++}
++
++ConnectionGuard::~ConnectionGuard() {
++    {
++        std::lock_guard<std::mutex> lock(stop_mu_);
++        stop_ = true;
++    }
++    stop_cv_.notify_all();
++    if (watchdog_.joinable()) {
++        watchdog_.join();
++    }
++}
++
++bool ConnectionGuard::admit(socket_t sock, const std::string& client, Ticket& ticket,
++                            Clock::time_point now) {
++    auto entry = std::make_shared<Entry>();
++    entry->client = client;
++    entry->accepted = now;
++    entry->watch_sock = kInvalidSocket;
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        if (limits_.max_connections_per_client > 0 && !is_loopback(client)) {
++            auto it = per_client_.find(client);
++            if (it != per_client_.end() && it->second >= limits_.max_connections_per_client) {
++                return false;
++            }
++        }
++        // The watchdog shuts down a duplicate of the socket, never the original
++        // descriptor: once the serving thread closes the original, its number
++        // can be reused by another connection, but the duplicate still refers
++        // to this connection's socket until the entry is released.
++        if (deadline_enabled()) {
++            entry->watch_sock = duplicate_socket(sock);
++        }
++        ++per_client_[client];
++        entries_.push_back(entry);
++    }
++    t_current_entry = entry.get();
++    ticket = Ticket(this, std::move(entry));
++    return true;
++}
++
++void ConnectionGuard::release(const std::shared_ptr<Entry>& entry) {
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        auto it = std::find(entries_.begin(), entries_.end(), entry);
++        if (it != entries_.end()) {
++            entries_.erase(it);
++        }
++        auto pc = per_client_.find(entry->client);
++        if (pc != per_client_.end() && --pc->second == 0) {
++            per_client_.erase(pc);
++        }
++    }
++    if (t_current_entry == entry.get()) {
++        t_current_entry = nullptr;
++    }
++    close_watch_socket(entry->watch_sock);
++    entry->watch_sock = kInvalidSocket;
++}
++
++void ConnectionGuard::mark_request_received() {
++    if (t_current_entry) {
++        t_current_entry->receiving.store(false);
++    }
++}
++
++std::vector<std::shared_ptr<ConnectionGuard::Entry>> ConnectionGuard::collect_expired(
++    Clock::time_point now) {
++    std::lock_guard<std::mutex> lock(mu_);
++    return expire_locked(now, false);
++}
++
++std::vector<std::shared_ptr<ConnectionGuard::Entry>> ConnectionGuard::expire_locked(
++    Clock::time_point now, bool shutdown_sockets) {
++    std::vector<std::shared_ptr<Entry>> out;
++    if (!deadline_enabled()) {
++        return out;
++    }
++    for (const auto& e : entries_) {
++        if (e->receiving.load() && !e->expired.load() &&
++            now - e->accepted > limits_.receive_timeout) {
++            e->expired.store(true);
++            // Called under mu_, so release() cannot close watch_sock meanwhile.
++            if (shutdown_sockets) {
++                shutdown_watch_socket(e->watch_sock);
++            }
++            out.push_back(e);
++        }
++    }
++    return out;
++}
++
++void ConnectionGuard::watchdog_loop() {
++    std::unique_lock<std::mutex> stop_lock(stop_mu_);
++    while (!stop_cv_.wait_for(stop_lock, std::chrono::milliseconds(500), [this] { return stop_; })) {
++        std::vector<std::shared_ptr<Entry>> closed;
++        {
++            std::lock_guard<std::mutex> lock(mu_);
++            closed = expire_locked(Clock::now(), true);
++        }
++        for (const auto& e : closed) {
++            LOG(WARNING, "Server") << "Closed connection from " << e->client
++                                   << ": request not received within "
++                                   << limits_.receive_timeout.count() << "s" << std::endl;
++        }
++    }
++}
++
++size_t ConnectionGuard::connections_for(const std::string& client) const {
++    std::lock_guard<std::mutex> lock(mu_);
++    auto it = per_client_.find(client);
++    return it == per_client_.end() ? 0 : it->second;
++}
++
++size_t ConnectionGuard::tracked() const {
++    std::lock_guard<std::mutex> lock(mu_);
++    return entries_.size();
++}
++
++std::string ConnectionGuard::peer_address(socket_t sock) {
++    sockaddr_storage addr;
++    std::memset(&addr, 0, sizeof(addr));
++    socklen_t len = sizeof(addr);
++    if (::getpeername(sock, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
++        return "";
++    }
++    char buf[INET6_ADDRSTRLEN] = {0};
++    if (addr.ss_family == AF_INET) {
++        auto* in = reinterpret_cast<sockaddr_in*>(&addr);
++        if (!::inet_ntop(AF_INET, &in->sin_addr, buf, sizeof(buf))) {
++            return "";
++        }
++    } else if (addr.ss_family == AF_INET6) {
++        auto* in6 = reinterpret_cast<sockaddr_in6*>(&addr);
++        if (!::inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf))) {
++            return "";
++        }
++    } else {
++        return "";
++    }
++    return normalize_address(buf);
++}
++
++std::string ConnectionGuard::normalize_address(const std::string& addr) {
++    std::string out = addr;
++    std::transform(out.begin(), out.end(), out.begin(),
++                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++    const std::string mapped = "::ffff:";
++    if (out.compare(0, mapped.size(), mapped) == 0 &&
++        out.find('.', mapped.size()) != std::string::npos) {
++        out = out.substr(mapped.size());
++    }
++    return out;
++}
++
++bool ConnectionGuard::is_loopback(const std::string& addr) {
++    return addr == "::1" || addr.compare(0, 4, "127.") == 0;
++}
++
++} // namespace lemon
+diff --git a/src/cpp/server/core/config_effects.cpp b/src/cpp/server/core/config_effects.cpp
+index 4e322f541..644dc3e80 100644
+--- a/src/cpp/server/core/config_effects.cpp
++++ b/src/cpp/server/core/config_effects.cpp
+@@ -25,6 +25,11 @@ void ConfigEffects::apply(const std::string& key, const json& value) {
+     if (key == "port" || key == "host" || key == "websocket_port" ||
+         key == "broadcast" || key == "no_broadcast") {
+         ctx_.listener->rebind();
++    } else if (key == "max_request_body_mb" || key == "request_receive_timeout" ||
++               key == "max_connections_per_client") {
++        // Applied when the HTTP servers are created, so rebuild them.
++        LOG(INFO, "Server") << key << " changed; restarting the HTTP listeners" << std::endl;
++        ctx_.listener->rebuild();
+     } else if (key == "beacon_listen_interfaces" || key == "beacon_trusted_relays") {
+         ctx_.listener->sync_beacon_listener();
+     } else if (key == "beacon_listen") {
+diff --git a/src/cpp/server/core/http_listener.cpp b/src/cpp/server/core/http_listener.cpp
+index a95611735..968057c34 100644
+--- a/src/cpp/server/core/http_listener.cpp
++++ b/src/cpp/server/core/http_listener.cpp
+@@ -31,6 +31,18 @@
+ template struct lemon::detail::PrivateMemberInit<
+     lemon::detail::ProcessAndCloseSocketTag,
+     &httplib::Server::process_and_close_socket>;
++template struct lemon::detail::PrivateMemberInit<lemon::detail::GetHandlersTag,
++                                                 &httplib::Server::get_handlers_>;
++template struct lemon::detail::PrivateMemberInit<lemon::detail::PostHandlersTag,
++                                                 &httplib::Server::post_handlers_>;
++template struct lemon::detail::PrivateMemberInit<lemon::detail::PutHandlersTag,
++                                                 &httplib::Server::put_handlers_>;
++template struct lemon::detail::PrivateMemberInit<lemon::detail::PatchHandlersTag,
++                                                 &httplib::Server::patch_handlers_>;
++template struct lemon::detail::PrivateMemberInit<lemon::detail::DeleteHandlersTag,
++                                                 &httplib::Server::delete_handlers_>;
++template struct lemon::detail::PrivateMemberInit<lemon::detail::OptionsHandlersTag,
++                                                 &httplib::Server::options_handlers_>;
+ 
+ namespace lemon {
+ 
+@@ -124,10 +136,48 @@ void HttpListener::create_servers() {
+         srv->set_read_timeout(30, 0);
+         srv->set_write_timeout(300, 0);
+         srv->set_keep_alive_max_count(100);
++        srv->set_payload_max_length(static_cast<size_t>(config_->max_request_body_mb()) * 1024 * 1024);
+     }
+ 
++    // The per-read timeout above still lets a client that trickles bytes hold
++    // a worker for as long as it likes; the guard bounds the whole receive.
++    ConnectionGuard::Limits limits;
++    limits.receive_timeout = std::chrono::seconds(config_->request_receive_timeout());
++    limits.max_connections_per_client = static_cast<size_t>(config_->max_connections_per_client());
++#ifdef _WIN32
++    if (limits.receive_timeout.count() > 0) {
++        LOG(WARNING, "Server") << "request_receive_timeout is not supported on Windows; ignoring it"
++                               << std::endl;
++        limits.receive_timeout = std::chrono::seconds(0);
++    }
++#endif
++    std::unique_ptr<ConnectionGuard> guard;
++    if (limits.receive_timeout.count() > 0 || limits.max_connections_per_client > 0) {
++        guard = std::make_unique<ConnectionGuard>(limits);
++        LOG(INFO, "Server") << "Connection limits: request_receive_timeout="
++                            << limits.receive_timeout.count() << "s, max_connections_per_client="
++                            << limits.max_connections_per_client << std::endl;
++    }
++    if (guard && guard->deadline_enabled()) {
++        // The deadline runs from accept, so each connection carries one request.
++        for (httplib::Server* srv : {static_cast<httplib::Server*>(http_front_.get()),
++                                     static_cast<httplib::Server*>(http_front_v6_.get()),
++                                     static_cast<httplib::Server*>(http_server_.get()),
++                                     static_cast<httplib::Server*>(http_server_v6_.get())}) {
++            srv->set_keep_alive_max_count(1);
++        }
++    }
++    http_front_->set_connection_guard(guard.get());
++    http_front_v6_->set_connection_guard(guard.get());
++    connection_guard_ = std::move(guard);
++
+     setup_(*http_server_);
+     setup_(*http_server_v6_);
++
++    if (connection_guard_ && connection_guard_->deadline_enabled()) {
++        detail::wrap_route_handlers(*http_server_, &ConnectionGuard::mark_request_received);
++        detail::wrap_route_handlers(*http_server_v6_, &ConnectionGuard::mark_request_received);
++    }
+ }
+ 
+ void HttpListener::stop_servers() {
+@@ -504,6 +554,15 @@ void HttpListener::rebind() {
+     }
+ }
+ 
++void HttpListener::rebuild() {
++    std::lock_guard<std::mutex> lock(rebind_mutex_);
++    if (running_) {
++        rebind_requested_ = true;
++        udp_beacon_.stopBroadcasting();
++        stop_servers();
++    }
++}
++
+ int HttpListener::websocket_port() const {
+     if (websocket_server_ && websocket_server_->is_running()) {
+         return websocket_server_->get_port();
+diff --git a/src/cpp/server/runtime_config.cpp b/src/cpp/server/runtime_config.cpp
+index f2c3f4cc6..ba2558fc8 100644
+--- a/src/cpp/server/runtime_config.cpp
++++ b/src/cpp/server/runtime_config.cpp
+@@ -503,6 +503,52 @@ int RuntimeConfig::download_connections() const {
+     return static_cast<int>(n);
+ }
+ 
++namespace {
++
++// Reads an integer setting that config.json may hold invalid or omit; any
++// value outside [lo, hi] falls back to `fallback` with a warning.
++int bounded_int_setting(const json& config, const char* key, int lo, int hi, int fallback) {
++    if (!config.contains(key) || !config[key].is_number_integer()) {
++        return fallback;
++    }
++    const int64_t n = config[key].get<int64_t>();
++    if (n < lo || n > hi) {
++        LOG(WARNING, "RuntimeConfig") << "Invalid " << key << " value in config, using "
++                                      << fallback << std::endl;
++        return fallback;
++    }
++    return static_cast<int>(n);
++}
++
++void validate_bounded_int_setting(const std::string& key, const json& value, int lo, int hi) {
++    if (!value.is_number_integer()) {
++        throw std::invalid_argument("'" + key + "' must be an integer");
++    }
++    const int64_t n = value.get<int64_t>();
++    if (n < lo || n > hi) {
++        throw std::invalid_argument("'" + key + "' must be between " + std::to_string(lo) +
++                                    " and " + std::to_string(hi));
++    }
++}
++
++} // namespace
++
++int RuntimeConfig::max_request_body_mb() const {
++    std::shared_lock lock(mutex_);
++    return bounded_int_setting(config_, "max_request_body_mb", 1, kMaxMaxRequestBodyMb,
++                               kDefaultMaxRequestBodyMb);
++}
++
++int RuntimeConfig::request_receive_timeout() const {
++    std::shared_lock lock(mutex_);
++    return bounded_int_setting(config_, "request_receive_timeout", 0, kMaxRequestReceiveTimeout, 0);
++}
++
++int RuntimeConfig::max_connections_per_client() const {
++    std::shared_lock lock(mutex_);
++    return bounded_int_setting(config_, "max_connections_per_client", 0, kMaxConnectionsPerClient, 0);
++}
++
+ std::string RuntimeConfig::allowed_origins_unlocked() const {
+     if (allowed_origins_override_.has_value()) {
+         return *allowed_origins_override_;
+@@ -982,6 +1028,12 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
+                 "'download_connections' must be between 1 and " +
+                 std::to_string(utils::HttpClient::kMaxDownloadConnections));
+         }
++    } else if (key == "max_request_body_mb") {
++        validate_bounded_int_setting(key, value, 1, kMaxMaxRequestBodyMb);
++    } else if (key == "request_receive_timeout") {
++        validate_bounded_int_setting(key, value, 0, kMaxRequestReceiveTimeout);
++    } else if (key == "max_connections_per_client") {
++        validate_bounded_int_setting(key, value, 0, kMaxConnectionsPerClient);
+     } else if (key == "allowed_origins") {
+         if (!value.is_string()) {
+             throw std::invalid_argument("'allowed_origins' must be a string");
+diff --git a/test/cpp/test_config_gateway_limits.cpp b/test/cpp/test_config_gateway_limits.cpp
+new file mode 100644
+index 000000000..43fb43647
+--- /dev/null
++++ b/test/cpp/test_config_gateway_limits.cpp
+@@ -0,0 +1,69 @@
++#include <cstdio>
++#include <stdexcept>
++#include <string>
++
++#include <nlohmann/json.hpp>
++#include <lemon/classify_text_limit.h>
++#include <lemon/runtime_config.h>
++
++#include "test_config_helpers.h"
++
++using json = nlohmann::json;
++using lemon::RuntimeConfig;
++using test_helpers::check;
++using test_helpers::report_results;
++
++static bool set_throws(const json& changes) {
++    try {
++        RuntimeConfig(json::object()).set(changes);
++        return false;
++    } catch (const std::invalid_argument&) {
++        return true;
++    }
++}
++
++int main() {
++    std::puts("=== RUNNING GATEWAY LIMITS CONFIG TESTS ===");
++
++    const RuntimeConfig empty(json::object());
++    check(empty.max_request_body_mb() == 100, "body limit defaults to 100 MB");
++    check(empty.request_receive_timeout() == 0, "receive timeout defaults to off");
++    check(empty.max_connections_per_client() == 0, "per-client cap defaults to off");
++
++    const RuntimeConfig gateway(json{{"max_request_body_mb", 32},
++                                     {"request_receive_timeout", 30},
++                                     {"max_connections_per_client", 8}});
++    check(gateway.max_request_body_mb() == 32, "body limit read from config");
++    check(gateway.request_receive_timeout() == 30, "receive timeout read from config");
++    check(gateway.max_connections_per_client() == 8, "per-client cap read from config");
++
++    const RuntimeConfig bad(json{{"max_request_body_mb", 0},
++                                 {"request_receive_timeout", -1},
++                                 {"max_connections_per_client", "8"}});
++    check(bad.max_request_body_mb() == 100, "out-of-range body limit falls back to the default");
++    check(bad.request_receive_timeout() == 0, "negative timeout falls back to off");
++    check(bad.max_connections_per_client() == 0, "non-integer cap falls back to off");
++
++    check(!set_throws({{"max_request_body_mb", 32}}), "set accepts a valid body limit");
++    check(set_throws({{"max_request_body_mb", 0}}), "set refuses a zero body limit");
++    check(set_throws({{"max_request_body_mb", RuntimeConfig::kMaxMaxRequestBodyMb + 1}}),
++          "set refuses a body limit above the maximum");
++    check(set_throws({{"max_request_body_mb", "32"}}), "set refuses a string body limit");
++    check(!set_throws({{"request_receive_timeout", 0}}), "set accepts turning the timeout off");
++    check(set_throws({{"request_receive_timeout", -5}}), "set refuses a negative timeout");
++    check(!set_throws({{"max_connections_per_client", 8}}), "set accepts a valid cap");
++    check(set_throws({{"max_connections_per_client", 1.5}}), "set refuses a fractional cap");
++
++    RuntimeConfig live(json::object());
++    live.set({{"request_receive_timeout", 45}});
++    check(live.request_receive_timeout() == 45, "set value is read back");
++
++    using lemon::classify_text::kMaxTextBytes;
++    using lemon::classify_text::too_large_error;
++    check(!too_large_error(std::string(kMaxTextBytes, 'a')), "text at the limit is accepted");
++    auto err = too_large_error(std::string(kMaxTextBytes + 1, 'a'));
++    check(err.has_value() && (*err)["error"]["status_code"] == 413,
++          "text over the limit gets a 413 error");
++
++    return report_results("gateway limits config");
++}
+diff --git a/test/cpp/test_connection_guard.cpp b/test/cpp/test_connection_guard.cpp
+new file mode 100644
+index 000000000..773f8664b
+--- /dev/null
++++ b/test/cpp/test_connection_guard.cpp
+@@ -0,0 +1,152 @@
++#include <chrono>
++#include <cstdio>
++#include <string>
++#include <thread>
++
++#ifndef _WIN32
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++#endif
++
++#include <lemon/connection_guard.h>
++
++#include "test_config_helpers.h"
++
++using lemon::ConnectionGuard;
++using test_helpers::check;
++using test_helpers::report_results;
++using namespace std::chrono_literals;
++
++static void test_addresses() {
++    check(ConnectionGuard::normalize_address("::FFFF:192.168.1.5") == "192.168.1.5",
++          "IPv4-mapped IPv6 reduces to IPv4");
++    check(ConnectionGuard::normalize_address("FE80::1") == "fe80::1", "IPv6 is lowercased");
++    check(ConnectionGuard::normalize_address("::ffff:abcd") == "::ffff:abcd",
++          "a non-dotted ::ffff: address is left alone");
++    check(ConnectionGuard::is_loopback("127.0.0.1"), "127.0.0.1 is loopback");
++    check(ConnectionGuard::is_loopback("127.4.5.6"), "127/8 is loopback");
++    check(ConnectionGuard::is_loopback("::1"), "::1 is loopback");
++    check(!ConnectionGuard::is_loopback("192.168.1.5"), "a LAN address is not loopback");
++    check(!ConnectionGuard::is_loopback(""), "an unreadable address is not loopback");
++}
++
++static void test_cap() {
++    ConnectionGuard::Limits limits;
++    limits.max_connections_per_client = 2;
++    ConnectionGuard guard(limits, false);
++    check(!guard.deadline_enabled(), "cap-only guard has no deadline");
++
++    ConnectionGuard::Ticket a1, a2, a3, b1;
++    check(guard.admit(-1, "192.168.1.5", a1), "first connection admitted");
++    check(guard.admit(-1, "192.168.1.5", a2), "second connection admitted");
++    check(!guard.admit(-1, "192.168.1.5", a3), "third connection from the same client refused");
++    check(guard.admit(-1, "192.168.1.6", b1), "another client is not affected");
++    check(guard.connections_for("192.168.1.5") == 2, "refused connection is not counted");
++
++    {
++        ConnectionGuard::Ticket l1, l2, l3;
++        check(guard.admit(-1, "127.0.0.1", l1) && guard.admit(-1, "127.0.0.1", l2) &&
++                  guard.admit(-1, "127.0.0.1", l3),
++              "loopback is exempt from the cap");
++    }
++    check(guard.connections_for("127.0.0.1") == 0, "loopback tickets released on scope exit");
++
++    a1 = ConnectionGuard::Ticket();
++    check(guard.connections_for("192.168.1.5") == 1, "releasing a ticket frees a slot");
++    check(guard.admit(-1, "192.168.1.5", a3), "a freed slot can be reused");
++    a2 = ConnectionGuard::Ticket();
++    a3 = ConnectionGuard::Ticket();
++    b1 = ConnectionGuard::Ticket();
++    check(guard.tracked() == 0, "no entries left after all tickets are released");
++}
++
++#ifndef _WIN32
++static void test_deadline_logic() {
++    ConnectionGuard::Limits limits;
++    limits.receive_timeout = 30s;
++    ConnectionGuard guard(limits, false);
++    check(guard.deadline_enabled(), "deadline enabled with a non-zero timeout");
++
++    int fds[2];
++    check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
++    const auto t0 = ConnectionGuard::Clock::now();
++    ConnectionGuard::Ticket slow, fast;
++    check(guard.admit(fds[0], "192.168.1.5", slow, t0), "slow connection admitted");
++    check(guard.admit(fds[0], "192.168.1.7", fast, t0), "fast connection admitted");
++    // admit() binds the serving thread to the most recent entry, as the front
++    // server does for the connection it is about to serve.
++    ConnectionGuard::mark_request_received();
++
++    check(guard.collect_expired(t0 + 29s).empty(), "nothing expires before the deadline");
++    auto expired = guard.collect_expired(t0 + 31s);
++    check(expired.size() == 1 && expired[0]->client == "192.168.1.5",
++          "only the connection still receiving expires");
++    check(guard.collect_expired(t0 + 60s).empty(), "an expired connection is reported once");
++
++    slow = ConnectionGuard::Ticket();
++    fast = ConnectionGuard::Ticket();
++    check(guard.tracked() == 0, "entries released");
++    ::close(fds[0]);
++    ::close(fds[1]);
++}
++
++static void test_watchdog_shuts_down_socket() {
++    ConnectionGuard::Limits limits;
++    limits.receive_timeout = 1s;
++    ConnectionGuard guard(limits);
++
++    int fds[2];
++    check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
++    // Without a shutdown the recv below would block forever; fail instead.
++    timeval tv{5, 0};
++    ::setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++    {
++        ConnectionGuard::Ticket t;
++        check(guard.admit(fds[0], "192.168.1.5", t), "connection admitted");
++        // The original descriptor stays open the whole time: the watchdog acts
++        // through its own duplicate.
++        char buf[1];
++        const auto start = std::chrono::steady_clock::now();
++        const auto n = ::recv(fds[1], buf, sizeof(buf), 0);
++        const auto waited = std::chrono::steady_clock::now() - start;
++        check(n == 0, "peer sees end of stream after the deadline");
++        check(waited >= 900ms && waited < 5s, "shutdown happens at about the deadline");
++    }
++    check(guard.tracked() == 0, "entry released after the ticket goes away");
++    ::close(fds[0]);
++    ::close(fds[1]);
++}
++
++static void test_received_request_is_not_shut_down() {
++    ConnectionGuard::Limits limits;
++    limits.receive_timeout = 1s;
++    ConnectionGuard guard(limits);
++
++    int fds[2];
++    check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
++    ConnectionGuard::Ticket t;
++    check(guard.admit(fds[0], "192.168.1.5", t), "connection admitted");
++    ConnectionGuard::mark_request_received();
++    std::this_thread::sleep_for(2500ms);
++    const char ping = 'p';
++    check(::send(fds[0], &ping, 1, 0) == 1, "socket still writable after the deadline");
++    char buf[1];
++    check(::recv(fds[1], buf, 1, 0) == 1 && buf[0] == 'p', "peer still receives data");
++    t = ConnectionGuard::Ticket();
++    ::close(fds[0]);
++    ::close(fds[1]);
++}
++#endif
++
++int main() {
++    std::puts("=== RUNNING CONNECTION GUARD TESTS ===");
++    test_addresses();
++    test_cap();
++#ifndef _WIN32
++    test_deadline_logic();
++    test_watchdog_shuts_down_socket();
++    test_received_request_is_not_shut_down();
++#endif
++    return report_results("connection guard");
++}
+-- 
+2.53.0
+

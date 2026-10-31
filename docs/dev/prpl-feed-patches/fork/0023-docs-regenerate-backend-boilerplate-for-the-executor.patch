@@ -1,0 +1,98 @@
+From bd837b853395569134d4045009ec6c8b98cf3dd7 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:27:52 -0400
+Subject: [PATCH 23/58] docs: regenerate backend boilerplate for the executorch
+ recipe
+
+Assisted-by: claude:opus-5.5
+---
+ docs/assets/models.js                     | 4 +++-
+ docs/guide/cli.md                         | 6 ++++++
+ docs/guide/configuration/README.md        | 3 +++
+ docs/guide/configuration/custom-models.md | 2 +-
+ src/cpp/resources/defaults.json           | 3 +++
+ 5 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/docs/assets/models.js b/docs/assets/models.js
+index 390be238f..aad7c49dc 100644
+--- a/docs/assets/models.js
++++ b/docs/assets/models.js
+@@ -6,6 +6,7 @@ const RAW_BASE = 'https://raw.githubusercontent.com/lemonade-sdk/lemonade';
+ const RECIPE_PRIORITY = [
+   'acestep',
+   'ds4',
++  'executorch',
+   'flm',
+   'llamacpp-hrx',
+   'kokoro',
+@@ -40,7 +41,8 @@ const RECIPE_DISPLAY_NAMES = {
+   trellis: 'TRELLIS.2',
+   openmoss: 'OpenMOSS TTS',
+   litert: 'LiteRT',
+-  tflite: 'TFLite'
++  tflite: 'TFLite',
++  executorch: 'ExecuTorch'
+ };
+ /* END GENERATED: models-js-recipes */
+ 
+diff --git a/docs/guide/cli.md b/docs/guide/cli.md
+index d07168ea3..d951f7a81 100644
+--- a/docs/guide/cli.md
++++ b/docs/guide/cli.md
+@@ -485,6 +485,12 @@ The following options are available depending on the recipe being used:
+ | Option | Description | Default |
+ |--------|-------------|---------|
+ | `--tflite-args ARGS` | Custom arguments to pass to tflite-server | `""` |
++
++#### ExecuTorch (`executorch` recipe)
++
++| Option | Description | Default |
++|--------|-------------|---------|
++| `--executorch-args ARGS` | Custom arguments to pass to et-server | `""` |
+ <!-- END GENERATED: cli-recipe-options -->
+ **Notes:**
+ - Unspecified options will use the backend's default values
+diff --git a/docs/guide/configuration/README.md b/docs/guide/configuration/README.md
+index 389d3ea4b..c4be4f2cf 100644
+--- a/docs/guide/configuration/README.md
++++ b/docs/guide/configuration/README.md
+@@ -60,6 +60,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
+     "args": ""
+   },
+   "enable_dgpu_gtt": false,
++  "executorch": {
++    "args": ""
++  },
+   "extra_models_dir": "",
+   "flm": {
+     "args": "",
+diff --git a/docs/guide/configuration/custom-models.md b/docs/guide/configuration/custom-models.md
+index a5f079e83..b35fc48e1 100644
+--- a/docs/guide/configuration/custom-models.md
++++ b/docs/guide/configuration/custom-models.md
+@@ -99,7 +99,7 @@ Supported registration flags:
+ |------|-------------|
+ | `--source SOURCE` | Remote registry for every checkpoint in this model: <!-- BEGIN GENERATED: remote-registry-tokens -->`huggingface` or `modelscope`<!-- END GENERATED: remote-registry-tokens -->. When omitted, the server's configured `default_model_source` applies. |
+ | `--checkpoint TYPE CHECKPOINT` | Add a checkpoint entry. Repeat for multi-file models such as `main` + `mmproj` or `main` + `vae`. |
+-| `--recipe RECIPE` | Recipe to associate with the new `user.*` model. Common values: <!-- BEGIN GENERATED: recipe-values -->`llamacpp`, `llamacpp-hrx`, `whispercpp`, `moonshine`, `kokoro`, `sd-cpp`, `flm`, `ryzenai-llm`, `vllm`, `thenoise`, `ds4`, `thinksound`, `acestep`, `onnxruntime`, `trellis`, `openmoss`, `litert`, `tflite`, `collection.omni`<!-- END GENERATED: recipe-values -->. |
++| `--recipe RECIPE` | Recipe to associate with the new `user.*` model. Common values: <!-- BEGIN GENERATED: recipe-values -->`llamacpp`, `llamacpp-hrx`, `whispercpp`, `moonshine`, `kokoro`, `sd-cpp`, `flm`, `ryzenai-llm`, `vllm`, `thenoise`, `ds4`, `thinksound`, `acestep`, `onnxruntime`, `trellis`, `openmoss`, `litert`, `tflite`, `executorch`, `collection.omni`<!-- END GENERATED: recipe-values -->. |
+ | `--label LABEL` | Add a label to the new model. Repeatable. Valid labels include `chat`, `coding`, `dflash`, `embeddings`, `hot`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `vision`. When no [deployment label](../../api/openai.md#model-labels) is given, the recipe's default is added — `chat` for `llamacpp`, `flm`, `ryzenai-llm` and `vllm`; `transcription` for `whispercpp`; `image` for `sd-cpp`; and so on. |
+ | `--components MODEL [MODEL ...]` | Components for an omni collection (see below). Use with `--recipe collection.omni`. |
+ 
+diff --git a/src/cpp/resources/defaults.json b/src/cpp/resources/defaults.json
+index 7399ede60..4606a9293 100644
+--- a/src/cpp/resources/defaults.json
++++ b/src/cpp/resources/defaults.json
+@@ -23,6 +23,9 @@
+     "args": ""
+   },
+   "enable_dgpu_gtt": false,
++  "executorch": {
++    "args": ""
++  },
+   "extra_models_dir": "",
+   "flm": {
+     "args": "",
+-- 
+2.53.0
+

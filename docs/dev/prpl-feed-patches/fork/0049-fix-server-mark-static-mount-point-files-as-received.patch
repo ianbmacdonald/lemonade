@@ -1,0 +1,40 @@
+From e9131bccb4f3001c253460d6dc7e88cb9dce75bc Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Fri, 9 Oct 2026 03:09:23 -0400
+Subject: [PATCH 49/58] fix(server): mark static mount-point files as received
+
+httplib serves /static files without going through the route tables that
+wrap_route_handlers covers, so with request_receive_timeout on a download
+still in progress at the deadline would be closed. Mark the request
+received in the file request handler, which httplib calls only after the
+request has been read. Found by the confirmatory review round.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/core/web_ui.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/cpp/server/core/web_ui.cpp b/src/cpp/server/core/web_ui.cpp
+index 4f97f8387..f7f0b3a7c 100644
+--- a/src/cpp/server/core/web_ui.cpp
++++ b/src/cpp/server/core/web_ui.cpp
+@@ -7,6 +7,7 @@
+ #include <lemon/utils/aixlog.hpp>
+ #include <nlohmann/json.hpp>
+ 
++#include "lemon/connection_guard.h"
+ #include "lemon/model_manager.h"
+ #include "lemon/server/http_listener.h"
+ #include "lemon/server/model_json.h"
+@@ -318,6 +319,8 @@ window.api = {
+     // Static files always get no-cache headers, so the web UI picks up a new version
+     // as soon as lemond is updated.
+     server.set_file_request_handler([](const httplib::Request&, httplib::Response& res) {
++        // Mount-point files bypass the route tables wrap_route_handlers covers.
++        ConnectionGuard::mark_request_received();
+         set_no_cache_headers(res);
+     });
+ }
+-- 
+2.53.0
+

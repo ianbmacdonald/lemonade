@@ -1,0 +1,310 @@
+From 863bebe0a6314e5b65bbac8abf7374d5bd57e9ad Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 01:12:46 -0400
+Subject: [PATCH 52/58] fix: run the litert, tflite and executorch backends
+ through start_server
+
+Upstream replaced the raw process-handle API (start_process,
+set_process_handle, wait_for_ready) with ServerProcess and
+WrappedServer::start_server. The three fork backends now start their
+subprocess the same way onnxruntime does, and unload() is stop_server().
+start_server() keeps the exit status of a child that died before it was
+ready, read from ServerProcess::exit_code(), so executorch still reports a
+SIGKILL during load as a likely OOM without relaunching it.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/server_process.h        |  4 +++
+ src/cpp/include/lemon/wrapped_server.h        |  6 ++++
+ .../backends/executorch/executorch_server.cpp | 29 +++++++------------
+ .../server/backends/litert/litert_server.cpp  | 28 +++++++-----------
+ .../server/backends/tflite/tflite_server.cpp  | 28 +++++++-----------
+ src/cpp/server/server_process.cpp             |  1 +
+ src/cpp/server/wrapped_server.cpp             |  7 ++++-
+ test/cpp/test_backend_load_failure.cpp        | 24 ++++++++-------
+ 8 files changed, 60 insertions(+), 67 deletions(-)
+
+diff --git a/src/cpp/include/lemon/server_process.h b/src/cpp/include/lemon/server_process.h
+index 6db005ede..d98029f3d 100644
+--- a/src/cpp/include/lemon/server_process.h
++++ b/src/cpp/include/lemon/server_process.h
+@@ -40,6 +40,9 @@ public:
+     virtual bool running() const;
+ 
+     utils::ProcessHandle handle() const { return handle_; }
++    // The status stop() reaped from a server that had already exited; -1 when stop()
++    // terminated it, or it never started.
++    int exit_code() const { return exit_code_; }
+     const std::vector<std::string>& command_line() const { return command_line_; }
+ 
+ protected:
+@@ -48,6 +51,7 @@ protected:
+ 
+     utils::ProcessHandle handle_{nullptr, 0};
+     std::vector<std::string> command_line_;
++    int exit_code_ = -1;
+ 
+ private:
+     ProcessOutput output_;
+diff --git a/src/cpp/include/lemon/wrapped_server.h b/src/cpp/include/lemon/wrapped_server.h
+index 7e1cbb67c..71ab9e438 100644
+--- a/src/cpp/include/lemon/wrapped_server.h
++++ b/src/cpp/include/lemon/wrapped_server.h
+@@ -602,6 +602,11 @@ protected:
+ 
+     bool load_cancelled() const { return load_cancel_ && load_cancel_->load(); }
+ 
++    // The exit status of a server that exited before its ready endpoint answered, as
++    // start_server() found it; -1 when it was still running (timeout, cancel) or never
++    // started. A backend uses it to tell a signal death apart.
++    int startup_exit_code() const { return startup_exit_code_; }
++
+     // Choose an available port
+     int choose_port();
+ 
+@@ -675,6 +680,7 @@ protected:
+     long load_duration_ms_;
+     bool pinned_ = false;
+     std::atomic<bool>* load_cancel_ = nullptr;
++    int startup_exit_code_ = -1;
+ 
+ private:
+     static uint64_t next_instance_id() {
+diff --git a/src/cpp/server/backends/executorch/executorch_server.cpp b/src/cpp/server/backends/executorch/executorch_server.cpp
+index 7762e3487..1ef126feb 100644
+--- a/src/cpp/server/backends/executorch/executorch_server.cpp
++++ b/src/cpp/server/backends/executorch/executorch_server.cpp
+@@ -189,23 +189,20 @@ void ExecutorchServer::load(const std::string& model_name,
+     }
+ 
+     bool inherit_output = (log_level_ == "info") || is_debug();
+-    ProcessHandle started_handle = utils::ProcessManager::start_process(
+-        executable, args, "", inherit_output, false, {});
+-    set_process_handle(started_handle, executable, args);
+-
+-    if (!has_process_handle(started_handle)) {
+-        throw std::runtime_error("Failed to start et-server process");
+-    }
+-    LOG(INFO, "ExecutorchServer") << "Process started with PID: " << started_handle.pid << std::endl;
+-
++    ServerCommand command;
++    command.program = executable;
++    command.args = args;
++    command.port = port;
+     constexpr long kReadyTimeoutSeconds = 600;
+-    if (!wait_for_ready("/health", kReadyTimeoutSeconds)) {
+-        unload();
++    try {
++        start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
++                     command, kReadyTimeoutSeconds);
++    } catch (const std::runtime_error&) {
+         // Every failure below is non-retryable: et-server is CPU-only, so the
+         // Router's evict-everything-and-retry would only cost the resident LLM
+         // and repeat a load that failed for reasons eviction does not change.
+         const int exit_code = startup_exit_code();
+-        if (load_cancel_ && load_cancel_->load()) {
++        if (load_cancelled()) {
+             throw NonRetryableLoadException("et-server load cancelled");
+         }
+         if (exit_code < 0) {
+@@ -229,17 +226,11 @@ void ExecutorchServer::load(const std::string& model_name,
+         throw NonRetryableLoadException("et-server " + status + " during startup" +
+                                         (details.empty() ? "" : ": " + details));
+     }
+-    start_backend_watchdog("/health");
+     LOG(INFO, "ExecutorchServer") << "Server is ready!" << std::endl;
+ }
+ 
+ void ExecutorchServer::unload() {
+-    stop_backend_watchdog();
+-    const ProcessHandle handle = consume_process_handle_for_cleanup();
+-    if (has_process_handle(handle)) {
+-        LOG(INFO, "ExecutorchServer") << "Stopping server (PID: " << handle.pid << ")" << std::endl;
+-        utils::ProcessManager::stop_process(handle);
+-    }
++    stop_server();
+ }
+ 
+ json ExecutorchServer::forward_classify(const std::string& text, const json& params) {
+diff --git a/src/cpp/server/backends/litert/litert_server.cpp b/src/cpp/server/backends/litert/litert_server.cpp
+index 821ea3fb4..bdf64f018 100644
+--- a/src/cpp/server/backends/litert/litert_server.cpp
++++ b/src/cpp/server/backends/litert/litert_server.cpp
+@@ -100,30 +100,22 @@ void LiteRtServer::load(const std::string& model_name,
+     }
+ 
+     bool inherit_output = (log_level_ == "info") || is_debug();
+-    ProcessHandle started_handle = utils::ProcessManager::start_process(
+-        executable, args, "", inherit_output, false, {});
+-    set_process_handle(started_handle, executable, args);
+-
+-    if (!has_process_handle(started_handle)) {
+-        throw std::runtime_error("Failed to start litert-lm-server process");
+-    }
+-    LOG(INFO, "LiteRtServer") << "Process started with PID: " << started_handle.pid << std::endl;
+-
+-    if (!wait_for_ready("/health")) {
+-        unload();
++    ServerCommand command;
++    command.program = executable;
++    command.args = args;
++    command.port = port_;
++    try {
++        start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
++                     command);
++    } catch (const std::runtime_error&) {
++        if (load_cancelled()) throw;
+         throw std::runtime_error("litert-lm-server failed to start or become ready");
+     }
+-    start_backend_watchdog("/health");
+     LOG(INFO, "LiteRtServer") << "Server is ready!" << std::endl;
+ }
+ 
+ void LiteRtServer::unload() {
+-    stop_backend_watchdog();
+-    const ProcessHandle handle = consume_process_handle_for_cleanup();
+-    if (has_process_handle(handle)) {
+-        LOG(INFO, "LiteRtServer") << "Stopping server (PID: " << handle.pid << ")" << std::endl;
+-        utils::ProcessManager::stop_process(handle);
+-    }
++    stop_server();
+ }
+ 
+ json LiteRtServer::chat_completion(const json& request) {
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index 282b8ea63..2308e0393 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -235,17 +235,15 @@ void TfliteServer::load(const std::string& model_name,
+     }
+ 
+     bool inherit_output = (log_level_ == "info") || is_debug();
+-    ProcessHandle started_handle = utils::ProcessManager::start_process(
+-        executable, args, "", inherit_output, false, {});
+-    set_process_handle(started_handle, executable, args);
+-
+-    if (!has_process_handle(started_handle)) {
+-        throw std::runtime_error("Failed to start tflite-server process");
+-    }
+-    LOG(INFO, "TfliteServer") << "Process started with PID: " << started_handle.pid << std::endl;
+-
+-    if (!wait_for_ready("/health")) {
+-        unload();
++    ServerCommand command;
++    command.program = executable;
++    command.args = args;
++    command.port = port_;
++    try {
++        start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
++                     command);
++    } catch (const std::runtime_error&) {
++        if (load_cancelled()) throw;
+         // The subprocess's stderr is invisible when lemond runs windowless (CI,
+         // tray), so a startup failure would otherwise surface only as "not
+         // ready". Re-run it briefly to capture the reason it refused the model.
+@@ -271,17 +269,11 @@ void TfliteServer::load(const std::string& model_name,
+                               "' for a text-classification model");
+     }
+ 
+-    start_backend_watchdog("/health");
+     LOG(INFO, "TfliteServer") << "Server is ready!" << std::endl;
+ }
+ 
+ void TfliteServer::unload() {
+-    stop_backend_watchdog();
+-    const ProcessHandle handle = consume_process_handle_for_cleanup();
+-    if (has_process_handle(handle)) {
+-        LOG(INFO, "TfliteServer") << "Stopping server (PID: " << handle.pid << ")" << std::endl;
+-        utils::ProcessManager::stop_process(handle);
+-    }
++    stop_server();
+ }
+ 
+ json TfliteServer::forward_classify(const std::string& text, const json& params) {
+diff --git a/src/cpp/server/server_process.cpp b/src/cpp/server/server_process.cpp
+index 9a09c1e72..d399af78c 100644
+--- a/src/cpp/server/server_process.cpp
++++ b/src/cpp/server/server_process.cpp
+@@ -47,6 +47,7 @@ void ServerProcess::stop() {
+         ProcessManager::stop_process(handle_);
+     } else {
+         const int exit_code = ProcessManager::reap_process(handle_);
++        exit_code_ = exit_code;
+         LOG(ERROR, "ServerProcess") << command_line_.front() << " (PID " << handle_.pid
+                                     << ") had exited with code " << exit_code << std::endl;
+     }
+diff --git a/src/cpp/server/wrapped_server.cpp b/src/cpp/server/wrapped_server.cpp
+index 66b21da87..f80e45be1 100644
+--- a/src/cpp/server/wrapped_server.cpp
++++ b/src/cpp/server/wrapped_server.cpp
+@@ -407,6 +407,7 @@ bool WrappedServer::has_backend_process_exited() const {
+ 
+ void WrappedServer::start_server(std::unique_ptr<ServerProcess> process,
+                                  const ServerCommand& command, long timeout_seconds) {
++    startup_exit_code_ = -1;
+     const std::string host = process->start(command);
+     std::unique_ptr<ServerProcess> previous;
+     {
+@@ -421,7 +422,11 @@ void WrappedServer::start_server(std::unique_ptr<ServerProcess> process,
+     }
+ 
+     if (!wait_for_ready(command.ready_endpoint, timeout_seconds)) {
+-        stop_server();
++        stop_backend_watchdog();
++        if (auto failed = take_process()) {
++            failed->stop();
++            startup_exit_code_ = failed->exit_code();
++        }
+         throw std::runtime_error(server_name_ + " failed to start");
+     }
+     start_backend_watchdog(command.ready_endpoint);
+diff --git a/test/cpp/test_backend_load_failure.cpp b/test/cpp/test_backend_load_failure.cpp
+index a75d79b96..08b200c2b 100644
+--- a/test/cpp/test_backend_load_failure.cpp
++++ b/test/cpp/test_backend_load_failure.cpp
+@@ -6,10 +6,12 @@
+ 
+ #include "lemon/error_types.h"
+ #include "lemon/router.h"
++#include "lemon/server_process.h"
+ #include "lemon/utils/process_manager.h"
+ #include "lemon/wrapped_server.h"
+ 
+ #include <atomic>
++#include <memory>
+ #include <chrono>
+ #include <cstdio>
+ #include <stdexcept>
+@@ -36,18 +38,18 @@ public:
+ 
+     void load(const std::string&, const ModelInfo&, const RecipeOptions&, bool) override {}
+ 
+-    void unload() override {
+-        const ProcessHandle handle = consume_process_handle_for_cleanup();
+-        if (has_process_handle(handle)) utils::ProcessManager::stop_process(handle);
+-    }
+-
+-    // Returns wait_for_ready's verdict and leaves startup_exit_code() readable.
+     bool start_and_wait(const std::string& script, long timeout_seconds) {
+-        choose_port();
+-        const std::vector<std::string> args = {"-c", script};
+-        ProcessHandle handle = utils::ProcessManager::start_process("/bin/sh", args);
+-        set_process_handle(handle, "/bin/sh", args);
+-        return wait_for_ready("/health", timeout_seconds, 50);
++        ServerCommand command;
++        command.program = "/bin/sh";
++        command.args = {"-c", script};
++        command.port = choose_port();
++        try {
++            start_server(std::make_unique<NativeProcess>(ProcessOutput{false, false}), command,
++                         timeout_seconds);
++        } catch (const std::runtime_error&) {
++            return false;
++        }
++        return true;
+     }
+ 
+     using WrappedServer::startup_exit_code;
+-- 
+2.53.0
+

@@ -1,0 +1,157 @@
+From 3b8b161ca1ab0bbde8042eda521275720b14fa8e Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 17:48:39 -0400
+Subject: [PATCH 31/58] fix(routing): report route_to and trace candidates by
+ public model name
+
+The route decision (x_lemonade_route and /routing/validate) emitted
+route_to as the internal component id the policy parser resolved, e.g.
+user.Gemma3-1B-IT-LiteRT, while /v1/models lists the same model under its
+public name (Gemma3-1B-IT-LiteRT), so a client joining the two missed.
+Serialize route_to and trace labels (router candidates) through
+ModelManager::get_public_model_name, the mapping /v1/models uses.
+Dispatch still uses the internal id.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/server/router_dispatch.h    | 6 ++++++
+ src/cpp/server/core/api_route.cpp                 | 6 ++++--
+ src/cpp/server/route_decision_response.cpp        | 9 +++++++--
+ src/cpp/server/routes/router/router_dispatch.cpp  | 7 +++++++
+ src/cpp/server/routes/router/routing_validate.cpp | 8 +++++---
+ 5 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/src/cpp/include/lemon/server/router_dispatch.h b/src/cpp/include/lemon/server/router_dispatch.h
+index ac59731f9..a18b22f82 100644
+--- a/src/cpp/include/lemon/server/router_dispatch.h
++++ b/src/cpp/include/lemon/server/router_dispatch.h
+@@ -6,6 +6,7 @@
+ 
+ #include <nlohmann/json.hpp>
+ 
++#include "lemon/route_decision_response.h"
+ #include "lemon/routing_policy.h"
+ 
+ namespace lemon {
+@@ -18,8 +19,13 @@ struct RouterDispatchResult {
+     std::string requested_model;
+     std::string selected_model;
+     Decision decision;
++    // Dispatch uses the engine's internal ids; responses report public names, the ones
++    // /v1/models lists, so a client can join route_to against it.
++    ModelNameMapper public_model_name;
+ };
+ 
++ModelNameMapper public_model_name_mapper(ModelManager& model_manager);
++
+ // The decision the registered policy of collection.router `info` makes for body. Dispatch
+ // and the classify-only /routing/validate share it so the two cannot disagree. It has no
+ // dispatch side effects, though routing helper models may load. std::nullopt when the
+diff --git a/src/cpp/server/core/api_route.cpp b/src/cpp/server/core/api_route.cpp
+index 80f80d8ee..c01048d06 100644
+--- a/src/cpp/server/core/api_route.cpp
++++ b/src/cpp/server/core/api_route.cpp
+@@ -617,7 +617,8 @@ void ApiRoute::stream_response(RouteRequest& req, httplib::Response& res, Stream
+     }
+ 
+     json route_decision_json = req.route_decision
+-        ? route_decision_to_json(req.route_decision->decision)
++        ? route_decision_to_json(req.route_decision->decision,
++                                 req.route_decision->public_model_name)
+         : json(nullptr);
+     std::string body = req.body.is_null() ? req.http.body : req.body.dump();
+     std::function<bool()> is_closed = req.http.is_connection_closed;
+@@ -769,7 +770,8 @@ void attach_route_decision(json& response, httplib::Response& res,
+     if (!decision) {
+         return;
+     }
+-    response["x_lemonade_route"] = route_decision_to_json(decision->decision);
++    response["x_lemonade_route"] =
++        route_decision_to_json(decision->decision, decision->public_model_name);
+     attach_route_header(res, decision->decision);
+ }
+ 
+diff --git a/src/cpp/server/route_decision_response.cpp b/src/cpp/server/route_decision_response.cpp
+index ec1ee1e1a..5bdaea582 100644
+--- a/src/cpp/server/route_decision_response.cpp
++++ b/src/cpp/server/route_decision_response.cpp
+@@ -50,9 +50,12 @@ std::optional<EventBoundary> find_sse_event_boundary(const std::string& buffer)
+ 
+ json route_decision_to_json(const Decision& decision,
+                             const ModelNameMapper& public_model_name) {
++    auto model_name = [&public_model_name](const std::string& name) {
++        return public_model_name ? public_model_name(name) : name;
++    };
+     json out = {
+         {"version", "1"},
+-        {"route_to", decision.route_to},
++        {"route_to", model_name(decision.route_to)},
+         {"matched_rule", decision.matched_rule},
+         {"default_used", decision.default_used},
+         {"outputs", decision.outputs.is_object() ? decision.outputs : json::object()},
+@@ -68,7 +71,9 @@ json route_decision_to_json(const Decision& decision,
+                 trace_entry["score"] = *entry.score;
+             }
+             if (!entry.label.empty()) {
+-                trace_entry["label"] = entry.label;
++                // A router label is a candidate name, so it must join
++                // route_to; a mapper leaves non-model labels unchanged.
++                trace_entry["label"] = model_name(entry.label);
+             }
+             if (!entry.rationale.empty()) {
+                 trace_entry["rationale"] = entry.rationale;
+diff --git a/src/cpp/server/routes/router/router_dispatch.cpp b/src/cpp/server/routes/router/router_dispatch.cpp
+index 1c7efa11f..7e8dfeaec 100644
+--- a/src/cpp/server/routes/router/router_dispatch.cpp
++++ b/src/cpp/server/routes/router/router_dispatch.cpp
+@@ -15,6 +15,12 @@ namespace lemon {
+ 
+ using json = nlohmann::json;
+ 
++ModelNameMapper public_model_name_mapper(ModelManager& model_manager) {
++    return [&model_manager](const std::string& name) {
++        return model_manager.get_public_model_name(name);
++    };
++}
++
+ std::optional<Decision> evaluate_router_policy(ServerContext& ctx, const ModelInfo& info,
+                                                const json& body, bool want_trace) {
+     // The policy is parsed once when the models cache is built. A missing one means
+@@ -64,6 +70,7 @@ std::optional<RouterDispatchResult> router_dispatch(ServerContext& ctx, std::str
+         result.requested_model = requested_model;
+         result.selected_model = decision->route_to;
+         result.decision = std::move(*decision);
++        result.public_model_name = public_model_name_mapper(*ctx.model_manager);
+         ctx.router->note_route_decision(utils::conversation_fingerprint(body),
+                                         result.selected_model);
+ 
+diff --git a/src/cpp/server/routes/router/routing_validate.cpp b/src/cpp/server/routes/router/routing_validate.cpp
+index 328691921..bd9e8f81c 100644
+--- a/src/cpp/server/routes/router/routing_validate.cpp
++++ b/src/cpp/server/routes/router/routing_validate.cpp
+@@ -270,7 +270,8 @@ public:
+             normalized_policy["routing"] = std::move(normalized_routing);
+ 
+             json response = {
+-                {"decision", route_decision_to_json(decision)},
++                {"decision", route_decision_to_json(
++                                 decision, public_model_name_mapper(*ctx_.model_manager))},
+                 {"normalized_policy", std::move(normalized_policy)},
+             };
+             res.set_content(response.dump(), "application/json");
+@@ -348,9 +349,10 @@ private:
+                 return;
+             }
+ 
++            const ModelNameMapper public_name = public_model_name_mapper(*ctx_.model_manager);
+             json response = {
+-                {"model", ctx_.model_manager->get_public_model_name(info.model_name)},
+-                {"decision", route_decision_to_json(*decision)},
++                {"model", public_name(info.model_name)},
++                {"decision", route_decision_to_json(*decision, public_name)},
+             };
+             res.set_content(response.dump(), "application/json");
+         } catch (const RouterResidencyConflictException& e) {
+-- 
+2.53.0
+

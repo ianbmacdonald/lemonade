@@ -1,0 +1,431 @@
+From f1669256d6ef1fb40d62f1f9865ca5de6ad5e0a8 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:13:52 -0400
+Subject: [PATCH 11/58] feat(health): report per-backend and server memory in
+ /v1/health
+
+Each all_models_loaded entry with a live pid now carries rss_mib (VmRSS)
+and anon_mib (RssAnon) read from /proc/<pid>/status, and a new top-level
+server_process object reports lemond's own pid and memory. Values are
+MiB rounded to one decimal, Linux-only, and omitted when unreadable.
+The /proc reads run in the health handler after the router lock is
+released, so other get_all_loaded_models() callers are unaffected.
+
+Adds a header-only lemon::utils process_memory helper with a cpp-ci
+unit test, extends the /health endpoint tests, and documents the fields.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                                |  12 ++
+ src/cpp/include/lemon/utils/process_memory.h  | 108 +++++++++++++++
+ .../server/routes/lemonade/system/health.cpp  |  35 ++++-
+ test/cpp/test_process_memory.cpp              | 125 ++++++++++++++++++
+ test/server_endpoints.py                      |  27 ++++
+ 5 files changed, 306 insertions(+), 1 deletion(-)
+ create mode 100644 src/cpp/include/lemon/utils/process_memory.h
+ create mode 100644 test/cpp/test_process_memory.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3b3831440..5921583b0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2489,6 +2489,18 @@ if(BUILD_TESTING AND EXISTS "${_CUSTOM_ARGS_TEST_SRC}")
+     add_cpp_ci_test(CustomArgsTest CI ON COMMAND test_custom_args)
+ endif()
+ 
++# /proc/<pid>/status memory parsing for the health endpoint.
++set(_PROCESS_MEMORY_TEST_SRC
++    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_process_memory.cpp"
++)
++if(BUILD_TESTING AND EXISTS "${_PROCESS_MEMORY_TEST_SRC}")
++    add_executable(test_process_memory ${_PROCESS_MEMORY_TEST_SRC})
++    target_include_directories(test_process_memory PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
++    )
++    add_cpp_ci_test(ProcessMemoryTest CI ON COMMAND test_process_memory)
++endif()
++
+ # Recipe custom-argument scope resolution.
+ set(_RECIPE_ARG_RESOLVER_TEST_SRC
+     "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_recipe_arg_resolution.cpp"
+diff --git a/src/cpp/include/lemon/utils/process_memory.h b/src/cpp/include/lemon/utils/process_memory.h
+new file mode 100644
+index 000000000..e3358d45c
+--- /dev/null
++++ b/src/cpp/include/lemon/utils/process_memory.h
+@@ -0,0 +1,108 @@
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <fstream>
++#include <istream>
++#include <string>
++
++#ifdef _WIN32
++#include <process.h>
++#else
++#include <unistd.h>
++#endif
++
++namespace lemon {
++namespace utils {
++
++struct ProcessMemory {
++    bool has_rss = false;
++    bool has_anon = false;
++    uint64_t rss_kib = 0;
++    uint64_t anon_kib = 0;
++};
++
++namespace detail {
++
++inline bool parse_status_kib(const std::string& line, const char* key, uint64_t& out) {
++    const std::string prefix = key;
++    if (line.compare(0, prefix.size(), prefix) != 0) {
++        return false;
++    }
++    size_t pos = prefix.size();
++    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
++        ++pos;
++    }
++    if (pos >= line.size() || line[pos] < '0' || line[pos] > '9') {
++        return false;
++    }
++    out = std::strtoull(line.c_str() + pos, nullptr, 10);
++    return true;
++}
++
++}  // namespace detail
++
++// VmRSS includes mmapped model weights and shared libraries; RssAnon is the
++// private anonymous share. A zombie has no Vm*/Rss* lines, so both stay unset.
++inline ProcessMemory parse_proc_status_memory(std::istream& in) {
++    ProcessMemory mem;
++    std::string line;
++    while (std::getline(in, line)) {
++        uint64_t value = 0;
++        if (!mem.has_rss && detail::parse_status_kib(line, "VmRSS:", value)) {
++            mem.has_rss = true;
++            mem.rss_kib = value;
++        } else if (!mem.has_anon && detail::parse_status_kib(line, "RssAnon:", value)) {
++            mem.has_anon = true;
++            mem.anon_kib = value;
++        }
++        if (mem.has_rss && mem.has_anon) {
++            break;
++        }
++    }
++    return mem;
++}
++
++inline ProcessMemory read_process_memory(int pid) {
++    if (pid <= 0) {
++        return {};
++    }
++#ifdef __linux__
++    std::ifstream in("/proc/" + std::to_string(pid) + "/status");
++    if (!in.is_open()) {
++        return {};
++    }
++    return parse_proc_status_memory(in);
++#else
++    (void)pid;
++    return {};
++#endif
++}
++
++inline ProcessMemory read_self_memory() {
++#ifdef __linux__
++    std::ifstream in("/proc/self/status");
++    if (!in.is_open()) {
++        return {};
++    }
++    return parse_proc_status_memory(in);
++#else
++    return {};
++#endif
++}
++
++inline double to_mib(uint64_t kib) {
++    return std::round(static_cast<double>(kib) / 1024.0 * 10.0) / 10.0;
++}
++
++inline int current_process_id() {
++#ifdef _WIN32
++    return _getpid();
++#else
++    return static_cast<int>(getpid());
++#endif
++}
++
++}  // namespace utils
++}  // namespace lemon
+diff --git a/src/cpp/server/routes/lemonade/system/health.cpp b/src/cpp/server/routes/lemonade/system/health.cpp
+index fbfdd265a..d35fdbaff 100644
+--- a/src/cpp/server/routes/lemonade/system/health.cpp
++++ b/src/cpp/server/routes/lemonade/system/health.cpp
+@@ -7,6 +7,7 @@
+ #include "lemon/server.h"
+ #include "lemon/server/api_route.h"
+ #include "lemon/server/http_listener.h"
++#include "lemon/utils/process_memory.h"
+ #include "lemon/version.h"
+ 
+ namespace lemon {
+@@ -15,6 +16,15 @@ namespace {
+ using json = nlohmann::json;
+ using ordered_json = nlohmann::ordered_json;
+ 
++void add_memory_fields(json& obj, const utils::ProcessMemory& mem) {
++    if (mem.has_rss) {
++        obj["rss_mib"] = utils::to_mib(mem.rss_kib);
++    }
++    if (mem.has_anon) {
++        obj["anon_mib"] = utils::to_mib(mem.anon_kib);
++    }
++}
++
+ ordered_json health_schema() {
+     return ordered_json::parse(R"json({
+         "type": "object",
+@@ -54,6 +64,8 @@ ordered_json health_schema() {
+                         "is_streaming": {"type": "boolean", "description": "Whether the model is generating output tokens: `true` from the first chunk until every streaming request completes."},
+                         "backend_url": {"type": "string", "description": "URL of the backend process serving the model."},
+                         "pid": {"type": "integer", "description": "Process ID of the backend process serving the model."},
++                        "rss_mib": {"type": "number", "description": "Resident memory of the backend process in MiB (`VmRSS`, rounded to one decimal). Includes memory-mapped model weights and shared libraries, so pages shared between backends can be counted more than once. Linux only; a best-effort sample, omitted when it can't be read. Only the direct backend process is measured, not its children."},
++                        "anon_mib": {"type": "number", "description": "Private anonymous memory of the backend process in MiB (`RssAnon`, rounded to one decimal): the part of `rss_mib` not backed by files. Same availability as `rss_mib`."},
+                         "launch_command": {"type": "array", "items": {"type": "string"}, "description": "The command that started the model's backend, program first, with the values actually used: an automatic `ctx_size` appears as a number, and flags Lemonade added are included. Absent for cloud models."},
+                         "recipe": {"type": "string", "description": "Recipe used to load the model, e.g. `llamacpp` or `flm`."},
+                         "recipe_options": {"type": "object", "description": "Options the model was loaded with, such as `ctx_size` or `llamacpp_args`."},
+@@ -96,7 +108,17 @@ ordered_json health_schema() {
+                     "captures": {"type": "array", "items": {"enum": ["inputs", "outputs", "thinking"]}, "description": "The parts of each request telemetry captures, present when `enabled` is `true`."}
+                 }
+             },
+-            "pinned_helper_models": {"type": "object", "additionalProperties": {"type": "integer", "description": "How many pinned routing-helper models of this type are loaded."}, "description": "Loaded pinned routing-helper models, counted per model type."}
++            "pinned_helper_models": {"type": "object", "additionalProperties": {"type": "integer", "description": "How many pinned routing-helper models of this type are loaded."}, "description": "Loaded pinned routing-helper models, counted per model type."},
++            "server_process": {
++                "type": "object",
++                "description": "The Lemonade Server process itself.",
++                "required": ["pid"],
++                "properties": {
++                    "pid": {"type": "integer", "description": "Process ID of the server."},
++                    "rss_mib": {"type": "number", "description": "Resident memory of the server in MiB, with the same meaning and availability as the per-model field."},
++                    "anon_mib": {"type": "number", "description": "Private anonymous memory of the server in MiB, with the same meaning and availability as the per-model field."}
++                }
++            }
+         }
+     })json");
+ }
+@@ -160,6 +182,17 @@ public:
+         std::string loaded_model = ctx_.router->get_loaded_model();
+         response["model_loaded"] = loaded_model.empty() ? json(nullptr) : json(loaded_model);
+         response["all_models_loaded"] = ctx_.router->get_all_loaded_models();
++        // Sampled after the router lock is released: a backend evicted in the gap
++        // just loses its memory fields for this one response.
++        for (auto& model : response["all_models_loaded"]) {
++            const int pid = model.value("pid", 0);
++            if (pid > 0) {
++                add_memory_fields(model, utils::read_process_memory(pid));
++            }
++        }
++        json server_process = {{"pid", utils::current_process_id()}};
++        add_memory_fields(server_process, utils::read_self_memory());
++        response["server_process"] = server_process;
+         response["max_models"] = ctx_.router->get_max_model_limits();
+         response["pinned_models"] = ctx_.router->get_pinned_model_counts();
+         response["pinned_helper_models"] = ctx_.router->get_pinned_helper_counts();
+diff --git a/test/cpp/test_process_memory.cpp b/test/cpp/test_process_memory.cpp
+new file mode 100644
+index 000000000..e5a4bfa9c
+--- /dev/null
++++ b/test/cpp/test_process_memory.cpp
+@@ -0,0 +1,125 @@
++// Standalone test for lemon::utils process memory helpers.
++// Build with: cmake --build --preset default --target test_process_memory
++// Run with: ctest --test-dir build -R '^ProcessMemoryTest$' --output-on-failure
++
++#include "lemon/utils/process_memory.h"
++
++#include <climits>
++#include <cstdint>
++#include <cstdio>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++using lemon::utils::ProcessMemory;
++using lemon::utils::current_process_id;
++using lemon::utils::parse_proc_status_memory;
++using lemon::utils::read_process_memory;
++using lemon::utils::read_self_memory;
++using lemon::utils::to_mib;
++
++static int g_failures = 0;
++
++static void check(bool ok, const char* name) {
++    std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", name);
++    if (!ok) {
++        ++g_failures;
++    }
++}
++
++static ProcessMemory parse(const std::string& text) {
++    std::istringstream in(text);
++    return parse_proc_status_memory(in);
++}
++
++static void test_parser() {
++    const std::string kernel6 =
++        "Name:\tllama-server\n"
++        "State:\tS (sleeping)\n"
++        "Pid:\t1234\n"
++        "VmPeak:\t 1234567 kB\n"
++        "VmSize:\t 1200000 kB\n"
++        "VmHWM:\t  700000 kB\n"
++        "VmRSS:\t  627088 kB\n"
++        "RssAnon:\t   90214 kB\n"
++        "RssFile:\t  536874 kB\n"
++        "RssShmem:\t       0 kB\n"
++        "Threads:\t8\n";
++    ProcessMemory m = parse(kernel6);
++    check(m.has_rss && m.rss_kib == 627088, "kernel 6.x fixture: VmRSS");
++    check(m.has_anon && m.anon_kib == 90214, "kernel 6.x fixture: RssAnon");
++
++    m = parse("Name:\told\nVmRSS:\t  4096 kB\nThreads:\t1\n");
++    check(m.has_rss && m.rss_kib == 4096 && !m.has_anon, "pre-4.5 fixture: rss only");
++
++    m = parse("Name:\tzombie\nState:\tZ (zombie)\nPid:\t42\nThreads:\t1\n");
++    check(!m.has_rss && !m.has_anon, "zombie fixture: neither");
++
++    m = parse("");
++    check(!m.has_rss && !m.has_anon, "empty stream: neither");
++
++    m = parse("VmRSS:");
++    check(!m.has_rss && !m.has_anon, "truncated VmRSS with no value: neither");
++
++    m = parse("VmRSS:   \nRssAnon:\tkB\n");
++    check(!m.has_rss && !m.has_anon, "keys with no digits: neither");
++
++    m = parse("VmRSS:      512 kB\nRssAnon:\t\t256 kB\n");
++    check(m.has_rss && m.rss_kib == 512, "multi-space padding parses");
++    check(m.has_anon && m.anon_kib == 256, "multi-tab padding parses");
++
++    m = parse("VmRSSx:\t100 kB\nRssAnonX:\t200 kB\n");
++    check(!m.has_rss && !m.has_anon, "prefix match requires the colon");
++}
++
++static void test_to_mib() {
++    check(to_mib(0) == 0.0, "to_mib(0) == 0.0");
++    check(to_mib(1024) == 1.0, "to_mib(1024) == 1.0");
++    check(to_mib(1075) == 1.0, "to_mib(1075) == 1.0");
++    check(to_mib(1076) == 1.1, "to_mib(1076) == 1.1");
++    check(to_mib(627088) == 612.4, "to_mib(627088) == 612.4");
++}
++
++#ifdef __linux__
++static int nonexistent_pid() {
++    std::ifstream in("/proc/sys/kernel/pid_max");
++    long long pid_max = 0;
++    if (in >> pid_max && pid_max > 0 && pid_max < INT_MAX) {
++        return static_cast<int>(pid_max + 1);
++    }
++    return INT_MAX;
++}
++
++static void test_live_reads() {
++    ProcessMemory self = read_self_memory();
++    check(self.has_rss && self.rss_kib > 0, "read_self_memory: rss > 0");
++    check(self.has_anon, "read_self_memory: has anon");
++
++    ProcessMemory by_pid = read_process_memory(current_process_id());
++    check(by_pid.has_rss && by_pid.rss_kib > 0, "read_process_memory(self pid): rss");
++
++    ProcessMemory zero = read_process_memory(0);
++    check(!zero.has_rss && !zero.has_anon, "read_process_memory(0): empty");
++
++    ProcessMemory negative = read_process_memory(-1);
++    check(!negative.has_rss && !negative.has_anon, "read_process_memory(-1): empty");
++
++    ProcessMemory gone = read_process_memory(nonexistent_pid());
++    check(!gone.has_rss && !gone.has_anon, "read_process_memory(pid_max+1): empty");
++}
++#endif
++
++int main() {
++    test_parser();
++    test_to_mib();
++    check(current_process_id() > 0, "current_process_id() > 0");
++#ifdef __linux__
++    test_live_reads();
++#endif
++    if (g_failures > 0) {
++        std::printf("%d failure(s)\n", g_failures);
++        return 1;
++    }
++    std::printf("All process memory tests passed\n");
++    return 0;
++}
+diff --git a/test/server_endpoints.py b/test/server_endpoints.py
+index 8b3a738c3..cabe1907b 100644
+--- a/test/server_endpoints.py
++++ b/test/server_endpoints.py
+@@ -26,6 +26,7 @@ import os
+ import platform
+ import socket
+ import subprocess
++import sys
+ import time
+ import unittest
+ import shutil
+@@ -208,6 +209,25 @@ class EndpointTests(ServerTestBase):
+         self.assertIsInstance(model_info["pid"], int)
+         self.assertGreater(model_info["pid"], 0)
+ 
++    def _assert_memory_fields(self, info):
++        """Assert rss_mib/anon_mib are sane on Linux and absent elsewhere."""
++        if sys.platform.startswith("linux"):
++            self.assertIn("rss_mib", info)
++            self.assertIn("anon_mib", info)
++            self.assertIsInstance(info["rss_mib"], (int, float))
++            self.assertIsInstance(info["anon_mib"], (int, float))
++            self.assertGreater(info["rss_mib"], 0)
++            self.assertGreaterEqual(info["anon_mib"], 0)
++            self.assertLessEqual(info["anon_mib"], info["rss_mib"])
++        else:
++            self.assertNotIn("rss_mib", info)
++            self.assertNotIn("anon_mib", info)
++
++    def _assert_loaded_model_memory(self, model_info):
++        """Assert /health exposes the wrapped backend's memory on Linux."""
++        self.assertIsNotNone(model_info, "Model should appear in /health")
++        self._assert_memory_fields(model_info)
++
+     def _assert_loaded_model_launch_command(self, model_info):
+         """Assert /health exposes the command the wrapped backend was started with."""
+         self.assertIsNotNone(model_info, "Model should appear in /health")
+@@ -378,6 +398,12 @@ class EndpointTests(ServerTestBase):
+         self.assertIn("embedding", max_models)
+         self.assertIn("reranking", max_models)
+ 
++        self.assertIn("server_process", data)
++        server_process = data["server_process"]
++        self.assertIsInstance(server_process["pid"], int)
++        self.assertGreater(server_process["pid"], 0)
++        self._assert_memory_fields(server_process)
++
+         # telemetry should have enabled, and captures iff enabled is True
+         self.assertIn("telemetry", data)
+         telemetry = data["telemetry"]
+@@ -1188,6 +1214,7 @@ class EndpointTests(ServerTestBase):
+         # Verify model is loaded via health endpoint and exposes backend PID
+         loaded_model = self._get_loaded_model_info(ENDPOINT_TEST_MODEL)
+         self._assert_loaded_model_pid(loaded_model)
++        self._assert_loaded_model_memory(loaded_model)
+         self._assert_loaded_model_launch_command(loaded_model)
+ 
+         print(f"[OK] Loaded model: {ENDPOINT_TEST_MODEL}")
+-- 
+2.53.0
+

@@ -1,0 +1,419 @@
+From 66ee687c9e024538ba4ea594498c80e22d50f119 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 21 Jul 2026 12:33:03 -0400
+Subject: [PATCH 01/58] feat: add LiteRT backend (litert-lm-server subprocess,
+ system PATH binary)
+
+New 'litert' recipe backend that launches litert-lm-server (an OpenAI-compatible
+HTTP server over LiteRT-LM's C ABI) as a subprocess and forwards chat/completions
+to it. System PATH-binary model (no downloadable artifact); CPU; x86_64/ARM64
+Linux; experimental. Adds a Qwen3-0.6B .litertlm model entry.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |   1 +
+ docs/assets/models.js                         |   4 +-
+ docs/guide/cli.md                             |   6 +
+ docs/guide/configuration/README.md            |   3 +
+ .../include/lemon/backends/litert/litert.h    |  50 +++++
+ .../lemon/backends/litert/litert_server.h     |  47 +++++
+ src/cpp/resources/defaults.json               |   3 +
+ src/cpp/resources/server_models.json          |   8 +
+ .../server/backends/litert/litert_server.cpp  | 177 ++++++++++++++++++
+ 9 files changed, 298 insertions(+), 1 deletion(-)
+ create mode 100644 src/cpp/include/lemon/backends/litert/litert.h
+ create mode 100644 src/cpp/include/lemon/backends/litert/litert_server.h
+ create mode 100644 src/cpp/server/backends/litert/litert_server.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6e2961a18..12568e6b2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -239,6 +239,7 @@ set(LEMON_BACKENDS
+     "onnxruntime|onnxruntime"
+     "trellis|trellis"
+     "openmoss|openmoss"
++    "litert|litert"
+ )
+ 
+ # ============================================================
+diff --git a/docs/assets/models.js b/docs/assets/models.js
+index d7b484e97..e15d0d490 100644
+--- a/docs/assets/models.js
++++ b/docs/assets/models.js
+@@ -9,6 +9,7 @@ const RECIPE_PRIORITY = [
+   'flm',
+   'llamacpp-hrx',
+   'kokoro',
++  'litert',
+   'llamacpp',
+   'moonshine',
+   'onnxruntime',
+@@ -36,7 +37,8 @@ const RECIPE_DISPLAY_NAMES = {
+   acestep: 'ACE-Step',
+   onnxruntime: 'ONNX Runtime',
+   trellis: 'TRELLIS.2',
+-  openmoss: 'OpenMOSS TTS'
++  openmoss: 'OpenMOSS TTS',
++  litert: 'LiteRT'
+ };
+ /* END GENERATED: models-js-recipes */
+ 
+diff --git a/docs/guide/cli.md b/docs/guide/cli.md
+index e601a3b66..cf2b607ea 100644
+--- a/docs/guide/cli.md
++++ b/docs/guide/cli.md
+@@ -473,6 +473,12 @@ The following options are available depending on the recipe being used:
+ | Option | Description | Default |
+ |--------|-------------|---------|
+ | `--openmoss BACKEND` | OpenMOSS TTS backend to use | Auto-detected |
++
++#### LiteRT (`litert` recipe)
++
++| Option | Description | Default |
++|--------|-------------|---------|
++| `--litert-args ARGS` | Custom arguments to pass to litert-lm-server | `""` |
+ <!-- END GENERATED: cli-recipe-options -->
+ **Notes:**
+ - Unspecified options will use the backend's default values
+diff --git a/docs/guide/configuration/README.md b/docs/guide/configuration/README.md
+index 32dda89ab..71b6d9fe1 100644
+--- a/docs/guide/configuration/README.md
++++ b/docs/guide/configuration/README.md
+@@ -75,6 +75,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
+   "kokoro": {
+     "cpu_bin": "builtin"
+   },
++  "litert": {
++    "args": ""
++  },
+   "llamacpp": {
+     "args": "",
+     "backend": "auto",
+diff --git a/src/cpp/include/lemon/backends/litert/litert.h b/src/cpp/include/lemon/backends/litert/litert.h
+new file mode 100644
+index 000000000..a95a585eb
+--- /dev/null
++++ b/src/cpp/include/lemon/backends/litert/litert.h
+@@ -0,0 +1,50 @@
++#pragma once
++
++#include "lemon/backends/backend_descriptor.h"
++
++namespace lemon {
++namespace backends {
++namespace litert {
++
++// The LiteRT backend descriptor (plain data). Header-only `inline const` so it
++// links into both the lemonade CLI and lemond without a separate source file.
++// Runs Google's LiteRT-LM runtime as a litert-lm-server subprocess serving an
++// OpenAI-compatible /v1/chat/completions endpoint over a `.litertlm` model on
++// the CPU backend. Like llamacpp's "system" variant, the binary is a pre-built
++// executable on PATH — there is nothing to download or install.
++inline const BackendDescriptor descriptor = {
++    /*recipe*/          "litert",
++    /*display_name*/    "LiteRT",
++    /*binary*/          "litert-lm-server",
++    /*config_section*/  "",  // defaults to recipe
++    /*default_device*/  DEVICE_CPU,
++    /*slot_policy*/     SlotPolicy::Standard,
++    /*selectable_backend*/ false,
++    /*uses_ctx_size*/   false,
++    /*dynamic_models*/  false,
++    /*options*/ {
++        {"litert_args", "--litert-args", "", "ARGS",
++         "Custom arguments to pass to litert-lm-server", "LiteRT Options"},
++    },
++    /*support*/ {
++        {"system", {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
++    },
++    /*default_labels*/  {},
++    /*required_checkpoints*/ {"main"},
++    /*modality*/        "Text generation",
++    /*experimental*/    true,
++    /*web_display_name*/ "",
++    /*rocm_channels*/   {},
++    /*exposes_prometheus_metrics*/ false,
++    /*rocm_requires_cwsr_fix*/ false,
++    /*version_policy*/  VersionPolicy::AtLeast,
++    /*self_manages_downloads*/ false,
++    /*takes_args*/      true,
++    /*arg_variants*/    {},
++    /*bin_variants*/    {},
++    /*config_extra*/    nlohmann::json::object(),
++};
++
++}  // namespace litert
++}  // namespace backends
++}  // namespace lemon
+diff --git a/src/cpp/include/lemon/backends/litert/litert_server.h b/src/cpp/include/lemon/backends/litert/litert_server.h
+new file mode 100644
+index 000000000..38087136f
+--- /dev/null
++++ b/src/cpp/include/lemon/backends/litert/litert_server.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include "lemon/backends/backend_registry.h"
++
++#include "lemon/wrapped_server.h"
++#include "lemon/server_capabilities.h"
++#include "lemon/backends/backend_utils.h"
++#include <string>
++
++namespace lemon {
++namespace backends {
++
++// Runs a `.litertlm` model as a litert-lm-server subprocess. The subprocess is
++// an OpenAI-compatible chat/completions server (Google LiteRT-LM runtime, CPU
++// backend), so serving the existing completion capability needs nothing beyond
++// forwarding requests to it. WrappedServer already inherits ICompletionServer;
++// only chat_completion/completion are overridden here.
++class LiteRtServer : public WrappedServer {
++public:
++    static InstallParams get_install_params(const std::string& backend, const std::string& version);
++
++    explicit LiteRtServer(const std::string& log_level,
++                          ModelManager* model_manager,
++                          BackendManager* backend_manager);
++
++    ~LiteRtServer() override;
++
++    void load(const std::string& model_name,
++              const ModelInfo& model_info,
++              const RecipeOptions& options,
++              bool do_not_upgrade = false) override;
++
++    void unload() override;
++
++    // ICompletionServer
++    json chat_completion(const json& request) override;
++    json completion(const json& request) override;
++};
++
++namespace litert {
++// Factory for the litert backend (constructs the server class — lemond only).
++std::unique_ptr<WrappedServer> create(const BackendContext& ctx);
++const BackendSpec* spec();
++const BackendOps* ops();
++}  // namespace litert
++}  // namespace backends
++}  // namespace lemon
+diff --git a/src/cpp/resources/defaults.json b/src/cpp/resources/defaults.json
+index 5e4fcde0e..1bd5f38f8 100644
+--- a/src/cpp/resources/defaults.json
++++ b/src/cpp/resources/defaults.json
+@@ -37,6 +37,9 @@
+   "kokoro": {
+     "cpu_bin": "builtin"
+   },
++  "litert": {
++    "args": ""
++  },
+   "llamacpp": {
+     "args": "",
+     "backend": "auto",
+diff --git a/src/cpp/resources/server_models.json b/src/cpp/resources/server_models.json
+index 95272b783..7f7dc879e 100644
+--- a/src/cpp/resources/server_models.json
++++ b/src/cpp/resources/server_models.json
+@@ -2983,5 +2983,13 @@
+         ],
+         "size": 81.0,
+         "min_resident_gb": 16.0
++    },
++    "Qwen3-0.6B-LiteRT": {
++        "checkpoint": "litert-community/Qwen3-0.6B:qwen3_0_6b_mixed_int4.litertlm",
++        "recipe": "litert",
++        "labels": [
++            "reasoning"
++        ],
++        "size": 0.5
+     }
+ }
+diff --git a/src/cpp/server/backends/litert/litert_server.cpp b/src/cpp/server/backends/litert/litert_server.cpp
+new file mode 100644
+index 000000000..04382a553
+--- /dev/null
++++ b/src/cpp/server/backends/litert/litert_server.cpp
+@@ -0,0 +1,177 @@
++#include "lemon/backends/litert/litert_server.h"
++#include "lemon/backends/litert/litert.h"
++#include "lemon/backends/backend_registry.h"
++#include "lemon/backends/backend_ops.h"
++#include "lemon/backends/backend_utils.h"
++#include "lemon/backend_manager.h"
++#include "lemon/utils/custom_args.h"
++#include "lemon/utils/http_client.h"
++#include "lemon/utils/process_manager.h"
++#include <algorithm>
++#include <filesystem>
++#include <optional>
++#include <set>
++#include <string>
++#include <vector>
++#include <lemon/utils/aixlog.hpp>
++
++namespace fs = std::filesystem;
++using namespace lemon::utils;
++
++namespace lemon {
++namespace backends {
++
++namespace {
++bool ends_with_ci(const std::string& value, const std::string& suffix) {
++    if (value.size() < suffix.size()) return false;
++    return std::equal(suffix.rbegin(), suffix.rend(), value.rbegin(),
++                      [](char a, char b) {
++                          return std::tolower(static_cast<unsigned char>(a)) ==
++                                 std::tolower(static_cast<unsigned char>(b));
++                      });
++}
++}  // namespace
++
++// litert-lm-server is a pre-built binary on PATH (the "system" backend), so it
++// has no downloadable release. install_backend() short-circuits for "system"
++// and never calls this; it exists only to satisfy make_spec<T>.
++InstallParams LiteRtServer::get_install_params(const std::string& backend,
++                                               const std::string& version) {
++    (void)backend;
++    (void)version;
++    throw std::runtime_error(
++        "The litert backend uses a pre-installed litert-lm-server binary on PATH "
++        "and has no downloadable release");
++}
++
++LiteRtServer::LiteRtServer(const std::string& log_level, ModelManager* model_manager,
++                           BackendManager* backend_manager)
++    : WrappedServer("litert-lm-server", log_level, model_manager, backend_manager) {
++}
++
++LiteRtServer::~LiteRtServer() {
++    unload();
++}
++
++void LiteRtServer::load(const std::string& model_name,
++                        const ModelInfo& model_info,
++                        const RecipeOptions& options,
++                        bool do_not_upgrade) {
++    (void)do_not_upgrade;
++    LOG(INFO, "LiteRtServer") << "Loading model: " << model_name << std::endl;
++    LOG(INFO, "LiteRtServer") << "Per-model settings: " << options.to_log_string() << std::endl;
++
++    std::string extra_args = options.get_option("litert_args");
++    device_type_ = DEVICE_CPU;
++
++    // "system" backend: nothing to install (PATH binary), returns immediately.
++    backend_manager_->install_backend(litert::spec()->recipe, "system");
++
++    std::string model_path = model_info.resolved_path();
++    if (model_path.empty() || !fs::exists(path_from_utf8(model_path))) {
++        throw std::runtime_error("Model file not found for checkpoint: " + model_info.checkpoint());
++    }
++    LOG(INFO, "LiteRtServer") << "Using model: " << model_path << std::endl;
++
++    std::string executable = BackendUtils::get_backend_binary_path(*litert::spec(), "system");
++    LOG(INFO, "LiteRtServer") << "Using executable: " << executable << std::endl;
++
++    port_ = utils::ProcessManager::find_free_port(8001);
++    if (port_ == 0) {
++        throw std::runtime_error("Failed to find an available port for litert-lm-server");
++    }
++
++    std::vector<std::string> args = {
++        "--model", model_path,
++        "--port", std::to_string(port_),
++    };
++
++    std::set<std::string> reserved_flags = {"--model", "--port"};
++    if (!extra_args.empty()) {
++        std::string validation_error = validate_custom_args(extra_args, reserved_flags);
++        if (!validation_error.empty()) {
++            throw std::invalid_argument("Invalid custom litert-lm-server arguments:\n" + validation_error);
++        }
++        std::vector<std::string> custom_args_vec = parse_custom_args(extra_args);
++        args.insert(args.end(), custom_args_vec.begin(), custom_args_vec.end());
++    }
++
++    bool inherit_output = (log_level_ == "info") || is_debug();
++    ProcessHandle started_handle = utils::ProcessManager::start_process(
++        executable, args, "", inherit_output, false, {});
++    set_process_handle(started_handle);
++
++    if (!has_process_handle(started_handle)) {
++        throw std::runtime_error("Failed to start litert-lm-server process");
++    }
++    LOG(INFO, "LiteRtServer") << "Process started with PID: " << started_handle.pid << std::endl;
++
++    if (!wait_for_ready("/health")) {
++        unload();
++        throw std::runtime_error("litert-lm-server failed to start or become ready");
++    }
++    start_backend_watchdog("/health");
++    LOG(INFO, "LiteRtServer") << "Server is ready!" << std::endl;
++}
++
++void LiteRtServer::unload() {
++    stop_backend_watchdog();
++    const ProcessHandle handle = consume_process_handle_for_cleanup();
++    if (has_process_handle(handle)) {
++        LOG(INFO, "LiteRtServer") << "Stopping server (PID: " << handle.pid << ")" << std::endl;
++        utils::ProcessManager::stop_process(handle);
++    }
++}
++
++json LiteRtServer::chat_completion(const json& request) {
++    return forward_request("/v1/chat/completions", request);
++}
++
++json LiteRtServer::completion(const json& request) {
++    return forward_request("/v1/completions", request);
++}
++
++}  // namespace backends
++}  // namespace lemon
++
++namespace lemon {
++namespace backends {
++namespace litert {
++
++std::unique_ptr<WrappedServer> create(const BackendContext& ctx) {
++    return make_server<LiteRtServer>(ctx);
++}
++
++namespace {
++// A litert checkpoint names a single `.litertlm` file (CHECKPOINT:VARIANT). The
++// default resolver locates that file in the active snapshot; here we scope the
++// download to just it (plus companion config files, added generically upstream)
++// so the whole multi-gigabyte repo isn't pulled.
++class LiteRtOps : public BackendOps {
++public:
++    std::optional<std::vector<std::string>> select_checkpoint_files(
++        const std::string& main_variant, const std::vector<std::string>& repo_files) const override {
++        if (!main_variant.empty()) {
++            for (const auto& f : repo_files) {
++                if (f == main_variant) {
++                    return std::vector<std::string>{f};
++                }
++            }
++            throw std::runtime_error("LiteRT model file not found in repository: " + main_variant);
++        }
++        for (const auto& f : repo_files) {
++            if (ends_with_ci(f, ".litertlm")) {
++                return std::vector<std::string>{f};
++            }
++        }
++        throw std::runtime_error("No .litertlm model file found in repository");
++    }
++};
++}  // namespace
++
++const BackendSpec* spec() { return make_spec<LiteRtServer>(descriptor); }
++const BackendOps* ops() { return single_ops<LiteRtOps>(); }
++
++}  // namespace litert
++}  // namespace backends
++}  // namespace lemon
+-- 
+2.53.0
+

@@ -1,0 +1,107 @@
+From 72fb1fdfd587e4d283f5c7656b47cf6e4c614c88 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 01:13:37 -0400
+Subject: [PATCH 53/58] fix: build against upstream's backend tiers, httplib
+ split header and beacon port
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/backends/executorch/executorch.h | 2 +-
+ src/cpp/include/lemon/backends/litert/litert.h         | 2 +-
+ src/cpp/include/lemon/backends/tflite/tflite.h         | 2 +-
+ src/cpp/include/lemon/upgradable_http_server.h         | 7 ++++++-
+ src/cpp/server/backends/litert/litert_server.cpp       | 1 +
+ src/cpp/server/core/http_listener.cpp                  | 8 ++------
+ 6 files changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/src/cpp/include/lemon/backends/executorch/executorch.h b/src/cpp/include/lemon/backends/executorch/executorch.h
+index c799ecb6d..7e1422cb6 100644
+--- a/src/cpp/include/lemon/backends/executorch/executorch.h
++++ b/src/cpp/include/lemon/backends/executorch/executorch.h
+@@ -25,7 +25,7 @@ inline const BackendDescriptor descriptor = {
+          "Custom arguments to pass to et-server", "ExecuTorch Options"},
+     },
+     /*support*/ {
+-        {"system", {"linux"}, {{"cpu", {"x86_64"}}}, "x86_64 CPU"},
++        {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64"}}}, "x86_64 CPU"},
+     },
+     /*supported_modes*/ {"classification"},
+     /*required_checkpoints*/ {"main"},
+diff --git a/src/cpp/include/lemon/backends/litert/litert.h b/src/cpp/include/lemon/backends/litert/litert.h
+index d734cb4b0..4eee560cf 100644
+--- a/src/cpp/include/lemon/backends/litert/litert.h
++++ b/src/cpp/include/lemon/backends/litert/litert.h
+@@ -27,7 +27,7 @@ inline const BackendDescriptor descriptor = {
+          "Custom arguments to pass to litert-lm-server", "LiteRT Options"},
+     },
+     /*support*/ {
+-        {"system", {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
++        {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
+     },
+     /*supported_modes*/ {"chat"},
+     /*required_checkpoints*/ {"main"},
+diff --git a/src/cpp/include/lemon/backends/tflite/tflite.h b/src/cpp/include/lemon/backends/tflite/tflite.h
+index bda92493f..f9a51bd2b 100644
+--- a/src/cpp/include/lemon/backends/tflite/tflite.h
++++ b/src/cpp/include/lemon/backends/tflite/tflite.h
+@@ -28,7 +28,7 @@ inline const BackendDescriptor descriptor = {
+          "Custom arguments to pass to tflite-server", "TFLite Options"},
+     },
+     /*support*/ {
+-        {"system", {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
++        {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
+     },
+     /*supported_modes*/ {"classification", "image-classification"},
+     /*required_checkpoints*/ {"main"},
+diff --git a/src/cpp/include/lemon/upgradable_http_server.h b/src/cpp/include/lemon/upgradable_http_server.h
+index 4a4981c73..df132d62e 100644
+--- a/src/cpp/include/lemon/upgradable_http_server.h
++++ b/src/cpp/include/lemon/upgradable_http_server.h
+@@ -212,7 +212,12 @@ private:
+             "Content-Type: application/json\r\nContent-Length: " +
+             std::to_string(kBody.size()) + "\r\n\r\n" + kBody;
+         httplib::detail::send_socket(sock, kBusy.data(), kBusy.size(), 0);
+-        httplib::detail::shutdown_socket(sock);
++        // httplib declares shutdown_socket only in its implementation section.
++#ifdef _WIN32
++        ::shutdown(sock, SD_BOTH);
++#else
++        ::shutdown(sock, SHUT_RDWR);
++#endif
+         httplib::detail::close_socket(sock);
+         // A client at its cap is usually retrying in a loop; log the first
+         // refusal and then every 100th rather than every one.
+diff --git a/src/cpp/server/backends/litert/litert_server.cpp b/src/cpp/server/backends/litert/litert_server.cpp
+index bdf64f018..dffbb9d67 100644
+--- a/src/cpp/server/backends/litert/litert_server.cpp
++++ b/src/cpp/server/backends/litert/litert_server.cpp
+@@ -6,6 +6,7 @@
+ #include "lemon/backend_manager.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
++#include "lemon/utils/path_utils.h"
+ #include "lemon/utils/process_manager.h"
+ #include <algorithm>
+ #include <filesystem>
+diff --git a/src/cpp/server/core/http_listener.cpp b/src/cpp/server/core/http_listener.cpp
+index 0881bd8d3..790ff4fc8 100644
+--- a/src/cpp/server/core/http_listener.cpp
++++ b/src/cpp/server/core/http_listener.cpp
+@@ -47,12 +47,8 @@ template struct lemon::detail::PrivateMemberInit<lemon::detail::OptionsHandlersT
+ 
+ namespace lemon {
+ 
+-namespace {
+-
+-// Clients find lemond by listening on this port, so it is not configurable.
+-constexpr int kBeaconPort = 13305;
+-
+-} // namespace
++// Clients find lemond by listening on kBeaconPort (beacon_listener.h), so it is
++// not configurable.
+ 
+ HttpListener::HttpListener(RuntimeConfig* config, Router* router, SetupFn setup,
+                            std::function<void()> stop_server, bool api_key_set,
+-- 
+2.53.0
+

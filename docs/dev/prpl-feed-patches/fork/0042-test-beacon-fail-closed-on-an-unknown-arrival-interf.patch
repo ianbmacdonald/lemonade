@@ -1,0 +1,121 @@
+From 609c7c21410041389a12d11afda20332ca349fe1 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 18:58:39 -0400
+Subject: [PATCH 42/58] test(beacon): fail closed on an unknown arrival
+ interface and report unmatched allow-list entries
+
+Factors the arrival-interface decision into beacon_arrival_accepted() with
+the current behaviour, and adds netns test cases that fail on it: an
+allow-listed listener that cannot learn the arrival interface still accepts
+beacons on a directed-broadcast socket, and an allow-list naming no existing
+interface is silent (no unmatched_interfaces, no error).
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/utils/beacon_listener.h |  4 +++
+ src/cpp/server/utils/beacon_listener.cpp      | 20 ++++++++-----
+ test/cpp/test_beacon_listener_socket.cpp      | 28 +++++++++++++++++++
+ 3 files changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/src/cpp/include/lemon/utils/beacon_listener.h b/src/cpp/include/lemon/utils/beacon_listener.h
+index 04ad0fcb5..c86b9c1c4 100644
+--- a/src/cpp/include/lemon/utils/beacon_listener.h
++++ b/src/cpp/include/lemon/utils/beacon_listener.h
+@@ -47,6 +47,10 @@ enum class IngestResult {
+ 
+ const char* ingest_result_name(IngestResult result);
+ 
++// Whether a beacon that arrived on ifindex (0 = unknown) may be ingested.
++bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
++                             const std::vector<unsigned>& listened_ifindexes);
++
+ struct HeardHost {
+     std::string hostname;
+     std::string url;
+diff --git a/src/cpp/server/utils/beacon_listener.cpp b/src/cpp/server/utils/beacon_listener.cpp
+index f0468eb5c..a63d83a27 100644
+--- a/src/cpp/server/utils/beacon_listener.cpp
++++ b/src/cpp/server/utils/beacon_listener.cpp
+@@ -138,6 +138,13 @@ const char* ingest_result_name(IngestResult result) {
+     return "unknown";
+ }
+ 
++bool beacon_arrival_accepted(bool allowlist_active, unsigned ifindex,
++                             const std::vector<unsigned>& listened_ifindexes) {
++    (void)allowlist_active;
++    if (ifindex == 0) return true;
++    return std::find(listened_ifindexes.begin(), listened_ifindexes.end(), ifindex) != listened_ifindexes.end();
++}
++
+ BeaconPeerTable::BeaconPeerTable() = default;
+ 
+ void BeaconPeerTable::set_self(const std::string& instance_id, int self_port) {
+@@ -699,13 +706,12 @@ void BeaconListener::refresh_sockets() {
+ }
+ 
+ bool BeaconListener::arrived_on_listened_interface(const SocketState& sock, unsigned ifindex) const {
+-    if (ifindex == 0) {
+-        // Without the arrival interface, only a directed-broadcast socket is
+-        // tied to a listened interface; 255.255.255.255 arrives on any of them.
+-        return !(allowlist_active_ && sock.bind_ip == 0xFFFFFFFFu);
+-    }
+-    return std::any_of(interfaces_.begin(), interfaces_.end(),
+-                       [ifindex](const ListenedInterface& i) { return i.index == ifindex; });
++    // Without the arrival interface, only a directed-broadcast socket is
++    // tied to a listened interface; 255.255.255.255 arrives on any of them.
++    if (ifindex == 0 && allowlist_active_ && sock.bind_ip == 0xFFFFFFFFu) return false;
++    std::vector<unsigned> listened;
++    for (const auto& i : interfaces_) listened.push_back(i.index);
++    return beacon_arrival_accepted(allowlist_active_, ifindex, listened);
+ }
+ 
+ void BeaconListener::thread_loop() {
+diff --git a/test/cpp/test_beacon_listener_socket.cpp b/test/cpp/test_beacon_listener_socket.cpp
+index 4827234a4..5976212de 100644
+--- a/test/cpp/test_beacon_listener_socket.cpp
++++ b/test/cpp/test_beacon_listener_socket.cpp
+@@ -131,6 +131,12 @@ bool socket_bound(const json& st, const std::string& address) {
+ 
+ int run_netns_tests() {
+     std::puts("=== RUNNING BEACON LISTENER NETNS BROADCAST TESTS ===");
++
++    check(!lemon::beacon_arrival_accepted(true, 0, {2}),
++          "allow-list active, arrival interface unknown: rejected (fail closed)");
++    check(lemon::beacon_arrival_accepted(false, 0, {2}), "no allow-list, arrival interface unknown: accepted");
++    check(lemon::beacon_arrival_accepted(true, 2, {2}), "allow-list active, arrival on listened interface: accepted");
++    check(!lemon::beacon_arrival_accepted(true, 3, {2}), "allow-list active, arrival on other interface: rejected");
+     if (!enter_private_netns()) return 0;
+ 
+     NetworkBeacon nb;
+@@ -197,6 +203,28 @@ int run_netns_tests() {
+                        std::chrono::milliseconds(2000)),
+               "changing the allow-list rebinds without a restart");
+         check(!socket_bound(listener.status_json(), "10.213.0.255:13305"), "old interface is released");
++        check(listener.status_json().value("unmatched_interfaces", json()) == json::array(),
++              "a fully matched allow-list reports no unmatched interfaces");
++
++        listener.set_interface_allowlist({"lbt0", "nope0"});
++        check(wait_for([&] { return socket_bound(listener.status_json(), "10.213.0.255:13305"); },
++                       std::chrono::milliseconds(2000)),
++              "partially matched allow-list still listens on lbt0");
++        json partial = listener.status_json();
++        check(partial.value("unmatched_interfaces", json()) == json::array({"nope0"}),
++              "partially matched allow-list reports nope0 as unmatched");
++        check(partial["listening"] == true && partial["error"].is_null(),
++              "partially matched allow-list is listening without an error");
++
++        listener.set_interface_allowlist({"nope0", "nope1"});
++        check(wait_for([&] { return !listener.status_json().value("listening", true); },
++                       std::chrono::milliseconds(2000)),
++              "allow-list matching no interface is not listening");
++        json none = listener.status_json();
++        check(none.value("unmatched_interfaces", json()) == json::array({"nope0", "nope1"}),
++              "allow-list matching no interface reports every entry as unmatched");
++        check(none["error"].is_string() && none["error"].get<std::string>().find("nope0") != std::string::npos,
++              "allow-list matching no interface explains itself in error");
+         listener.stop();
+     }
+ 
+-- 
+2.53.0
+

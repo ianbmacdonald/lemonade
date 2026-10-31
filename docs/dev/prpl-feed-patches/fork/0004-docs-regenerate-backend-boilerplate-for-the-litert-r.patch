@@ -1,0 +1,54 @@
+From b4306d7099aaf733fdfafab48e9fcff137ce24b6 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 26 Sep 2026 21:21:01 -0400
+Subject: [PATCH 04/58] docs: regenerate backend boilerplate for the litert
+ recipe
+
+Assisted-by: claude:opus-5.5
+---
+ README.md                                 | 8 +++++++-
+ docs/guide/configuration/custom-models.md | 2 +-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/README.md b/README.md
+index 55374555a..0c6f42e38 100644
+--- a/README.md
++++ b/README.md
+@@ -147,7 +147,7 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
+   </thead>
+   <tbody>
+     <tr>
+-      <td rowspan="11"><strong>Text generation</strong></td>
++      <td rowspan="12"><strong>Text generation</strong></td>
+       <td rowspan="6"><code>llamacpp</code></td>
+       <td><code>system</code></td>
+       <td><code>x86_64</code>/ARM64 CPU, GPU</td>
+@@ -208,6 +208,12 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
+       <td>Prebuilt ds4 for AMD Strix Halo</td>
+       <td>Linux</td>
+     </tr>
++    <tr>
++      <td rowspan="1"><code>litert</code> (experimental)</td>
++      <td><code>system</code></td>
++      <td><code>x86_64</code>/ARM64 CPU</td>
++      <td>Linux</td>
++    </tr>
+     <tr>
+       <td rowspan="6"><strong>Speech-to-text</strong></td>
+       <td rowspan="5"><code>whispercpp</code></td>
+diff --git a/docs/guide/configuration/custom-models.md b/docs/guide/configuration/custom-models.md
+index 3cda3f940..95a569d1f 100644
+--- a/docs/guide/configuration/custom-models.md
++++ b/docs/guide/configuration/custom-models.md
+@@ -99,7 +99,7 @@ Supported registration flags:
+ |------|-------------|
+ | `--source SOURCE` | Remote registry for every checkpoint in this model: <!-- BEGIN GENERATED: remote-registry-tokens -->`huggingface` or `modelscope`<!-- END GENERATED: remote-registry-tokens -->. When omitted, the server's configured `default_model_source` applies. |
+ | `--checkpoint TYPE CHECKPOINT` | Add a checkpoint entry. Repeat for multi-file models such as `main` + `mmproj` or `main` + `vae`. |
+-| `--recipe RECIPE` | Recipe to associate with the new `user.*` model. Common values: <!-- BEGIN GENERATED: recipe-values -->`llamacpp`, `llamacpp-hrx`, `whispercpp`, `moonshine`, `kokoro`, `sd-cpp`, `flm`, `ryzenai-llm`, `vllm`, `thenoise`, `ds4`, `thinksound`, `acestep`, `onnxruntime`, `trellis`, `openmoss`, `collection.omni`<!-- END GENERATED: recipe-values -->. |
++| `--recipe RECIPE` | Recipe to associate with the new `user.*` model. Common values: <!-- BEGIN GENERATED: recipe-values -->`llamacpp`, `llamacpp-hrx`, `whispercpp`, `moonshine`, `kokoro`, `sd-cpp`, `flm`, `ryzenai-llm`, `vllm`, `thenoise`, `ds4`, `thinksound`, `acestep`, `onnxruntime`, `trellis`, `openmoss`, `litert`, `collection.omni`<!-- END GENERATED: recipe-values -->. |
+ | `--label LABEL` | Add a label to the new model. Repeatable. Valid labels include `chat`, `coding`, `dflash`, `embeddings`, `hot`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `vision`. When no [deployment label](../../api/openai.md#model-labels) is given, the recipe's default is added — `chat` for `llamacpp`, `flm`, `ryzenai-llm` and `vllm`; `transcription` for `whispercpp`; `image` for `sd-cpp`; and so on. |
+ | `--components MODEL [MODEL ...]` | Components for an omni collection (see below). Use with `--recipe collection.omni`. |
+ 
+-- 
+2.53.0
+

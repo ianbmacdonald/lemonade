@@ -1,0 +1,28 @@
+From dcb65af3bc9ff3538c4128844c8058713cc03dc4 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 21:29:23 -0400
+Subject: [PATCH 46/58] docs(config): regenerate the config example for
+ beacon_trusted_relays
+
+Assisted-by: claude:opus-5.5
+---
+ docs/guide/configuration/README.md | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/docs/guide/configuration/README.md b/docs/guide/configuration/README.md
+index 67460f74c..b48c90631 100644
+--- a/docs/guide/configuration/README.md
++++ b/docs/guide/configuration/README.md
+@@ -49,6 +49,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
+   "auto_evict": false,
+   "auto_evict_threshold_pct": 0.9,
+   "auto_update_models": false,
++  "beacon_listen": false,
++  "beacon_listen_interfaces": [],
++  "beacon_trusted_relays": [],
+   "broadcast": true,
+   "cloud_providers": [],
+   "config_version": 2,
+-- 
+2.53.0
+

@@ -1,0 +1,34 @@
+From 0223af58a92f40fca50f980c6132e86e01d06850 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Thu, 23 Jul 2026 09:01:29 -0400
+Subject: [PATCH 02/58] fix(litert): reserve --host so a recipe cannot widen
+ the backend bind
+
+The litert-lm-server binds loopback by design (reached only by the
+in-process forwarder); reserving --host in litert_args prevents a recipe
+from re-exposing it to the gateway LAN. Part of the B123 hardening pass.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/cpp/server/backends/litert/litert_server.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/cpp/server/backends/litert/litert_server.cpp b/src/cpp/server/backends/litert/litert_server.cpp
+index 04382a553..29148aa5b 100644
+--- a/src/cpp/server/backends/litert/litert_server.cpp
++++ b/src/cpp/server/backends/litert/litert_server.cpp
+@@ -86,7 +86,10 @@ void LiteRtServer::load(const std::string& model_name,
+         "--port", std::to_string(port_),
+     };
+ 
+-    std::set<std::string> reserved_flags = {"--model", "--port"};
++    // --host is reserved: litert-lm-server binds loopback by design (it is
++    // reached only by this in-process forwarder), and a recipe must not be able
++    // to widen that to the gateway LAN.
++    std::set<std::string> reserved_flags = {"--model", "--port", "--host"};
+     if (!extra_args.empty()) {
+         std::string validation_error = validate_custom_args(extra_args, reserved_flags);
+         if (!validation_error.empty()) {
+-- 
+2.53.0
+

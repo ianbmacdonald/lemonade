@@ -1,0 +1,1097 @@
+From 994c9b68f155b64ea580083c0ab337fce0a7e5e3 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:39:05 -0400
+Subject: [PATCH 18/58] fix(images/classify): close body-size bypasses, cap
+ in-flight requests, pause crash loops
+
+The pre-body guard read only Content-Length, but httplib reads chunked
+framing first and inflates Content-Encoding bodies up to its 100 MB cap.
+The guard now refuses any Transfer-Encoding (411) and any Content-Encoding
+(415), and the handler re-checks the received size (413) as a second layer.
+parse_json refuses an over-long image string before decoding and no longer
+makes a whitespace-free copy of it.
+
+At most two requests are admitted to the route at once (503 server_busy,
+Retry-After: 1). The slot is taken in pre-routing and released in
+post-routing, which httplib runs on every answered request, including
+aborted uploads.
+
+A request that crashes the backend no longer reloads it on its own thread;
+the next request does. Three such crashes within 60 s pause image
+classification for that model for 60 s (503 backend_crash_cooldown with
+Retry-After) without a reload. With no model named, the sole image model is
+chosen even while its backend is down, so that request reloads it instead of
+getting a misleading 400.
+
+tflite_server uses the shared magic sniffer and drops an unused include;
+/v1/classify checks for an empty model name before looking it up; the docs
+list 411/415/503 and the image/jpg data-URL alias.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/crash_breaker.h         |  59 +++++++
+ .../include/lemon/image_classify_request.h    |  33 +++-
+ src/cpp/include/lemon/router.h                |   9 +-
+ .../include/lemon/server/request_middleware.h |   7 +
+ .../server/backends/tflite/tflite_server.cpp  |  15 +-
+ src/cpp/server/core/request_middleware.cpp    |  84 ++++++---
+ src/cpp/server/image_classify_request.cpp     |  81 ++++++---
+ src/cpp/server/router.cpp                     |  43 +++--
+ .../lemonade/inference/images_classify.cpp    |  49 +++++-
+ test/cpp/test_image_classify_request.cpp      |  70 +++++++-
+ test/server_image_classify.py                 | 166 +++++++++++++++++-
+ test/utils/fake_tflite_server.py              |   7 +
+ 12 files changed, 528 insertions(+), 95 deletions(-)
+ create mode 100644 src/cpp/include/lemon/crash_breaker.h
+
+diff --git a/src/cpp/include/lemon/crash_breaker.h b/src/cpp/include/lemon/crash_breaker.h
+new file mode 100644
+index 000000000..1cf964019
+--- /dev/null
++++ b/src/cpp/include/lemon/crash_breaker.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <chrono>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++namespace lemon {
++
++// Counts backend crashes per key. After `threshold` crashes inside `window`,
++// the key is refused for `cooldown`, so an input that keeps crashing a backend
++// cannot keep it in a crash-and-reload loop.
++class CrashBreaker {
++public:
++    using Clock = std::chrono::steady_clock;
++
++    CrashBreaker(int threshold, Clock::duration window, Clock::duration cooldown)
++        : threshold_(threshold), window_(window), cooldown_(cooldown) {}
++
++    // Whole seconds left in the cool-down (at least 1), or 0 when not blocked.
++    long long blocked_seconds(const std::string& key, Clock::time_point now) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        auto it = state_.find(key);
++        if (it == state_.end() || now >= it->second.blocked_until) return 0;
++        const auto left = it->second.blocked_until - now;
++        const long long secs =
++            std::chrono::duration_cast<std::chrono::seconds>(left + std::chrono::seconds(1) -
++                                                             Clock::duration(1))
++                .count();
++        return secs < 1 ? 1 : secs;
++    }
++
++    // Returns true when this crash opens the cool-down.
++    bool record_crash(const std::string& key, Clock::time_point now) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        State& s = state_[key];
++        while (!s.crashes.empty() && now - s.crashes.front() >= window_) s.crashes.pop_front();
++        s.crashes.push_back(now);
++        if (static_cast<int>(s.crashes.size()) < threshold_) return false;
++        s.crashes.clear();
++        s.blocked_until = now + cooldown_;
++        return true;
++    }
++
++private:
++    struct State {
++        std::deque<Clock::time_point> crashes;
++        Clock::time_point blocked_until{};
++    };
++
++    const int threshold_;
++    const Clock::duration window_;
++    const Clock::duration cooldown_;
++    std::mutex mutex_;
++    std::unordered_map<std::string, State> state_;
++};
++
++}  // namespace lemon
+diff --git a/src/cpp/include/lemon/image_classify_request.h b/src/cpp/include/lemon/image_classify_request.h
+index 0ecebcb8a..83eec5a40 100644
+--- a/src/cpp/include/lemon/image_classify_request.h
++++ b/src/cpp/include/lemon/image_classify_request.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <nlohmann/json.hpp>
+@@ -16,6 +17,13 @@ using json = nlohmann::json;
+ constexpr std::size_t kMaxImageBytes = 16u * 1024u * 1024u;
+ // Base64 of kMaxImageBytes plus room for the JSON or multipart framing.
+ constexpr std::uint64_t kMaxImageClassifyRequestBytes = 23ull * 1024ull * 1024ull;
++// Longest JSON "image" string worth decoding: base64 of kMaxImageBytes plus a
++// data: URL prefix and line breaks.
++constexpr std::size_t kMaxImageBase64Chars = 4u * ((kMaxImageBytes + 2u) / 3u) + 64u * 1024u;
++
++// Each admitted request can hold several copies of a maximum-size body while it
++// is parsed and forwarded, and httplib runs up to 256 workers.
++constexpr int kMaxConcurrentImageClassify = 2;
+ 
+ constexpr int kDefaultTopK = 5;
+ constexpr long long kMaxTopK = 1000000;
+@@ -51,9 +59,28 @@ std::string sniff_image_mime(std::string_view bytes);
+ // True for POST targets of this route under any of its four prefixes.
+ bool is_image_classify_path(const std::string& path);
+ 
+-// Checked before the body is read: 0 to proceed, 411 when there is no
+-// Content-Length (chunked), 413 when it exceeds kMaxImageClassifyRequestBytes.
+-int precheck_content_length(bool has_length, std::uint64_t length);
++// Checked before the body is read, so the body can only be what Content-Length
++// declares. Returns 0 to proceed; 415 for any Content-Encoding (httplib would
++// inflate it past the declared length); 411 for any Transfer-Encoding (even
++// with a Content-Length, httplib reads chunked framing first) or no
++// Content-Length; 413 when it exceeds kMaxImageClassifyRequestBytes.
++int precheck_request_headers(bool has_length, std::uint64_t length,
++                             bool has_transfer_encoding, bool has_content_encoding);
++
++class InflightLimiter {
++public:
++    explicit InflightLimiter(int max_in_flight) : max_(max_in_flight) {}
++    InflightLimiter(const InflightLimiter&) = delete;
++    InflightLimiter& operator=(const InflightLimiter&) = delete;
++
++    bool try_acquire();
++    void release();
++    int in_flight() const { return count_.load(std::memory_order_acquire); }
++
++private:
++    const int max_;
++    std::atomic<int> count_{0};
++};
+ 
+ }  // namespace image_classify
+ }  // namespace lemon
+diff --git a/src/cpp/include/lemon/router.h b/src/cpp/include/lemon/router.h
+index 1473a7e00..4f45f5a5e 100644
+--- a/src/cpp/include/lemon/router.h
++++ b/src/cpp/include/lemon/router.h
+@@ -16,6 +16,7 @@
+ #include <optional>
+ #include <nlohmann/json.hpp>
+ #include <httplib.h>
++#include "crash_breaker.h"
+ #include "wrapped_server.h"
+ #include "lemon/live_throughput.h"
+ #include "model_residency.h"
+@@ -191,7 +192,9 @@ public:
+     // The single live model of this type, or "" when none or more than one is
+     // loaded. Endpoints that let the caller omit "model" use this so an
+     // ambiguous choice is refused rather than silently resolved.
+-    std::string get_sole_loaded_model_of_type(ModelType type) const;
++    // include_dead_backends also counts a model whose backend has exited; the
++    // request that uses it then reloads it.
++    std::string get_sole_loaded_model_of_type(ModelType type, bool include_dead_backends = false) const;
+ 
+     json get_all_loaded_models() const;
+ 
+@@ -308,6 +311,7 @@ private:
+ 
+     // Concurrency control for load operations
+     mutable std::mutex load_mutex_;              // Protects loading state and loaded_servers_
++    CrashBreaker image_crash_breaker_{3, std::chrono::seconds(60), std::chrono::seconds(60)};
+     bool is_loading_ = false;                    // True when a load operation is in progress
+     std::condition_variable load_cv_;            // Signals when load completes
+ 
+@@ -411,7 +415,8 @@ private:
+                                             const StreamingProxy::TelemetryData& telemetry);
+ 
+     // retry_after_watchdog_reset=false is for requests whose input may itself be
+-    // what crashed the backend: replaying it would crash the fresh one too.
++    // what crashed the backend: replaying it would crash the fresh one too, so
++    // the reload is also left to the next request.
+     template<typename Func>
+     auto execute_inference(const json& request, Func&& inference_func,
+                            bool retry_after_watchdog_reset = true) -> decltype(inference_func(nullptr));
+diff --git a/src/cpp/include/lemon/server/request_middleware.h b/src/cpp/include/lemon/server/request_middleware.h
+index 59b07feda..91a5c494c 100644
+--- a/src/cpp/include/lemon/server/request_middleware.h
++++ b/src/cpp/include/lemon/server/request_middleware.h
+@@ -5,6 +5,8 @@
+ 
+ #include <httplib.h>
+ 
++#include "lemon/image_classify_request.h"
++
+ namespace lemon {
+ 
+ class RouteRegistry;
+@@ -28,12 +30,17 @@ private:
+     httplib::Server::HandlerResponse authenticate(const httplib::Request& req,
+                                                   httplib::Response& res);
+     void log_response(const httplib::Request& req, const httplib::Response& res);
++    httplib::Server::HandlerResponse precheck_image_classify(const httplib::Request& req,
++                                                             httplib::Response& res);
++    void release_image_classify_slot();
+ 
+     RuntimeConfig* config_;
+     const RouteRegistry* registry_;
+     std::string api_key_;
+     std::string admin_api_key_;
+     std::atomic<bool> metrics_access_logged_{false};
++    image_classify::InflightLimiter image_classify_inflight_{
++        image_classify::kMaxConcurrentImageClassify};
+ };
+ 
+ } // namespace lemon
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index 015ee2728..f7f16d9ef 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -6,7 +6,7 @@
+ #include "lemon/backends/backend_utils.h"
+ #include "lemon/backends/hf_cache_util.h"
+ #include "lemon/backend_manager.h"
+-#include "lemon/error_types.h"
++#include "lemon/image_classify_request.h"
+ #include "lemon/utils/path_utils.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
+@@ -86,16 +86,6 @@ const char* task_for_type(ModelType type) {
+                                                    : "text-classification";
+ }
+ 
+-// JPEG and PNG are the only formats the route accepts; the handler has already
+-// sniffed the magic, so this just names it for the multipart part.
+-std::string image_mime(const std::string& bytes) {
+-    if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xFF &&
+-        static_cast<unsigned char>(bytes[1]) == 0xD8) {
+-        return "image/jpeg";
+-    }
+-    return "image/png";
+-}
+-
+ // forward_multipart_request nests the backend's status and body under
+ // error.details. Lift the backend's own message, code and status to the top so
+ // the client sees "image too large" with its 4xx, not a generic 500.
+@@ -342,7 +332,8 @@ json TfliteServer::classify_image(const json& params, std::string image_bytes) {
+         top_k = params["top_k"].get<int>();
+     }
+     std::vector<utils::MultipartField> fields;
+-    std::string mime = image_mime(image_bytes);
++    std::string mime = image_classify::sniff_image_mime(image_bytes);
++    if (mime.empty()) mime = "application/octet-stream";
+     fields.push_back({"image", std::move(image_bytes), "image", std::move(mime)});
+     fields.push_back({"top_k", std::to_string(top_k), "", ""});
+     return normalize_backend_error(forward_multipart_request("/classify/image", fields, 60));
+diff --git a/src/cpp/server/core/request_middleware.cpp b/src/cpp/server/core/request_middleware.cpp
+index fe849983c..297fe895a 100644
+--- a/src/cpp/server/core/request_middleware.cpp
++++ b/src/cpp/server/core/request_middleware.cpp
+@@ -10,7 +10,6 @@
+ #include <nlohmann/json.hpp>
+ 
+ #include "../telemetry.h"
+-#include "lemon/image_classify_request.h"
+ #include "lemon/runtime_config.h"
+ #include "lemon/server/route_registry.h"
+ #include "lemon/utils/origin_utils.h"
+@@ -20,6 +19,12 @@ namespace lemon {
+ 
+ namespace {
+ 
++// httplib runs pre-routing, the handler and post-routing for one request on
++// one worker thread, and post-routing runs on every path that answers the
++// request, including body-read failures. So a slot taken in pre-routing is
++// released in post-routing even when the handler never runs.
++thread_local bool t_holds_image_classify_slot = false;
++
+ // Parse a W3C Trace Context "traceparent" header per the spec grammar
+ // (https://www.w3.org/TR/trace-context/): version "-" trace-id "-" parent-id
+ // "-" trace-flags, where version is 2 lowercase hex chars, trace-id is 32,
+@@ -90,8 +95,12 @@ RequestMiddleware::RequestMiddleware(RuntimeConfig* config, const RouteRegistry*
+ 
+ void RequestMiddleware::install(httplib::Server& server) {
+     server.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
++        release_image_classify_slot();
+         return pre_route(req, res);
+     });
++    server.set_post_routing_handler([this](const httplib::Request&, httplib::Response&) {
++        release_image_classify_slot();
++    });
+ 
+     server.set_default_headers({
+         {"Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"},
+@@ -182,31 +191,64 @@ httplib::Server::HandlerResponse RequestMiddleware::pre_route(const httplib::Req
+     if (auth == httplib::Server::HandlerResponse::Handled) {
+         return auth;
+     }
+-
+-    // Runs before httplib reads the body, so an oversized upload is refused
+-    // without lemond ever buffering it (httplib's own cap is 100 MB).
+     if (req.method == "POST" && image_classify::is_image_classify_path(req.path)) {
+-        const bool has_length = req.has_header("Content-Length");
+-        const int status = image_classify::precheck_content_length(
+-            has_length, has_length ? req.get_header_value_u64("Content-Length") : 0);
+-        if (status != 0) {
+-            res.status = status;
+-            const bool too_large = status == 413;
+-            nlohmann::json error = {{"error", {
+-                {"message", too_large
+-                    ? "Request body exceeds " +
+-                          std::to_string(image_classify::kMaxImageClassifyRequestBytes /
+-                                         (1024 * 1024)) + " MiB"
+-                    : std::string("Content-Length required")},
+-                {"type", "invalid_request_error"},
+-                {"code", too_large ? "payload_too_large" : "length_required"}}}};
+-            res.set_content(error.dump(), "application/json");
+-            return httplib::Server::HandlerResponse::Handled;
+-        }
++        return precheck_image_classify(req, res);
+     }
+     return auth;
+ }
+ 
++void RequestMiddleware::release_image_classify_slot() {
++    if (t_holds_image_classify_slot) {
++        t_holds_image_classify_slot = false;
++        image_classify_inflight_.release();
++    }
++}
++
++// Runs before httplib reads the body, so an oversized upload is refused without
++// lemond ever buffering it (httplib's own cap is 100 MB).
++httplib::Server::HandlerResponse RequestMiddleware::precheck_image_classify(
++    const httplib::Request& req, httplib::Response& res) {
++    const bool has_length = req.has_header("Content-Length");
++    const int status = image_classify::precheck_request_headers(
++        has_length, has_length ? req.get_header_value_u64("Content-Length") : 0,
++        req.has_header("Transfer-Encoding"), req.has_header("Content-Encoding"));
++    if (status != 0) {
++        std::string message;
++        std::string code;
++        if (status == 413) {
++            message = "Request body exceeds " +
++                      std::to_string(image_classify::kMaxImageClassifyRequestBytes /
++                                     (1024 * 1024)) + " MiB";
++            code = "payload_too_large";
++        } else if (status == 415) {
++            message = "Content-Encoding is not supported on this route";
++            code = "unsupported_content_encoding";
++        } else {
++            message = "Content-Length required (Transfer-Encoding is not supported on this route)";
++            code = "length_required";
++        }
++        res.status = status;
++        nlohmann::json error = {{"error", {
++            {"message", message},
++            {"type", "invalid_request_error"},
++            {"code", code}}}};
++        res.set_content(error.dump(), "application/json");
++        return httplib::Server::HandlerResponse::Handled;
++    }
++    if (!image_classify_inflight_.try_acquire()) {
++        res.status = 503;
++        res.set_header("Retry-After", "1");
++        nlohmann::json error = {{"error", {
++            {"message", "Too many image classification requests in flight; retry shortly"},
++            {"type", "server_busy"},
++            {"code", "server_busy"}}}};
++        res.set_content(error.dump(), "application/json");
++        return httplib::Server::HandlerResponse::Handled;
++    }
++    t_holds_image_classify_slot = true;
++    return httplib::Server::HandlerResponse::Unhandled;
++}
++
+ httplib::Server::HandlerResponse RequestMiddleware::authenticate(const httplib::Request& req,
+                                                                  httplib::Response& res) {
+     telemetry::g_request_start_time = std::chrono::steady_clock::now();
+diff --git a/src/cpp/server/image_classify_request.cpp b/src/cpp/server/image_classify_request.cpp
+index cc3425138..44fdc3e27 100644
+--- a/src/cpp/server/image_classify_request.cpp
++++ b/src/cpp/server/image_classify_request.cpp
+@@ -71,36 +71,37 @@ bool strict_base64_decode(std::string_view in, std::string& out) {
+         return t;
+     }();
+ 
+-    std::string compact;
+-    compact.reserve(in.size());
+-    for (char c : in) {
+-        if (!is_ascii_space(c)) compact.push_back(c);
+-    }
+-    if (compact.empty() || compact.size() % 4 != 0) return false;
+-
++    // Two passes over the input instead of a whitespace-free copy, which would
++    // double the peak for a maximum-size image.
++    std::size_t symbols = 0;
+     std::size_t padding = 0;
+-    if (compact.back() == '=') {
+-        ++padding;
+-        if (compact[compact.size() - 2] == '=') ++padding;
+-    }
+-    const std::size_t data_len = compact.size() - padding;
+-    for (std::size_t i = 0; i < data_len; ++i) {
+-        if (kTable[static_cast<unsigned char>(compact[i])] < 0) return false;
++    for (char c : in) {
++        if (is_ascii_space(c)) continue;
++        ++symbols;
++        if (c == '=') {
++            ++padding;
++        } else if (padding > 0 || kTable[static_cast<unsigned char>(c)] < 0) {
++            return false;
++        }
+     }
++    if (symbols == 0 || symbols % 4 != 0 || padding > 2) return false;
+ 
+     out.clear();
+-    out.reserve(compact.size() / 4 * 3);
+-    for (std::size_t i = 0; i < compact.size(); i += 4) {
+-        const bool last = i + 4 == compact.size();
+-        const int a = kTable[static_cast<unsigned char>(compact[i])];
+-        const int b = kTable[static_cast<unsigned char>(compact[i + 1])];
+-        const int c = (last && padding == 2) ? 0 : kTable[static_cast<unsigned char>(compact[i + 2])];
+-        const int d = (last && padding >= 1) ? 0 : kTable[static_cast<unsigned char>(compact[i + 3])];
+-        const unsigned triple = (static_cast<unsigned>(a) << 18) | (static_cast<unsigned>(b) << 12) |
+-                                (static_cast<unsigned>(c) << 6) | static_cast<unsigned>(d);
++    out.reserve(symbols / 4 * 3);
++    unsigned quad[4];
++    std::size_t filled = 0;
++    std::size_t seen = 0;
++    for (char c : in) {
++        if (is_ascii_space(c)) continue;
++        ++seen;
++        quad[filled++] = c == '=' ? 0u : static_cast<unsigned>(kTable[static_cast<unsigned char>(c)]);
++        if (filled < 4) continue;
++        filled = 0;
++        const unsigned triple = (quad[0] << 18) | (quad[1] << 12) | (quad[2] << 6) | quad[3];
++        const std::size_t keep = seen == symbols ? 3 - padding : 3;
+         out.push_back(static_cast<char>((triple >> 16) & 0xFF));
+-        if (!(last && padding == 2)) out.push_back(static_cast<char>((triple >> 8) & 0xFF));
+-        if (!(last && padding >= 1)) out.push_back(static_cast<char>(triple & 0xFF));
++        if (keep > 1) out.push_back(static_cast<char>((triple >> 8) & 0xFF));
++        if (keep > 2) out.push_back(static_cast<char>(triple & 0xFF));
+     }
+     return true;
+ }
+@@ -124,12 +125,28 @@ bool is_image_classify_path(const std::string& path) {
+            path == "/v0/images/classify" || path == "/v1/images/classify";
+ }
+ 
+-int precheck_content_length(bool has_length, std::uint64_t length) {
+-    if (!has_length) return 411;
++int precheck_request_headers(bool has_length, std::uint64_t length,
++                             bool has_transfer_encoding, bool has_content_encoding) {
++    if (has_content_encoding) return 415;
++    if (has_transfer_encoding || !has_length) return 411;
+     if (length > kMaxImageClassifyRequestBytes) return 413;
+     return 0;
+ }
+ 
++bool InflightLimiter::try_acquire() {
++    int current = count_.load(std::memory_order_acquire);
++    while (current < max_) {
++        if (count_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void InflightLimiter::release() {
++    count_.fetch_sub(1, std::memory_order_acq_rel);
++}
++
+ ParsedRequest parse_json(const std::string& body) {
+     json doc = json::parse(body, nullptr, false);
+     if (doc.is_discarded()) return fail(400, "Invalid JSON in request body");
+@@ -148,11 +165,17 @@ ParsedRequest parse_json(const std::string& body) {
+         return fail(400, "Missing 'image' (base64 or data: URL string)");
+     }
+ 
++    std::string image = std::move(doc["image"].get_ref<std::string&>());
++    doc.erase("image");
++
+     ParsedRequest r;
+     {
+-        const std::string& image = doc["image"].get_ref<const std::string&>();
+         std::string_view view(image);
+         while (!view.empty() && is_ascii_space(view.front())) view.remove_prefix(1);
++        if (view.size() > kMaxImageBase64Chars) {
++            return fail(413, "image exceeds the " + std::to_string(kMaxImageBytes / (1024 * 1024)) +
++                                 " MiB limit");
++        }
+ 
+         if (starts_with_ci(view, "http://") || starts_with_ci(view, "https://")) {
+             return fail(400, "remote image URLs are not supported; send base64 or a data: URL");
+@@ -173,8 +196,8 @@ ParsedRequest parse_json(const std::string& body) {
+             return fail(400, "'image' is not valid base64");
+         }
+     }
++    std::string().swap(image);
+ 
+-    doc.erase("image");
+     r.params = std::move(doc);
+     return finish(std::move(r));
+ }
+diff --git a/src/cpp/server/router.cpp b/src/cpp/server/router.cpp
+index 51a76b987..426a31171 100644
+--- a/src/cpp/server/router.cpp
++++ b/src/cpp/server/router.cpp
+@@ -1339,14 +1339,15 @@ std::string Router::get_loaded_recipe() const {
+     return server->get_recipe_options().get_recipe();
+ }
+ 
+-std::string Router::get_sole_loaded_model_of_type(ModelType type) const {
++std::string Router::get_sole_loaded_model_of_type(ModelType type, bool include_dead_backends) const {
+     std::lock_guard<std::mutex> lock(load_mutex_);
+ 
+     WrappedServer* standard_match = nullptr;
+     WrappedServer* helper_match = nullptr;
+     bool helper_ambiguous = false;
+     for (const auto& server : loaded_servers_) {
+-        if (!server->is_backend_alive() || server->get_model_type() != type) {
++        if ((!include_dead_backends && !server->is_backend_alive()) ||
++            server->get_model_type() != type) {
+             continue;
+         }
+         if (server->get_residency_class() == ResidencyClass::Standard) {
+@@ -1656,17 +1657,6 @@ auto Router::execute_inference(const json& request, Func&& inference_func,
+ 
+             server->release_inference();
+ 
+-            if (attempt == 0 && watchdog_reset) {
+-                if (restart_model_name.empty()) {
+-                    restart_model_name = requested_model;
+-                }
+-                const bool reloaded = reload_model_after_watchdog_reset(
+-                    restart_model_name, restart_options, failed_instance_id);
+-                if (reloaded && retry_after_watchdog_reset) {
+-                    continue;
+-                }
+-            }
+-
+             if (watchdog_reset && !retry_after_watchdog_reset) {
+                 return json{{"error", {
+                     {"message", "The backend for model '" + requested_model +
+@@ -1677,6 +1667,15 @@ auto Router::execute_inference(const json& request, Func&& inference_func,
+                     {"retryable", false}}}};
+             }
+ 
++            if (attempt == 0 && watchdog_reset) {
++                if (restart_model_name.empty()) {
++                    restart_model_name = requested_model;
++                }
++                if (reload_model_after_watchdog_reset(restart_model_name, restart_options, failed_instance_id)) {
++                    continue;
++                }
++            }
++
+             return response;
+         } catch (...) {
+             server->release_inference();
+@@ -2219,6 +2218,17 @@ nlohmann::ordered_json Router::systemone(const nlohmann::ordered_json& request)
+ 
+ json Router::classify_image(const json& params, std::string image_bytes) {
+     std::string requested_model = params.value("model", "");
++    if (const long long wait = image_crash_breaker_.blocked_seconds(
++            requested_model, CrashBreaker::Clock::now())) {
++        return json{{"error", {
++            {"message", "The backend for model '" + requested_model +
++                            "' crashed repeatedly on recent inputs; image classification is paused"},
++            {"type", ErrorType::BACKEND_ERROR},
++            {"code", "backend_crash_cooldown"},
++            {"status_code", 503},
++            {"retry_after", wait},
++            {"retryable", true}}}};
++    }
+     std::shared_ptr<telemetry::InferenceSpan> span = telemetry::TelemetryTracker::start_span(
+         "CLASSIFIER", "image_classify", requested_model, params);
+ 
+@@ -2240,6 +2250,13 @@ json Router::classify_image(const json& params, std::string image_bytes) {
+             return image_server->classify_image(params, std::move(image_bytes));
+         }, /*retry_after_watchdog_reset=*/false);
+ 
++        if (response.contains("error") && response["error"].is_object() &&
++            response["error"].value("code", "") == "backend_crashed_on_input" &&
++            image_crash_breaker_.record_crash(requested_model, CrashBreaker::Clock::now())) {
++            LOG(WARNING, "Router") << "Image classification for '" << requested_model
++                                   << "' paused after repeated backend crashes" << std::endl;
++        }
++
+         if (span) {
+             if (response.contains("error")) {
+                 std::string error_msg = "Request failed";
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index 328b46e08..a458a7ff7 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -1,3 +1,4 @@
++#include <cstdint>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -24,13 +25,26 @@ const RouteError kBadImageRequest{
+     "Malformed request: zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG "
+     "image, a bad `top_k`, or an image the backend cannot decode"};
+ const RouteError kImageTooLarge{413, "payload_too_large", "The decoded image exceeds 16 MiB, or the body exceeds 23 MiB"};
+-const RouteError kLengthRequired{411, "length_required", "The request carries no `Content-Length` (a chunked upload)"};
++const RouteError kLengthRequired{
++    411, "length_required",
++    "No `Content-Length`, or any `Transfer-Encoding` header, even alongside a `Content-Length`; "
++    "refused before the body is read"};
++const RouteError kContentEncoding{
++    415, "unsupported_content_encoding",
++    "Any `Content-Encoding` header, such as a gzip-compressed body; refused before the body is read"};
++const RouteError kServerBusy{
++    503, "server_busy",
++    "Two image-classification requests are already in progress (`Retry-After: 1`)"};
++const RouteError kCrashCooldown{
++    503, "backend_crash_cooldown",
++    "The model's backend crashed on 3 inputs within 60 seconds, which pauses image classification "
++    "for that model for 60 seconds (with `Retry-After`)"};
+ const RouteError kNotImageClassifier{400, "model_not_applicable", "`model` is not an image-classification model"};
+ const RouteError kNoSoleImageClassifier{
+     400, "", "`model` is omitted and not exactly one image-classification model is loaded"};
+ const RouteError kCrashedOnInput{
+     502, "backend_crashed_on_input",
+-    "The backend crashed on this input; it is reloaded and the request is not retried"};
++    "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
+ 
+ const RouteArg kModel{"model", ArgIn::Form, {{"type", "string"}}, false, Support::Available,
+                       "The image-classification model to use. Optional when exactly one is loaded."};
+@@ -89,11 +103,12 @@ public:
+             "as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` "
+             "classes), so a repeated name keeps only its highest score there; use `data[].index` "
+             "to tell classes apart.",
+-            "The body is capped before it is read: a request without `Content-Length` (a chunked "
+-            "upload) gets `411`, and one whose `Content-Length` is over 23 MiB gets `413`.",
++            "The body is capped before it is read: a request without `Content-Length`, or with any "
++            "`Transfer-Encoding`, gets `411`; any `Content-Encoding` gets `415`; and a "
++            "`Content-Length` over 23 MiB gets `413`. At most two requests run at once.",
+             "An image that crashes the backend is never replayed, because replaying it would crash "
+-            "the restarted backend too: the backend is restarted for the next request and this one "
+-            "fails with `502` `backend_crashed_on_input`.",
++            "the restarted backend too: this request fails with `502` `backend_crashed_on_input` "
++            "and the next request restarts the backend.",
+             "### Model Directory\n\n"
+             "An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 "
+             "output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the "
+@@ -151,7 +166,8 @@ public:
+             }
+         })");
+         s.responses = {response};
+-        s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired,
++        s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired, kContentEncoding,
++                                 kServerBusy, kCrashCooldown,
+                                  kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput,
+                                  kModelUnloaded, kBackendError, kMalformedBackendResponse,
+                                  kUnexpectedException},
+@@ -164,6 +180,17 @@ public:
+     void handle(RouteRequest& req, httplib::Response& res) override {
+         const httplib::Request& http = req.http;
+         try {
++            std::uint64_t received = http.body.size();
++            for (const auto& [name, field] : http.form.fields) received += name.size() + field.content.size();
++            for (const auto& [name, file] : http.form.files) received += name.size() + file.content.size();
++            if (received > image_classify::kMaxImageClassifyRequestBytes) {
++                write_openai_error(res, kImageTooLarge,
++                                   "Request body exceeds " +
++                                       std::to_string(image_classify::kMaxImageClassifyRequestBytes /
++                                                      (1024 * 1024)) + " MiB");
++                return;
++            }
++
+             image_classify::ParsedRequest parsed;
+             if (http.is_multipart_form_data()) {
+                 std::optional<std::string> model;
+@@ -216,7 +243,8 @@ public:
+                     return;
+                 }
+             } else {
+-                model = ctx_.router->get_sole_loaded_model_of_type(ModelType::IMAGE_CLASSIFICATION);
++                model = ctx_.router->get_sole_loaded_model_of_type(
++                    ModelType::IMAGE_CLASSIFICATION, /*include_dead_backends=*/true);
+                 if (model.empty()) {
+                     write_openai_error(res, kNoSoleImageClassifier,
+                         "No 'model' specified and no single image-classification model "
+@@ -229,6 +257,11 @@ public:
+             auto response = ctx_.router->classify_image(params, std::move(parsed.bytes));
+             if (response.contains("error") && response["error"].is_object()) {
+                 res.status = status_for_backend_error(response["error"]);
++                if (response["error"].contains("retry_after") &&
++                    response["error"]["retry_after"].is_number_integer()) {
++                    res.set_header("Retry-After",
++                                   std::to_string(response["error"]["retry_after"].get<long long>()));
++                }
+                 res.set_content(response.dump(), "application/json");
+                 return;
+             }
+diff --git a/test/cpp/test_image_classify_request.cpp b/test/cpp/test_image_classify_request.cpp
+index db9270eba..f4162ca77 100644
+--- a/test/cpp/test_image_classify_request.cpp
++++ b/test/cpp/test_image_classify_request.cpp
+@@ -1,8 +1,10 @@
+ // Request parsing and limits for POST /v1/images/classify
+ // (lemon::image_classify). Pure functions, no server.
+ 
++#include "lemon/crash_breaker.h"
+ #include "lemon/image_classify_request.h"
+ 
++#include <chrono>
+ #include <cstdio>
+ #include <optional>
+ #include <string>
+@@ -94,6 +96,8 @@ void test_json() {
+     check("json: PNG data URL accepted", data_url.ok() && data_url.mime == "image/png");
+     auto data_upper = parse_json(json_body("DATA:IMAGE/JPEG;BASE64," + b64(kJpeg)));
+     check("json: data URL scheme is case-insensitive", data_upper.ok());
++    check("json: image/jpg data URL accepted as an alias",
++          parse_json(json_body("data:image/jpg;base64," + b64(kJpeg))).ok());
+     check("json: non-image data URL rejected",
+           parse_json(json_body("data:text/plain;base64," + b64("hello"))).status == 400);
+     check("json: non-base64 data URL rejected",
+@@ -131,6 +135,11 @@ void test_json() {
+     auto big = parse_json(json_body(b64(over)));
+     check("size: 16 MiB + 1 is 413", big.status == 413);
+     check("size: empty image is 400", parse_json(json_body("")).status == 400);
++    std::string oversized_text(kMaxImageBase64Chars + 4, '@');
++    check("size: over-long image string is 413 before any decoding",
++          parse_json(json_body(oversized_text)).status == 413);
++    check("base64: whitespace-heavy input decodes",
++          parse_json(json_body("  " + b64(kJpeg).insert(4, "\\n  \\r\\n"))).ok());
+ }
+ 
+ void test_form() {
+@@ -159,12 +168,23 @@ void test_form() {
+ }
+ 
+ void test_precheck_and_path() {
+-    check("precheck: no Content-Length is 411", precheck_content_length(false, 0) == 411);
+-    check("precheck: 1 KiB passes", precheck_content_length(true, 1024) == 0);
++    const auto kMax = kMaxImageClassifyRequestBytes;
++    check("precheck: no Content-Length is 411",
++          precheck_request_headers(false, 0, false, false) == 411);
++    check("precheck: 1 KiB passes", precheck_request_headers(true, 1024, false, false) == 0);
+     check("precheck: exactly the limit passes",
+-          precheck_content_length(true, kMaxImageClassifyRequestBytes) == 0);
+-    check("precheck: limit + 1 is 413",
+-          precheck_content_length(true, kMaxImageClassifyRequestBytes + 1) == 413);
++          precheck_request_headers(true, kMax, false, false) == 0);
++    check("precheck: limit + 1 is 413", precheck_request_headers(true, kMax + 1, false, false) == 413);
++    check("precheck: chunked without Content-Length is 411",
++          precheck_request_headers(false, 0, true, false) == 411);
++    check("precheck: Content-Length 0 plus Transfer-Encoding is 411",
++          precheck_request_headers(true, 0, true, false) == 411);
++    check("precheck: small Content-Length plus Transfer-Encoding is 411",
++          precheck_request_headers(true, 1024, true, false) == 411);
++    check("precheck: any Content-Encoding is 415",
++          precheck_request_headers(true, 1024, false, true) == 415);
++    check("precheck: Content-Encoding with chunked is 415",
++          precheck_request_headers(false, 0, true, true) == 415);
+ 
+     for (const char* p : {"/api/v0/images/classify", "/api/v1/images/classify",
+                           "/v0/images/classify", "/v1/images/classify"}) {
+@@ -176,6 +196,44 @@ void test_precheck_and_path() {
+     }
+ }
+ 
++void test_inflight_limiter() {
++    InflightLimiter limiter(2);
++    const bool first = limiter.try_acquire();
++    const bool second = limiter.try_acquire();
++    check("limiter: admits up to the cap", first && second && limiter.in_flight() == 2);
++    check("limiter: refuses past the cap", !limiter.try_acquire() && limiter.in_flight() == 2);
++    limiter.release();
++    check("limiter: a release frees a slot", limiter.try_acquire() && limiter.in_flight() == 2);
++    limiter.release();
++    limiter.release();
++    check("limiter: drains to zero", limiter.in_flight() == 0);
++}
++
++void test_crash_breaker() {
++    using namespace std::chrono;
++    lemon::CrashBreaker breaker(3, seconds(60), seconds(60));
++    const auto t0 = lemon::CrashBreaker::Clock::time_point{} + hours(1);
++    check("breaker: open by default", breaker.blocked_seconds("m", t0) == 0);
++    check("breaker: first crash does not trip", !breaker.record_crash("m", t0));
++    check("breaker: second crash does not trip", !breaker.record_crash("m", t0 + seconds(10)));
++    check("breaker: still open below the threshold", breaker.blocked_seconds("m", t0 + seconds(11)) == 0);
++    check("breaker: third crash in the window trips", breaker.record_crash("m", t0 + seconds(20)));
++    check("breaker: blocked for the cool-down",
++          breaker.blocked_seconds("m", t0 + seconds(20)) == 60 &&
++              breaker.blocked_seconds("m", t0 + seconds(79)) == 1);
++    check("breaker: partial second rounds up",
++          breaker.blocked_seconds("m", t0 + seconds(79) + milliseconds(500)) == 1);
++    check("breaker: other keys unaffected", breaker.blocked_seconds("other", t0 + seconds(30)) == 0);
++    check("breaker: reopens after the cool-down", breaker.blocked_seconds("m", t0 + seconds(80)) == 0);
++    check("breaker: count restarts after tripping", !breaker.record_crash("m", t0 + seconds(81)));
++
++    lemon::CrashBreaker spaced(3, seconds(60), seconds(60));
++    spaced.record_crash("m", t0);
++    spaced.record_crash("m", t0 + seconds(30));
++    check("breaker: crashes outside the window expire",
++          !spaced.record_crash("m", t0 + seconds(61)) && spaced.blocked_seconds("m", t0 + seconds(61)) == 0);
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -184,6 +242,8 @@ int main() {
+     test_json();
+     test_form();
+     test_precheck_and_path();
++    test_inflight_limiter();
++    test_crash_breaker();
+     if (failures == 0) {
+         std::printf("\nAll image classify request checks passed.\n");
+         return 0;
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index c5e3d58db..75a05a930 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -35,8 +35,11 @@ import base64
+ import json
+ import os
+ import shutil
++import gzip
+ import socket
+ import struct
++import threading
++import time
+ import zlib
+ 
+ import requests
+@@ -59,6 +62,7 @@ REFERENCE_INDEX = 653
+ REFERENCE_SCORE = 0.803491
+ REFERENCE_TOL = 0.02
+ POISON = b"B169-POISON-IMAGE"
++SLOW = b"B169-SLOW-IMAGE"
+ 
+ _opts = argparse.Namespace(
+     image_model_dir=None,
+@@ -107,7 +111,11 @@ def _raw_request(headers, body=b""):
+     """Sends a request without a client library, so headers such as a
+     Content-Length far larger than the body reach the server unaltered."""
+     with socket.create_connection(("localhost", PORT), timeout=30) as sock:
+-        sock.sendall(headers.encode() + body)
++        try:
++            sock.sendall(headers.encode() + body)
++        except (BrokenPipeError, ConnectionResetError):
++            # The server may answer and close before a large body is sent.
++            pass
+         data = b""
+         while b"\r\n\r\n" not in data:
+             chunk = sock.recv(65536)
+@@ -236,6 +244,72 @@ class ImageClassifyTests(ServerTestBase):
+         self.assertEqual(status, 411, body[:300])
+         self.assertEqual(json.loads(body)["error"]["code"], "length_required")
+ 
++    def _assert_refused_unread(self, headers, body, expected_status, expected_code):
++        rss_before = _vm_rss_kb(_opts.lemond_pid) if _opts.lemond_pid else None
++        status, reply = _raw_request(headers, body)
++        self.assertEqual(status, expected_status, reply[:300])
++        self.assertEqual(json.loads(reply)["error"]["code"], expected_code)
++        if rss_before is not None:
++            growth_kb = _vm_rss_kb(_opts.lemond_pid) - rss_before
++            self.assertLess(growth_kb, 10 * 1024, f"lemond RSS grew {growth_kb} KiB")
++            print(f"[OK] lemond RSS growth {growth_kb} KiB")
++
++    def test_006b_gzip_body_is_415(self):
++        # 60 MiB of JSON that gzips to about 60 KB: httplib would inflate it
++        # past the 61 KB Content-Length the guard saw.
++        payload = gzip.compress(
++            b'{"image":"' + b"A" * (60 * 1024 * 1024) + b'"}', compresslevel=9
++        )
++        self._assert_refused_unread(
++            f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
++            "Content-Type: application/json\r\nContent-Encoding: gzip\r\n"
++            f"Content-Length: {len(payload)}\r\n\r\n",
++            payload,
++            415,
++            "unsupported_content_encoding",
++        )
++
++    def test_006c_chunked_with_zero_content_length_is_411(self):
++        # A small first slice of a chunked body; httplib would read chunks
++        # until the terminator, however many the client sends.
++        chunk = b"A" * (32 * 1024)
++        body = b"".join(b"%x\r\n" % len(chunk) + chunk + b"\r\n" for _ in range(2))
++        self._assert_refused_unread(
++            f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
++            "Content-Type: application/json\r\nContent-Length: 0\r\n"
++            "Transfer-Encoding: chunked\r\n\r\n",
++            body,
++            411,
++            "length_required",
++        )
++
++    def test_006d_chunked_with_small_content_length_is_411(self):
++        self._assert_refused_unread(
++            f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
++            "Content-Type: application/json\r\nContent-Length: 1024\r\n"
++            "Transfer-Encoding: chunked\r\n\r\n",
++            b"5\r\nhello\r\n0\r\n\r\n",
++            411,
++            "length_required",
++        )
++
++    def test_006e_aborted_uploads_release_their_slot(self):
++        # Each upload is admitted, then the client disappears mid-body. If the
++        # in-flight slot leaked, a few of these would leave the route at 503.
++        for _ in range(4):
++            with socket.create_connection(("localhost", PORT), timeout=30) as sock:
++                sock.sendall(
++                    (
++                        f"POST /api/v1/images/classify HTTP/1.1\r\nHost: localhost:{PORT}\r\n"
++                        "Content-Type: application/json\r\nContent-Length: 100000\r\n\r\n"
++                    ).encode()
++                    + b'{"image":"'
++                )
++        time.sleep(1)
++        self._assert_status(
++            self._post_json({"image": "@@@@"}), 400, "request after aborted uploads"
++        )
++
+     def test_007_two_image_parts_rejected(self):
+         files = [
+             ("image", ("a.jpg", _jpeg_like(), "image/jpeg")),
+@@ -434,15 +508,103 @@ class ImageClassifyTests(ServerTestBase):
+             lines(crashes) - crashes_before, 1, "the poison image was replayed"
+         )
+ 
++        # No model named: the sole image model is chosen even though its
++        # backend is down, and this request reloads it.
+         response = self._post_form(
+             {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+-            data={"model": MODEL, "top_k": "1"},
++            data={"top_k": "1"},
+         )
+         self._assert_reference(response, 1)
+         self.assertEqual(
+             lines(starts) - starts_before, 1, "expected exactly one reload"
+         )
+ 
++    def test_509_inflight_cap(self):
++        if not _opts.fake_backend:
++            self.skipTest("needs --fake-backend")
++        self._require_model()
++        results = []
++
++        def slow_request():
++            results.append(
++                self._post_form(
++                    {"image": ("slow.jpg", _jpeg_like(SLOW), "image/jpeg")},
++                    data={"model": MODEL, "top_k": "1"},
++                )
++            )
++
++        threads = [threading.Thread(target=slow_request) for _ in range(2)]
++        for t in threads:
++            t.start()
++        time.sleep(1.5)
++        response = self._post_form(
++            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
++            data={"model": MODEL, "top_k": "1"},
++        )
++        for t in threads:
++            t.join()
++        self._assert_status(response, 503, "third concurrent request")
++        self.assertEqual(response.json()["error"]["code"], "server_busy")
++        self.assertEqual(response.headers.get("Retry-After"), "1")
++        for r in results:
++            self._assert_reference(r, 1)
++        self._assert_reference(
++            self._post_form(
++                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
++                data={"model": MODEL, "top_k": "1"},
++            ),
++            1,
++        )
++
++    def test_510_repeated_crashes_pause_the_model(self):
++        # Runs last: it leaves the model paused for up to a minute.
++        if not _opts.fake_backend or not _opts.fake_state_dir:
++            self.skipTest("needs --fake-backend and --fake-state-dir")
++        self._require_model()
++        crashes = os.path.join(_opts.fake_state_dir, "crashes.log")
++        starts = os.path.join(_opts.fake_state_dir, "starts.log")
++
++        def lines(path):
++            if not os.path.exists(path):
++                return 0
++            with open(path, encoding="utf-8") as f:
++                return len(f.read().splitlines())
++
++        def poison():
++            return self._post_form(
++                {"image": ("poison.jpg", _jpeg_like(POISON), "image/jpeg")},
++                data={"model": MODEL},
++            )
++
++        response = None
++        for _ in range(4):
++            response = poison()
++            if response.status_code != 502:
++                break
++        self._assert_status(response, 503, "poison after repeated crashes")
++        self.assertEqual(response.json()["error"]["code"], "backend_crash_cooldown")
++        retry_after = int(response.headers["Retry-After"])
++        self.assertTrue(1 <= retry_after <= 60, retry_after)
++
++        crashes_before, starts_before = lines(crashes), lines(starts)
++        response = self._post_form(
++            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
++            data={"model": MODEL, "top_k": "1"},
++        )
++        self._assert_status(response, 503, "good image while paused")
++        self.assertEqual(lines(crashes), crashes_before, "paused model crashed again")
++        self.assertEqual(lines(starts), starts_before, "paused model was reloaded")
++
++        time.sleep(int(response.headers["Retry-After"]) + 1)
++        response = self._post_form(
++            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
++            data={"model": MODEL, "top_k": "1"},
++        )
++        self._assert_reference(response, 1)
++        self.assertEqual(
++            lines(starts) - starts_before, 1, "expected one reload after the pause"
++        )
++
+ 
+ if __name__ == "__main__":
+     _opts = _parse_own_args()
+diff --git a/test/utils/fake_tflite_server.py b/test/utils/fake_tflite_server.py
+index c9604b88d..5cb6abb38 100644
+--- a/test/utils/fake_tflite_server.py
++++ b/test/utils/fake_tflite_server.py
+@@ -9,6 +9,8 @@ task=image-classification, and serves POST /classify/image:
+ 
+ - a body containing POISON crashes the process with SIGSEGV, which is how the
+   non-replay test proves lemond does not resend a crashing input;
++- a body containing SLOW is answered after SLOW_SECONDS, which lets the
++  in-flight cap test hold requests open;
+ - a PNG whose IHDR claims more than --max-image-pixels pixels, or whose data
+   is truncated, gets 400 like the real decoder;
+ - anything else gets a fixed ranked prediction list.
+@@ -23,11 +25,14 @@ import os
+ import signal
+ import struct
+ import sys
++import time
+ from email.parser import BytesParser
+ from email.policy import HTTP
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ 
+ POISON = b"B169-POISON-IMAGE"
++SLOW = b"B169-SLOW-IMAGE"
++SLOW_SECONDS = 4
+ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+ 
+ 
+@@ -108,6 +113,8 @@ def make_handler(args):
+             if POISON in image:
+                 _log("crashes.log", str(os.getpid()))
+                 os.kill(os.getpid(), signal.SIGSEGV)
++            if SLOW in image:
++                time.sleep(SLOW_SECONDS)
+             if image.startswith(PNG_SIGNATURE):
+                 problem = _png_problem(image, args.max_image_pixels)
+                 if problem:
+-- 
+2.53.0
+

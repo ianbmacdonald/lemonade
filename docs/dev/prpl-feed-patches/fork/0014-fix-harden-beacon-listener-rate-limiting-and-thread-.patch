@@ -1,0 +1,585 @@
+From 517fa500241c2e55990c1469256d7f58ff9423ca Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Tue, 29 Sep 2026 15:46:28 -0400
+Subject: [PATCH 14/58] fix: harden beacon listener rate limiting and thread
+ start; tighten tests
+
+- Check the per-source bucket before spending a global token, so one noisy
+  unpinned host cannot empty the budget that admits new peers.
+- For pinned sources, spend the per-source token only on structurally valid
+  beacons; junk forged with a known peer's IP is charged to the global bucket
+  and can no longer expire that peer.
+- Create the worker thread before marking the listener running; a thread
+  creation failure is reported in /health instead of escaping Server::run().
+- server_endpoints: inject via the interface's directed broadcast, gate socket
+  assertions to Linux, assert the self filter on port+source and make the port
+  release check able to fail.
+- server_cli2: scan still receives the loopback beacon with beacon_listen on.
+- Document that the listener is not interface-scoped (WAN on double NAT).
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/server/http_listener.h  |   2 +-
+ src/cpp/include/lemon/utils/beacon_listener.h |   6 +-
+ .../server/routes/lemonade/system/health.cpp  |   4 +-
+ src/cpp/server/utils/beacon_listener.cpp      |  98 ++++++++---
+ test/cpp/test_beacon_listener_socket.cpp      |   2 +-
+ test/cpp/test_beacon_peer_table.cpp           |  36 +++-
+ test/server_cli2.py                           |  36 ++++
+ test/server_endpoints.py                      | 160 +++++++++++++-----
+ 8 files changed, 264 insertions(+), 80 deletions(-)
+
+diff --git a/src/cpp/include/lemon/server/http_listener.h b/src/cpp/include/lemon/server/http_listener.h
+index 09d5463a9..a05a8c332 100644
+--- a/src/cpp/include/lemon/server/http_listener.h
++++ b/src/cpp/include/lemon/server/http_listener.h
+@@ -46,7 +46,7 @@ public:
+     // the running listeners. Only what changed is restarted.
+     void rebind();
+ 
+-    // Starts or stops the LAN beacon listener to match config; safe to call repeatedly.
++    // Idempotent: start(), stop() and the config side-effect path all converge on config.
+     void sync_beacon_listener();
+     nlohmann::json beacon_listener_status() const { return beacon_listener_.status_json(); }
+ 
+diff --git a/src/cpp/include/lemon/utils/beacon_listener.h b/src/cpp/include/lemon/utils/beacon_listener.h
+index db748f7da..b4e938dd3 100644
+--- a/src/cpp/include/lemon/utils/beacon_listener.h
++++ b/src/cpp/include/lemon/utils/beacon_listener.h
+@@ -89,7 +89,10 @@ private:
+         std::chrono::steady_clock::time_point last_seen;
+     };
+ 
+-    bool admit_locked(uint32_t src_ip, std::chrono::steady_clock::time_point now);
++    IngestResult ingest_admitted_locked(const char* buf, std::size_t len, bool truncated, uint32_t src_ip,
++                                        std::chrono::steady_clock::time_point now);
++    SourceState& source_state_locked(uint32_t src_ip, std::chrono::steady_clock::time_point now);
++    bool take_global_token_locked(std::chrono::steady_clock::time_point now);
+     bool is_pinned_locked(uint32_t src_ip) const;
+     void expire_locked(std::chrono::steady_clock::time_point now);
+     IngestResult record_locked(IngestResult result);
+@@ -149,6 +152,7 @@ private:
+     mutable std::mutex status_mtx_;
+     bool supported_ = true;
+     std::string error_;
++    bool start_failed_ = false;
+     nlohmann::json sockets_status_ = nlohmann::json::array();
+ 
+     std::vector<SocketState> sockets_;
+diff --git a/src/cpp/server/routes/lemonade/system/health.cpp b/src/cpp/server/routes/lemonade/system/health.cpp
+index 8d32c283d..5d1e96fa8 100644
+--- a/src/cpp/server/routes/lemonade/system/health.cpp
++++ b/src/cpp/server/routes/lemonade/system/health.cpp
+@@ -117,8 +117,8 @@ ordered_json health_schema() {
+                     "enabled": {"type": "boolean", "description": "Whether the listener is running."},
+                     "supported": {"type": "boolean", "description": "`false` on Windows, where the listener is not available in this release."},
+                     "listening": {"type": "boolean", "description": "Whether at least one UDP socket is bound."},
+-                    "error": {"type": ["string", "null"], "description": "Platform-level error, or `null`."},
+-                    "sockets": {"type": "array", "items": {"type": "object"}, "description": "One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each local RFC1918 interface's directed-broadcast address plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on."},
++                    "error": {"type": ["string", "null"], "description": "Platform-level error, or `null`. If the listener thread could not be started, `listening` is `false`, `sockets` is empty and `error` says why; toggling `beacon_listen` retries."},
++                    "sockets": {"type": "array", "items": {"type": "object"}, "description": "One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each local RFC1918 interface's directed-broadcast address plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on. It is not scoped to an interface: on a gateway whose WAN side is also RFC1918, block inbound UDP 13305 on the WAN zone or WAN-side hosts are listed too."},
+                     "self_instance_id": {"type": "string", "description": "This server's beacon `instance_id`, used to drop its own beacons."},
+                     "self_port": {"type": "integer", "description": "This server's HTTP port, used to drop its own beacons."},
+                     "ttl_seconds": {"type": "integer", "description": "Seconds a host stays listed after its last beacon."},
+diff --git a/src/cpp/server/utils/beacon_listener.cpp b/src/cpp/server/utils/beacon_listener.cpp
+index 2f5c1277c..3648504a0 100644
+--- a/src/cpp/server/utils/beacon_listener.cpp
++++ b/src/cpp/server/utils/beacon_listener.cpp
+@@ -160,30 +160,9 @@ bool BeaconPeerTable::is_pinned_locked(uint32_t src_ip) const {
+     return false;
+ }
+ 
+-// Pinned sources (those owning a live row) skip the global bucket so a flood
+-// from other addresses cannot starve refreshes from already-known peers.
+-bool BeaconPeerTable::admit_locked(uint32_t src_ip, steady_clock::time_point now) {
++BeaconPeerTable::SourceState& BeaconPeerTable::source_state_locked(uint32_t src_ip,
++                                                                   steady_clock::time_point now) {
+     auto it = sources_.find(src_ip);
+-    if (is_pinned_locked(src_ip)) {
+-        if (it == sources_.end()) {
+-            it = sources_.emplace(src_ip, SourceState{{kPerSourceBurst, now}, now}).first;
+-        }
+-        auto& st = it->second;
+-        refill(st.bucket.tokens, st.bucket.last, now, kPerSourceRate, kPerSourceBurst);
+-        st.last_seen = now;
+-        if (st.bucket.tokens < 1.0) return false;
+-        st.bucket.tokens -= 1.0;
+-        return true;
+-    }
+-
+-    if (!global_bucket_primed_) {
+-        global_bucket_ = {kGlobalBurst, now};
+-        global_bucket_primed_ = true;
+-    }
+-    refill(global_bucket_.tokens, global_bucket_.last, now, kGlobalRate, kGlobalBurst);
+-    if (global_bucket_.tokens < 1.0) return false;
+-    global_bucket_.tokens -= 1.0;
+-
+     if (it == sources_.end()) {
+         size_t unpinned = 0;
+         auto oldest = sources_.end();
+@@ -202,8 +181,17 @@ bool BeaconPeerTable::admit_locked(uint32_t src_ip, steady_clock::time_point now
+     auto& st = it->second;
+     refill(st.bucket.tokens, st.bucket.last, now, kPerSourceRate, kPerSourceBurst);
+     st.last_seen = now;
+-    if (st.bucket.tokens < 1.0) return false;
+-    st.bucket.tokens -= 1.0;
++    return st;
++}
++
++bool BeaconPeerTable::take_global_token_locked(steady_clock::time_point now) {
++    if (!global_bucket_primed_) {
++        global_bucket_ = {kGlobalBurst, now};
++        global_bucket_primed_ = true;
++    }
++    refill(global_bucket_.tokens, global_bucket_.last, now, kGlobalRate, kGlobalBurst);
++    if (global_bucket_.tokens < 1.0) return false;
++    global_bucket_.tokens -= 1.0;
+     return true;
+ }
+ 
+@@ -218,7 +206,37 @@ IngestResult BeaconPeerTable::ingest(const char* buf, std::size_t len, bool trun
+ 
+     if (!utils::is_rfc1918_ipv4(src_ip)) return record_locked(IngestResult::BadSource);
+     expire_locked(now);
+-    if (!admit_locked(src_ip, now)) return record_locked(IngestResult::RateLimited);
++
++    // Pinned sources (those owning a live row) skip the global bucket so a
++    // flood from other addresses cannot starve refreshes from known peers.
++    // Their per-source token is only spent on a structurally valid beacon:
++    // junk forged with a known peer's source IP must not drain the budget of
++    // that peer's real refreshes, so it is charged to the global bucket.
++    if (is_pinned_locked(src_ip)) {
++        if (source_state_locked(src_ip, now).bucket.tokens < 1.0) {
++            return record_locked(IngestResult::RateLimited);
++        }
++        IngestResult result = ingest_admitted_locked(buf, len, truncated, src_ip, now);
++        if (result == IngestResult::BadPayload || result == IngestResult::UrlMismatch) {
++            take_global_token_locked(now);
++        } else {
++            auto it = sources_.find(src_ip);
++            if (it != sources_.end()) it->second.bucket.tokens -= 1.0;
++        }
++        return result;
++    }
++
++    // The per-source check comes first so one noisy host only ever spends its
++    // own small bucket, never the global budget that admits new peers.
++    SourceState& st = source_state_locked(src_ip, now);
++    if (st.bucket.tokens < 1.0) return record_locked(IngestResult::RateLimited);
++    if (!take_global_token_locked(now)) return record_locked(IngestResult::RateLimited);
++    st.bucket.tokens -= 1.0;
++    return ingest_admitted_locked(buf, len, truncated, src_ip, now);
++}
++
++IngestResult BeaconPeerTable::ingest_admitted_locked(const char* buf, std::size_t len, bool truncated,
++                                                     uint32_t src_ip, steady_clock::time_point now) {
+     if (buf == nullptr || len == 0 || len >= kMaxDatagram || truncated) {
+         return record_locked(IngestResult::BadPayload);
+     }
+@@ -441,20 +459,41 @@ void BeaconListener::start(const std::string& instance_id, int self_port) {
+         std::lock_guard<std::mutex> status_lock(status_mtx_);
+         supported_ = true;
+         error_.clear();
++        start_failed_ = false;
+         sockets_status_ = nlohmann::json::array();
+     }
+     {
+         std::lock_guard<std::mutex> cv_lock(cv_mtx_);
+         stop_ = false;
+     }
++    // running_ is only set once the worker exists: a std::system_error from
++    // thread creation (EAGAIN on a constrained gateway) must leave the
++    // listener cleanly stopped, and must not escape into Server::run().
++    try {
++        worker_ = std::thread(&BeaconListener::thread_loop, this);
++    } catch (const std::exception& e) {
++        {
++            std::lock_guard<std::mutex> status_lock(status_mtx_);
++            error_ = std::string("failed to start beacon listener thread: ") + e.what();
++            start_failed_ = true;
++        }
++        LOG(ERROR, "BeaconListener") << "Failed to start beacon listener thread: " << e.what() << std::endl;
++        return;
++    }
+     running_ = true;
+-    worker_ = std::thread(&BeaconListener::thread_loop, this);
+     LOG(INFO, "BeaconListener") << "Listening for LAN beacons on UDP " << kBeaconPort << std::endl;
+ #endif
+ }
+ 
+ void BeaconListener::stop() {
+     std::lock_guard<std::mutex> lock(lifecycle_mtx_);
++    {
++        std::lock_guard<std::mutex> status_lock(status_mtx_);
++        if (start_failed_) {
++            start_failed_ = false;
++            error_.clear();
++        }
++    }
+     if (!running_.load()) return;
+     {
+         std::lock_guard<std::mutex> cv_lock(cv_mtx_);
+@@ -475,6 +514,11 @@ void BeaconListener::stop() {
+ 
+ nlohmann::json BeaconListener::status_json() const {
+     if (!running_.load()) {
++        std::lock_guard<std::mutex> status_lock(status_mtx_);
++        if (start_failed_) {
++            return {{"enabled", true}, {"supported", supported_}, {"listening", false},
++                    {"error", error_}, {"sockets", nlohmann::json::array()}};
++        }
+         return {{"enabled", false}};
+     }
+     auto now = std::chrono::steady_clock::now();
+diff --git a/test/cpp/test_beacon_listener_socket.cpp b/test/cpp/test_beacon_listener_socket.cpp
+index 0a2d222d5..1e84094db 100644
+--- a/test/cpp/test_beacon_listener_socket.cpp
++++ b/test/cpp/test_beacon_listener_socket.cpp
+@@ -10,9 +10,9 @@
+ #include <string>
+ #include <thread>
+ 
+-#include <nlohmann/json.hpp>
+ #include <lemon/utils/beacon_listener.h>
+ #include <lemon/utils/network_beacon.h>
++#include <nlohmann/json.hpp>
+ 
+ #include "test_config_helpers.h"
+ 
+diff --git a/test/cpp/test_beacon_peer_table.cpp b/test/cpp/test_beacon_peer_table.cpp
+index 2866dfba5..bb6373055 100644
+--- a/test/cpp/test_beacon_peer_table.cpp
++++ b/test/cpp/test_beacon_peer_table.cpp
+@@ -4,9 +4,9 @@
+ #include <string>
+ #include <vector>
+ 
+-#include <nlohmann/json.hpp>
+ #include <lemon/utils/beacon_listener.h>
+ #include <lemon/utils/network_beacon.h>
++#include <nlohmann/json.hpp>
+ 
+ #include "test_config_helpers.h"
+ 
+@@ -375,6 +375,38 @@ void test_flood_survival(Clock::time_point t0) {
+     check(t.evicted() == 0, "flood: evicted stays 0");
+ }
+ 
++
++void test_pinned_junk_flood(Clock::time_point t0) {
++    BeaconPeerTable t;
++    uint32_t peer = ip(192, 168, 1, 40);
++    std::string good = beacon(url_for(peer), "legit");
++    check(feed(t, good, peer, t0) == IngestResult::Accepted, "pinned junk: peer accepted");
++
++    std::vector<std::string> junk = {"not json at all", "[]", beacon(url_for(ip(192, 168, 1, 41)), "x"),
++                                     beacon("https://192.168.1.40:13305/api/v1/", "x")};
++    bool refreshes_ok = true;
++    for (int ms = 1; ms <= 20000; ++ms) {
++        auto now = t0 + std::chrono::milliseconds(ms);
++        feed(t, junk[ms % junk.size()], peer, now);
++        if (ms % 2000 == 0 && feed(t, good, peer, now) != IngestResult::Refreshed) refreshes_ok = false;
++    }
++    t.expire(t0 + std::chrono::milliseconds(20000));
++    check(refreshes_ok, "pinned junk: every real refresh admitted during a 1000 pps junk flood");
++    check(t.size() == 1, "pinned junk: legitimate row survives the flood");
++}
++
++void test_single_source_flood(Clock::time_point t0) {
++    BeaconPeerTable t;
++    uint32_t noisy = ip(10, 0, 0, 7);
++    for (int i = 0; i < 5000; ++i) {
++        feed(t, "garbage", noisy, t0);
++    }
++    check(t.stat(IngestResult::RateLimited) >= 5000 - static_cast<uint64_t>(lemon::kPerSourceBurst),
++          "single source: the noisy host is limited to its own bucket");
++    uint32_t fresh = ip(10, 0, 0, 8);
++    check(feed(t, beacon(url_for(fresh)), fresh, t0) == IngestResult::Accepted,
++          "single source: a new peer is still accepted during the flood");
++}
+ } // namespace
+ 
+ int main() {
+@@ -393,6 +425,8 @@ int main() {
+     test_rate_limit_global(t0);
+     test_rate_limit_per_source(t0);
+     test_flood_survival(t0);
++    test_pinned_junk_flood(t0);
++    test_single_source_flood(t0);
+ 
+     return test_helpers::report_results("beacon peer table");
+ }
+diff --git a/test/server_cli2.py b/test/server_cli2.py
+index b6fe4704f..69f640c8d 100644
+--- a/test/server_cli2.py
++++ b/test/server_cli2.py
+@@ -852,6 +852,42 @@ sys.exit(0)
+             # Restore default
+             run_cli_command(["--port", str(PORT), "config", "set", "broadcast=true"])
+ 
++    def test_045a_scan_with_beacon_listen(self):
++        """With beacon_listen on, scan still receives the server's loopback beacon."""
++        if platform.system() != "Linux":
++            self.skipTest("beacon listener coexistence is only validated on Linux")
++        response = requests.get(
++            f"http://localhost:{PORT}/internal/config",
++            headers=_auth_headers(),
++            timeout=10,
++        )
++        self.assertEqual(response.status_code, 200)
++        if response.json().get("broadcast") is False:
++            self.skipTest("server broadcasting is disabled, so there is no beacon")
++
++        loopback_url = f"http://127.0.0.1:{PORT}/api/v1/"
++        try:
++            set_server_config({"beacon_listen": True})
++            health = requests.get(
++                f"http://localhost:{PORT}/api/v1/health",
++                headers=_auth_headers(),
++                timeout=10,
++            ).json()
++            self.assertTrue(health["beacon_listener"]["enabled"])
++
++            result = self.assertCommandSucceeds(["scan", "--duration", "3"], timeout=30)
++            if "Found 0 beacon(s)" in result.stdout:
++                self.skipTest(
++                    "server is not broadcasting (no RFC1918 interface on this host)"
++                )
++            self.assertIn(
++                loopback_url,
++                result.stdout,
++                "the listener must not keep the loopback beacon from the CLI",
++            )
++        finally:
++            set_server_config({"beacon_listen": False})
++
+     # =============================================================================
+     # Pull Tests
+     # =============================================================================
+diff --git a/test/server_endpoints.py b/test/server_endpoints.py
+index 89a15ff62..1c43e4071 100644
+--- a/test/server_endpoints.py
++++ b/test/server_endpoints.py
+@@ -21,10 +21,12 @@ Usage:
+ """
+ 
+ import contextlib
++import errno
+ import json
+ import os
+ import platform
+ import socket
++import struct
+ import subprocess
+ import sys
+ import time
+@@ -33,6 +35,7 @@ import shutil
+ import tempfile
+ import uuid
+ import requests
++from urllib.parse import urlparse
+ from openai import NotFoundError
+ from prometheus_client.parser import text_string_to_metric_families
+ 
+@@ -463,14 +466,44 @@ class EndpointTests(ServerTestBase):
+         return None
+ 
+     @staticmethod
+-    def _send_limited_broadcast(payload):
++    def _directed_broadcast_for(local_ip, sockets):
++        """Pick the bound directed-broadcast address whose subnet contains local_ip."""
++        ip_int = struct.unpack("!I", socket.inet_aton(local_ip))[0]
++        for entry in sockets:
++            if not entry.get("bound"):
++                continue
++            address = entry["address"].rsplit(":", 1)[0]
++            if address == "255.255.255.255":
++                continue
++            bcast = struct.unpack("!I", socket.inet_aton(address))[0]
++            for prefix in range(8, 31):
++                host_mask = (1 << (32 - prefix)) - 1
++                if (ip_int | host_mask) == bcast:
++                    return address
++        return None
++
++    @staticmethod
++    def _send_broadcast(payload, local_ip, broadcast_ip):
+         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+         try:
+             sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+-            sender.sendto(json.dumps(payload).encode(), ("255.255.255.255", 13305))
++            sender.bind((local_ip, 0))
++            sender.sendto(json.dumps(payload).encode(), (broadcast_ip, 13305))
+         finally:
+             sender.close()
+ 
++    @staticmethod
++    def _try_bind_beacon_port():
++        """Bind 0.0.0.0:13305 without SO_REUSEADDR; return the errno or 0."""
++        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        try:
++            probe.bind(("0.0.0.0", 13305))
++            return 0
++        except OSError as e:
++            return e.errno
++        finally:
++            probe.close()
++
+     def test_002c_beacon_listener_health(self):
+         """beacon_listen toggles a list-only listener reported under /health."""
+         for prefix in ("/api/v0", "/api/v1", "/v0", "/v1"):
+@@ -480,6 +513,12 @@ class EndpointTests(ServerTestBase):
+                 f"beacon_listener should default to disabled on {prefix}/health",
+             )
+ 
++        is_linux = platform.system() == "Linux"
++        # Another process (CLI scan, desktop app) may already hold the port;
++        # the bind-release checks are only meaningful when it is free now.
++        port_free_before = is_linux and self._try_bind_beacon_port() == 0
++        skip_reason = None
++
+         try:
+             set_server_config({"beacon_listen": True})
+             state = self._wait_beacon_listener(
+@@ -491,65 +530,92 @@ class EndpointTests(ServerTestBase):
+                 self.assertEqual(platform.system(), "Windows")
+                 self.assertFalse(state["listening"])
+                 self.skipTest("beacon listener is not supported on this platform")
++            if not is_linux:
++                self.skipTest(
++                    "beacon listener socket behaviour is only validated on Linux"
++                )
+ 
+             self.assertTrue(state["listening"], state)
+             self.assertTrue(state["sockets"])
+             self.assertNotIn("0.0.0.0:13305", [s["address"] for s in state["sockets"]])
+             self.assertRegex(state["self_instance_id"], r"^[0-9a-f]{16}$")
+             self.assertEqual(state["self_port"], PORT)
+-            for host in state["hosts"]:
+-                self.assertNotEqual(host["instance_id"], state["self_instance_id"])
+ 
+             local_ip = self._local_rfc1918_ip()
+-            if local_ip is None:
+-                self.skipTest("no RFC1918 default-route address to inject beacons from")
++            for host in state["hosts"]:
++                self.assertNotEqual(host["instance_id"], state["self_instance_id"])
++                if local_ip is not None:
++                    self.assertFalse(
++                        host["source_ip"] == local_ip
++                        and urlparse(host["url"]).port == state["self_port"],
++                        f"listener lists its own server: {host}",
++                    )
+ 
+-            url = f"http://{local_ip}:65001/api/v1/"
+-            self._send_limited_broadcast(
+-                {
+-                    "service": "lemonade",
+-                    "hostname": "peer-test",
+-                    "url": url,
+-                    "instance_id": "abcdef0123456789",
+-                }
+-            )
+-            state = self._wait_beacon_listener(
+-                lambda s: any(h["url"] == url for h in s.get("hosts", []))
+-            )
+-            self.assertTrue(
+-                any(h["url"] == url for h in state["hosts"]),
+-                f"injected beacon {url} not listed: {state}",
+-            )
++            if port_free_before:
++                self.assertEqual(
++                    self._try_bind_beacon_port(),
++                    errno.EADDRINUSE,
++                    "a non-reuse wildcard bind should conflict with the listener",
++                )
+ 
+-            mismatches = state["stats"]["url_mismatch"]
+-            self._send_limited_broadcast(
+-                {
+-                    "service": "lemonade",
+-                    "hostname": "peer-mismatch",
+-                    "url": "http://10.9.9.9:1/api/v1/",
+-                }
+-            )
+-            state = self._wait_beacon_listener(
+-                lambda s: s["stats"]["url_mismatch"] > mismatches
+-            )
+-            self.assertGreater(state["stats"]["url_mismatch"], mismatches)
+-            self.assertFalse(
+-                any(h["url"] == "http://10.9.9.9:1/api/v1/" for h in state["hosts"])
+-            )
++            skip_reason = self._inject_beacons(state, local_ip)
+         finally:
+             set_server_config({"beacon_listen": False})
+ 
+         self.assertEqual(self._beacon_listener_state(), {"enabled": False})
+-        if platform.system() == "Linux":
+-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+-            try:
+-                probe.bind(("0.0.0.0", 13305))
+-            except OSError:
+-                pass  # the CLI or desktop app may legitimately hold the port
+-            else:
+-                print("[OK] UDP 13305 released after beacon_listen=false")
+-            finally:
+-                probe.close()
++        if port_free_before:
++            self.assertEqual(
++                self._try_bind_beacon_port(),
++                0,
++                "UDP 13305 should be released after beacon_listen=false",
++            )
++        if skip_reason:
++            self.skipTest(skip_reason)
++
++    def _inject_beacons(self, state, local_ip):
++        if local_ip is None:
++            return "no RFC1918 default-route address to inject beacons from"
++        broadcast_ip = self._directed_broadcast_for(local_ip, state["sockets"])
++        if broadcast_ip is None:
++            return f"no bound directed-broadcast socket covers {local_ip}"
++
++        url = f"http://{local_ip}:65001/api/v1/"
++        self._send_broadcast(
++            {
++                "service": "lemonade",
++                "hostname": "peer-test",
++                "url": url,
++                "instance_id": "abcdef0123456789",
++            },
++            local_ip,
++            broadcast_ip,
++        )
++        state = self._wait_beacon_listener(
++            lambda s: any(h["url"] == url for h in s.get("hosts", []))
++        )
++        self.assertTrue(
++            any(h["url"] == url for h in state["hosts"]),
++            f"injected beacon {url} via {broadcast_ip} not listed: {state}",
++        )
++
++        mismatches = state["stats"]["url_mismatch"]
++        self._send_broadcast(
++            {
++                "service": "lemonade",
++                "hostname": "peer-mismatch",
++                "url": "http://10.9.9.9:1/api/v1/",
++            },
++            local_ip,
++            broadcast_ip,
++        )
++        state = self._wait_beacon_listener(
++            lambda s: s["stats"]["url_mismatch"] > mismatches
++        )
++        self.assertGreater(state["stats"]["url_mismatch"], mismatches)
++        self.assertFalse(
++            any(h["url"] == "http://10.9.9.9:1/api/v1/" for h in state["hosts"])
++        )
++        return None
+ 
+     def test_002_health_streaming_flags(self):
+         """Test is_busy and is_streaming fields in /health response.
+-- 
+2.53.0
+

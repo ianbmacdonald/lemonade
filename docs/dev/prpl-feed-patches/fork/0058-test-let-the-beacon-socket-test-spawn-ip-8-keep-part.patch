@@ -1,0 +1,49 @@
+From 35f5acd6ce691da97334e4feae390902370abf73 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 03:26:41 -0400
+Subject: [PATCH 58/58] test: let the beacon socket test spawn ip(8); keep
+ partial-file names out of http_client.h
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/utils/http_client.h | 4 ++--
+ test/cpp/test_facade_shape.cpp            | 1 +
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/cpp/include/lemon/utils/http_client.h b/src/cpp/include/lemon/utils/http_client.h
+index 4064f503c..448f5de85 100644
+--- a/src/cpp/include/lemon/utils/http_client.h
++++ b/src/cpp/include/lemon/utils/http_client.h
+@@ -219,7 +219,7 @@ public:
+                                         HttpSecurityPolicy policy = HttpSecurityPolicy::ExternalHttpsOnly,
+                                         const CancelToken& cancel = CancelToken());
+ 
+-    // Bytes of output_path + ".partial" that a resumed download_file will keep.
++    // Bytes of output_path's partial file that a resumed download_file will keep.
+     // Differs from the partial's file size while an interrupted parallel
+     // download has left out-of-order ranges past its contiguous prefix.
+     static size_t resumable_partial_bytes(const std::string& output_path);
+@@ -247,7 +247,7 @@ private:
+                                            const CancelToken& cancel);
+ 
+     // One attempt over concurrent Range requests for bytes
+-    // [resume_from, total_size) of the .partial file. Sets
++    // [resume_from, total_size) of the partial file. Sets
+     // fall_back_single_stream when a server ignored or rejected (416) a
+     // ranged request.
+     static DownloadResult parallel_download_attempt(const std::string& url,
+diff --git a/test/cpp/test_facade_shape.cpp b/test/cpp/test_facade_shape.cpp
+index bcc4940a7..47661eb08 100644
+--- a/test/cpp/test_facade_shape.cpp
++++ b/test/cpp/test_facade_shape.cpp
+@@ -533,6 +533,7 @@ int main() {
+         }
+     }
+     const std::vector<std::string> allowed_spawners = {
++        "test/cpp/test_beacon_listener_socket.cpp",  // ip(8) builds dummy links in its own netns
+         "test/cpp/test_process_manager.cpp",  // process management is the subject
+     };
+     check("only the named test spawns a process", spawners == allowed_spawners);
+-- 
+2.53.0
+
