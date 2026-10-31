@@ -1,7 +1,13 @@
+#include <optional>
+#include <string>
+
 #include <lemon/utils/aixlog.hpp>
 
+#include "lemon/backends/backend_descriptor_registry.h"
 #include "lemon/server/model_sync.h"
 #include "lemon/model_manager.h"
+#include "lemon/model_types.h"
+#include "lemon/models/registry_descriptors.h"
 #include "lemon/models/registry_types.h"
 #include "lemon/runtime_config.h"
 #include "lemon/server/api_route.h"
@@ -30,6 +36,13 @@ const RouteError kRegistryUnavailable{
     503, "registry_unavailable",
     "Without `stream`, the model registry rate-limits or is temporarily unavailable; the "
     "`Retry-After` header and the body's `upstream_status_code` carry the details"};
+const RouteError kInvalidRevision{
+    400, "",
+    "`revision` is malformed, or cannot pin this model: a collection, a local import, a "
+    "non-Hugging Face registry, a backend that manages its own downloads, or a request that "
+    "also changes an existing model's recipe or source"};
+const RouteError kRevisionOffline{
+    400, "lemond_offline", "`revision` is sent while the server is in offline mode"};
 const RouteError kPullFailed{
     500, "",
     "Another failure occurs, for example a failed download, a model this system cannot run, a "
@@ -45,6 +58,7 @@ ordered_json pull_schema() {
         "properties": {
             "status": {"const": "success", "description": "Always `success`."},
             "model_name": {"type": "string", "description": "The installed model."},
+            "revision": {"type": "string", "description": "Only with `revision`: the commit sha the model is pinned to."},
             "message": {"type": "string", "description": "Only with `local_import`: a confirmation that the files were registered."}
         }
     })");
@@ -104,6 +118,12 @@ const RouteArg kLocalImport{"local_import", ArgIn::JsonBody, {{"type", "boolean"
                             "Register model files a client already copied into the Hugging Face cache, without "
                             "downloading. Defaults to `false`."};
 
+const RouteArg kRevision{"revision", ArgIn::JsonBody, {{"type", "string"}}, false, Support::Available,
+                         "Pin the download to an exact Hugging Face revision of the model's main "
+                         "checkpoint repository: a 40-character commit sha, or a branch or tag name. "
+                         "Omitted or empty pulls the registry's default branch, and an explicit pull "
+                         "without it releases an existing pin. See Pin a Revision below."};
+
 class PullRoute : public ApiRoute {
 public:
     using ApiRoute::ApiRoute;
@@ -123,6 +143,41 @@ public:
             "[`POST /v1/models/check-updates`](#post-v1modelscheck-updates) only reports them.",
             "With `stream`, the error event or the job reports an unknown model.",
             "In offline mode a new definition is still registered, but nothing is downloaded.",
+            "### Pin a Revision\n\n"
+            "A client can look up a model's commits on the Hub (for example "
+            "`https://huggingface.co/api/models/<owner>/<repo>/commits/main`) and download exactly "
+            "one of them by passing `revision`; the non-streaming response then carries the "
+            "resolved commit as `revision`.\n\n"
+            "- `revision` must be a 40-character hexadecimal commit sha, or a branch/tag name of at "
+            "most 128 characters made of `A-Z a-z 0-9 . _ / -` that does not contain `..` and does "
+            "not start with `/` or `-` (for example `main` or `refs/pr/1`). Anything else is "
+            "rejected with `400` before any registration or network request.\n"
+            "- A branch or tag is resolved to its commit when the pull runs; the model stays on that "
+            "commit even if the branch moves later.\n"
+            "- The pin applies to the main checkpoint's repository only. Auxiliary checkpoints in "
+            "other repositories follow their default branch; auxiliary files in the main repository "
+            "come from the pinned commit.\n"
+            "- Files are stored under `snapshots/<commit sha>/`. A pinned pull never moves "
+            "`refs/main`, so other models that share the repository keep loading the default-branch "
+            "snapshot.\n"
+            "- The model records the pinned commit in the repository's `.lemonade_registry.json`, "
+            "and every later load of that model uses the pinned snapshot. "
+            "[`GET /v1/models/{id}`](./openai.md#get-v1modelsid) reports it as `pinned_revision`. A "
+            "pinned model is excluded from update checks and auto-update.\n"
+            "- An explicit pull with `revision` always fetches and pins that revision, even with "
+            "`do_not_upgrade` and an already-downloaded model, so it also moves an existing pin. "
+            "Pulling again without `revision` removes the pin.\n"
+            "- `revision` is rejected with `400` for collections, local imports, models from a "
+            "non-Hugging Face registry, backends that manage their own downloads (`flm`, `cloud`), "
+            "a request that also changes an existing model's recipe or source, and in offline "
+            "mode. [`POST /v1/models/register`](#post-v1modelsregister) does not download and "
+            "rejects `revision`.\n"
+            "- Streaming and server-owned job responses do not carry the resolved sha; read "
+            "`pinned_revision` after the download completes.\n"
+            "- If a repository's `.lemonade_registry.json` is corrupt, models in that repository "
+            "that are not on the `refs/main` snapshot (pinned models included) report not "
+            "downloaded. A later download of that repository rewrites the file and drops the pins "
+            "it held.",
             "### Register and Install a Model\n\n"
             "Registering writes the model to `user_models.json` in the Lemonade config directory "
             "(`~/.config/lemonade` by default), after which [`GET /v1/models`](./openai.md#get-v1models) lists it beside the "
@@ -141,7 +196,7 @@ public:
         s.args = {
             common::kStream, downloads::kSubscribe, kModelName, kRecipe, kCheckpoint, kCheckpoints,
             kReasoning, kVision, kEmbedding, kReranking, kMmproj, kComponents, kModels, kLabels,
-            kSource, kRegistrySource, kDoNotUpgrade, kLocalImport
+            kSource, kRegistrySource, kDoNotUpgrade, kLocalImport, kRevision
         };
 
         RouteResponse job;
@@ -204,7 +259,7 @@ public:
         s.examples = {job_example, success_example, events_example, register_example,
                       collection_example};
         s.errors = {kBodyNotJson, kArgMissing, kArgInvalid, kInvalidSource, kInvalidModelDefinition,
-                    kLemondOffline, kUnknownModel, kIllegalLabels, kRegistryUnavailable, kPullFailed};
+                    kInvalidRevision, kRevisionOffline, kLemondOffline, kUnknownModel, kIllegalLabels, kRegistryUnavailable, kPullFailed};
         s.request_format = RequestFormat::Json;
         return s;
     }
@@ -219,6 +274,28 @@ public:
             bool stream = req.value(common::kStream, false);
             bool subscribe = req.value(downloads::kSubscribe, true);
             bool local_import = req.value(kLocalImport, false);
+
+            const std::string revision = req.value(kRevision, "");
+            if (req.has(kRevision)) {
+                const std::string revision_error = lemon::registry_revision_error(revision);
+                if (!revision_error.empty()) {
+                    write_plain_error(res, kInvalidRevision, revision_error);
+                    return;
+                }
+                req.body.erase(kRevision.name);
+                if (!revision.empty() && local_import) {
+                    write_plain_error(res, kInvalidRevision,
+                        "`revision` applies only to registry downloads, not local imports");
+                    return;
+                }
+                if (!revision.empty() && ctx_.config->offline()) {
+                    res.status = kRevisionOffline.status;
+                    res.set_content(json{
+                        {"error", "revision pinning needs network access; offline mode is on"},
+                        {"code", kRevisionOffline.code}}.dump(), "application/json");
+                    return;
+                }
+            }
 
             // The registry is resolved once, up front, so download, cache layout and
             // later refresh agree on it.
@@ -237,6 +314,9 @@ public:
             }
             if (!recipe.empty()) {
                 LOG(INFO, "Server") << "   recipe: " << recipe << std::endl;
+            }
+            if (!revision.empty() && !check_pinnable(req, model_name, recipe, revision, res)) {
+                return;
             }
 
             const bool collection_file_import = req.arg(kModels).is_array();
@@ -272,6 +352,9 @@ public:
                     download_request[field->name] = req.arg(*field);
                 }
             }
+            // Present even when empty: an explicit /pull without a revision is the one
+            // request that releases a pin; every other download keeps it.
+            download_request[kRevision.name] = revision;
 
             if (stream) {
                 ModelManager* model_manager = ctx_.model_manager;
@@ -295,6 +378,13 @@ public:
                 ctx_.model_manager->download_model(model_name, download_request, do_not_upgrade);
 
                 json response = {{"status", "success"}, {"model_name", model_name}};
+                if (!revision.empty()) {
+                    const std::string pinned =
+                        ctx_.model_manager->get_model_info(model_name).pinned_revision;
+                    if (!pinned.empty()) {
+                        response["revision"] = pinned;
+                    }
+                }
                 res.set_content(response.dump(), "application/json");
             }
 
@@ -318,6 +408,81 @@ public:
             LOG(ERROR, "Server") << "ERROR in handle_pull: " << e.what() << std::endl;
             write_plain_error(res, kPullFailed, e.what());
         }
+    }
+
+private:
+    // A pin is checked against the registration the download will use: the existing one
+    // when the model is registered, so a request that also changes it is refused.
+    bool check_pinnable(RouteRequest& req, const std::string& model_name,
+                        const std::string& recipe, const std::string& revision,
+                        httplib::Response& res) {
+        LOG(INFO, "Server") << "   revision: " << revision << std::endl;
+        std::string pinned_recipe = recipe;
+        const std::string requested_source = req.value(kSource, "");
+        std::string pinned_source =
+            requested_source.empty() || lemon::is_remote_registry_source(requested_source)
+                ? std::string()
+                : requested_source;
+        std::string pinned_registry = req.value(kRegistrySource, "");
+        if (pinned_registry.empty() && lemon::is_remote_registry_source(requested_source)) {
+            pinned_registry = requested_source;
+        }
+        const auto registry_name = [](const std::string& name) {
+            try {
+                return remote_registry_source_name(parse_remote_registry_source(name));
+            } catch (const std::exception&) {
+                return name;
+            }
+        };
+        std::optional<ModelInfo> existing_info;
+        try {
+            if (ctx_.model_manager->model_exists(model_name)) {
+                existing_info = ctx_.model_manager->get_model_info(model_name);
+            }
+        } catch (const std::exception&) {
+            // Deleted between the two calls: check it as a new registration.
+        }
+        if (existing_info) {
+            const ModelInfo& existing = *existing_info;
+            const std::string existing_registry = existing.registry_source.empty()
+                ? ctx_.config->default_model_source()
+                : existing.registry_source;
+            if ((!pinned_recipe.empty() && pinned_recipe != existing.recipe) ||
+                (!pinned_source.empty() && pinned_source != existing.source) ||
+                (!pinned_registry.empty() &&
+                 registry_name(pinned_registry) != registry_name(existing_registry))) {
+                write_plain_error(res, kInvalidRevision,
+                    "`revision` cannot be combined with a change to the recipe or source of the "
+                    "existing model '" + model_name + "'");
+                return false;
+            }
+            pinned_recipe = existing.recipe;
+            pinned_source = existing.source;
+            pinned_registry = existing_registry;
+        }
+        if (pinned_registry.empty()) pinned_registry = ctx_.config->default_model_source();
+        const auto* descriptor = backends::descriptor_for(pinned_recipe);
+        if (is_model_collection_recipe(pinned_recipe) || !pinned_source.empty() ||
+            (descriptor && descriptor->self_manages_downloads)) {
+            write_plain_error(res, kInvalidRevision,
+                "`revision` applies only to registry downloads; '" + model_name + "' (recipe " +
+                pinned_recipe + ") cannot be pinned");
+            return false;
+        }
+        bool hugging_face = false;
+        try {
+            hugging_face = parse_remote_registry_source(pinned_registry) ==
+                           models::huggingface_descriptor().id;
+        } catch (const std::exception&) {
+            // An unrecognized registry name cannot be pinned either.
+        }
+        if (!hugging_face) {
+            write_plain_error(res, kInvalidRevision,
+                "`revision` pinning is supported for Hugging Face only; '" + model_name +
+                "' downloads from " + pinned_registry);
+            return false;
+        }
+        return true;
     }
 };
 

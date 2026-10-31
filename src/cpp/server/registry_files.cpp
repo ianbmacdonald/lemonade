@@ -6,6 +6,7 @@
 #include <lemon/gguf_shard_utils.h>
 #include <lemon/hf_variants.h>
 #include <lemon/models/artifact_ref.h>
+#include <lemon/models/registry_types.h>
 #include <lemon/utils/aixlog.hpp>
 #include <lemon/utils/path_utils.h>
 #include <lemon/utils/http_client.h>
@@ -13,7 +14,10 @@
 #include <lemon/utils/safe_fs.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <mutex>
+#include <optional>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -248,6 +252,95 @@ std::string active_local_snapshot(
         snapshot = backends::hf_cache::read_ref_main(model_cache_path);
     }
     return snapshot;
+}
+
+static bool is_commit_sha(const std::string& value) {
+    return value.size() == 40 &&
+           std::all_of(value.begin(), value.end(), [](unsigned char c) {
+               return std::isdigit(c) || (c >= 'a' && c <= 'f');
+           });
+}
+
+static bool is_snapshot_component(const std::string& snapshot_id) {
+    // A leading dot would name "." or a hidden entry rather than a commit.
+    return !snapshot_id.empty() && snapshot_id.front() != '.' &&
+           registry_revision_error(snapshot_id).empty() &&
+           snapshot_id.find('/') == std::string::npos;
+}
+
+// Every valid pin recorded in a repository's .lemonade_registry.json, by model;
+// nullopt when the file exists but cannot be read.
+static std::optional<std::map<std::string, std::string>> read_pinned_snapshot_ids(
+    const fs::path& model_cache_path) {
+    std::map<std::string, std::string> pins;
+    const fs::path provenance_path = model_cache_path / ".lemonade_registry.json";
+    if (!utils::safe_exists(provenance_path)) {
+        return pins;
+    }
+    try {
+        const nlohmann::json provenance =
+            utils::JsonUtils::load_from_file(utils::path_to_utf8(provenance_path));
+        const auto models_it = provenance.find("processed_models");
+        if (models_it == provenance.end() || !models_it->is_object()) {
+            return pins;
+        }
+        for (const auto& [model_name, entry] : models_it->items()) {
+            if (!entry.is_object()) continue;
+            const std::string pinned =
+                utils::JsonUtils::get_or_default<std::string>(entry, "pinned_revision", "");
+            if (is_snapshot_component(pinned)) {
+                pins[model_name] = pinned;
+            }
+        }
+    } catch (const std::exception& e) {
+        static std::mutex logged_mutex;
+        static std::set<std::string> logged;
+        std::lock_guard<std::mutex> lock(logged_mutex);
+        if (logged.insert(utils::path_to_utf8(provenance_path)).second) {
+            LOG(ERROR, "ModelManager") << "Cannot read " << utils::path_to_utf8(provenance_path)
+                << " (" << e.what() << "); models in this repository load only "
+                << "the refs/main snapshot until it is repaired or re-pulled" << std::endl;
+        }
+        return std::nullopt;
+    }
+    return pins;
+}
+
+std::string pinned_snapshot_id(
+    const fs::path& model_cache_path,
+    const std::string& model_name) {
+    const auto pins = read_pinned_snapshot_ids(model_cache_path);
+    if (!pins) return "";
+    const auto it = pins->find(model_name);
+    return it == pins->end() ? "" : it->second;
+}
+
+std::optional<std::set<std::string>> pinned_snapshot_ids(const fs::path& model_cache_path) {
+    const auto pins = read_pinned_snapshot_ids(model_cache_path);
+    if (!pins) return std::nullopt;
+    std::set<std::string> ids;
+    for (const auto& [model_name, pinned] : *pins) {
+        (void)model_name;
+        ids.insert(pinned);
+    }
+    return ids;
+}
+
+std::string download_revision(const std::string& requested_revision,
+                              bool release_pin,
+                              const std::string& current_pin) {
+    if (!requested_revision.empty() || release_pin) {
+        return requested_revision;
+    }
+    return current_pin;
+}
+
+bool is_pinnable_snapshot_id(const std::string& requested_revision,
+                             const std::string& snapshot_id) {
+    // A registry that omits the commit id reports the requested name instead;
+    // pinning that would persist a pin the load path cannot honour.
+    return is_snapshot_component(snapshot_id) &&
+           (snapshot_id != requested_revision || is_commit_sha(snapshot_id));
 }
 
 std::map<std::string, std::vector<std::string>> group_aux_checkpoint_variants(

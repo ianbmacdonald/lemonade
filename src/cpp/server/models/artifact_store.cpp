@@ -11,6 +11,8 @@
 #include <lemon/models/registry_types.h>
 #include <lemon/models/artifact_source.h>
 #include <lemon/models/repository_provenance.h>
+#include <lemon/model_types.h>
+#include <lemon/registry_files.h>
 #include <lemon/utils/aixlog.hpp>
 #include <lemon/utils/json_utils.h>
 #include <lemon/utils/path_utils.h>
@@ -349,10 +351,40 @@ std::string ModelArtifactStore::resolve_path_in(const ModelInfo& info, const std
     ctx.registry_source = registry_source_of(info);
     ctx.model_cache_path = cache_root + "/" +
         backends::hf_cache::repo_id_to_cache_dir_name(ctx.repo_id, ctx.registry_source);
+    const bool pinned = !info.pinned_revision.empty() && ctx.repo_id == ctx.main_repo_id;
+    if (pinned) {
+        // Presenting the pinned snapshot as the whole repository cache keeps every
+        // backend's lookup, including refs/main and whole-cache fallbacks, on the
+        // pinned commit without each backend knowing about pins.
+        ctx.model_cache_path += "/snapshots/" + info.pinned_revision;
+        if (!utils::safe_exists(utils::path_from_utf8(ctx.model_cache_path))) {
+            return "";
+        }
+    }
     ctx.type = type;
     ctx.checkpoint = checkpoint;
 
-    return backends::ops_for(info.recipe)->resolve_checkpoint_path(info, ctx);
+    std::string resolved = backends::ops_for(info.recipe)->resolve_checkpoint_path(info, ctx);
+    // Backends fall back to the cache root when a named file is absent (the
+    // pre-snapshot flat layout); for a pin that root is the snapshot itself.
+    if (pinned && !ctx.variant.empty() && resolved == ctx.model_cache_path) {
+        return "";
+    }
+    if (!pinned && !resolved.empty()) {
+        // Backends that search every snapshot (no refs/main yet, or a variant
+        // missing from it) must not hand an unpinned model another model's
+        // pinned commit; it then reports not downloaded and a pull fetches main.
+        const fs::path cache_path = utils::path_from_utf8(ctx.model_cache_path);
+        const std::string snapshot =
+            registry_files::snapshot_id_from_resolved_path(resolved, cache_path);
+        if (!snapshot.empty() && snapshot != backends::hf_cache::read_ref_main(cache_path)) {
+            const auto pins = registry_files::pinned_snapshot_ids(cache_path);
+            if (!pins || pins->count(snapshot) != 0) {
+                return "";
+            }
+        }
+    }
+    return resolved;
 }
 
 // The same three checks every ArtifactSource::present() applies, asked of the path this
@@ -1169,6 +1201,16 @@ backends::DownloadPolicy ModelArtifactStore::download_policy(const ModelInfo& in
 }
 
 void ModelArtifactStore::resolve_all(ModelInfo& info) const {
+    info.pinned_revision.clear();
+    const std::string main_repo_id = repo_id_from_checkpoint(info.checkpoint("main"));
+    if (info.source.empty() && !main_repo_id.empty() &&
+        !is_model_collection_recipe(info.recipe)) {
+        info.pinned_revision = registry_files::pinned_snapshot_id(
+            utils::path_from_utf8(root()) /
+                backends::hf_cache::repo_id_to_cache_dir_name(main_repo_id,
+                                                              registry_source_of(info)),
+            info.model_name);
+    }
     for (const auto& [type, checkpoint] : info.checkpoints) {
         info.resolved_paths[type] = resolve_path(info, type, checkpoint);
     }

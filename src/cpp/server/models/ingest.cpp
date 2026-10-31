@@ -3,6 +3,7 @@
 #include <lemon/models/ingest_collections.h>
 
 #include <lemon/backends/backend_registry.h>
+#include <lemon/backends/hf_cache_util.h>
 #include <lemon/routing_policy.h>
 #include <lemon/routing_policy_parser.h>
 #include <lemon/canonical_id.h>
@@ -243,14 +244,28 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
     SourcePlacement placement;
     placement.recipe = info.recipe;
 
+    const bool pinned = !info.requested_revision.empty();
     std::map<std::string, std::unique_ptr<FetchableRepository>> repositories;
     std::map<std::string, RepoListing> listings;
     for (const auto& ref : refs) {
         if (listings.count(ref.repo_id)) continue;
         std::unique_ptr<FetchableRepository> repository =
             deps_.resolver->repository_for(ref, placement);
-        listings.emplace(ref.repo_id, repository->list(ref.repo_id, ref.revision));
+        const std::string revision =
+            pinned && ref.repo_id == main_repo_id ? info.requested_revision : ref.revision;
+        listings.emplace(ref.repo_id, repository->list(ref.repo_id, revision));
         repositories.emplace(ref.repo_id, std::move(repository));
+    }
+    if (pinned) {
+        const RepoListing& main_listing = listings.at(main_repo_id);
+        const std::string resolved = main_listing.revision.id.empty()
+            ? main_listing.download_revision
+            : main_listing.revision.id;
+        if (!registry_files::is_pinnable_snapshot_id(info.requested_revision, resolved)) {
+            throw std::runtime_error(
+                source_display + " did not report a commit for revision '" +
+                info.requested_revision + "' of " + main_repo_id + "; cannot pin it");
+        }
     }
 
     // The existence rule stays the pull's own: its words tell the user which
@@ -337,6 +352,9 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
     std::set<std::string> repos_reusing_previous_snapshot;
     if (source == models::huggingface_descriptor().id) {
         for (const auto& repo_id : repo_ids) {
+            // A pin must own snapshots/<sha> even when its artifacts match the
+            // snapshot refs/main names.
+            if (pinned && repo_id == main_repo_id) continue;
             const std::string current_ref = repo_snapshot_ids.at(repo_id);
             const std::string previous_ref = repo_previous_refs.at(repo_id);
             if (previous_ref.empty() || previous_ref == current_ref) continue;
@@ -438,10 +456,17 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
             ? repo_previous_refs.at(repo_id)
             : snapshot_id;
 
-        artifacts().write_active_snapshot(cache_path, active_snapshot_id);
+        const bool pinned_repo = pinned && repo_id == main_repo_id;
+        if (!pinned_repo) {
+            artifacts().write_active_snapshot(cache_path, active_snapshot_id);
+        }
         if (reusing_previous_snapshot) {
-            artifacts().remove_unused_snapshot(
-                cache_path, repo_snapshot_paths.at(repo_id), active_snapshot_id);
+            // The commit refs/main skipped can be another model's pinned snapshot.
+            const auto pins = registry_files::pinned_snapshot_ids(cache_path);
+            if (pins && pins->count(snapshot_id) == 0) {
+                artifacts().remove_unused_snapshot(
+                    cache_path, repo_snapshot_paths.at(repo_id), active_snapshot_id);
+            }
         }
 
         const RepoListing& listing = listings.at(repo_id);
@@ -454,13 +479,15 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
                 }
             }
         }
-        artifacts().record_processed_model(cache_path, info, models::Provenance{
+        models::Provenance provenance{
             source_name,
             repo_id,
             listing.download_revision,
             active_snapshot_id,
             snapshot_id,
-        }, checkpoint_type);
+        };
+        provenance.pinned = pinned_repo;
+        artifacts().record_processed_model(cache_path, info, provenance, checkpoint_type);
     }
 
     if (progress_callback) {
@@ -869,10 +896,19 @@ void ModelIngest::pull(const std::string& model_name,
     // The do_not_upgrade flag means:
     //   - Load/inference endpoints: Don't check the remote registry for updates (use cache if available)
     //   - Pull endpoint: Always check the recorded registry for the latest version (do_not_upgrade=false)
-    if (do_not_upgrade && deps_.store->is_downloaded(artifacts(), model_name)) {
+    model_info.requested_revision =
+        model_data.contains("revision") && model_data["revision"].is_string()
+            ? model_data["revision"].get<std::string>()
+            : std::string();
+    if (do_not_upgrade && model_info.requested_revision.empty() &&
+        deps_.store->is_downloaded(artifacts(), model_name)) {
         LOG(INFO, "ModelManager") << "Model already downloaded and do_not_upgrade=true, using cached version" << std::endl;
         return;
     }
+    // Only /pull sets "revision" (empty included); load-time, sync, Ollama and
+    // collection-component downloads omit it and so restore the pin instead.
+    model_info.release_pin = !do_not_upgrade && model_data.contains("revision") &&
+                             model_info.requested_revision.empty();
 
     const auto resolved_paths_before = deps_.store->resolved_paths_for(model_info.model_name);
 
@@ -886,6 +922,52 @@ void ModelIngest::pull(const std::string& model_name,
 
 }
 
+std::shared_ptr<std::mutex> ModelIngest::repo_download_lock(const ModelInfo& info) {
+    std::lock_guard<std::mutex> guard(download_locks_mutex_);
+    auto& slot = download_locks_[
+        registry_source_of(info) + ":" +
+        repo_id_from_checkpoint(info.checkpoint("main"))];
+    if (!slot) slot = std::make_shared<std::mutex>();
+    return slot;
+}
+
+void ModelIngest::forget_registry_provenance(const ModelInfo& info) {
+    const std::string main_repo_id = repo_id_from_checkpoint(info.checkpoint("main"));
+    if (main_repo_id.empty() || !info.source.empty()) {
+        return;
+    }
+    std::shared_ptr<std::mutex> repo_lock = repo_download_lock(info);
+    std::lock_guard<std::mutex> download_lock(*repo_lock);
+    const fs::path provenance_path =
+        path_from_utf8(artifacts().root()) /
+        backends::hf_cache::repo_id_to_cache_dir_name(main_repo_id, registry_source_of(info)) /
+        ".lemonade_registry.json";
+    if (!safe_exists(provenance_path)) {
+        return;
+    }
+    try {
+        json provenance = JsonUtils::load_from_file(path_to_utf8(provenance_path));
+        const auto models_it = provenance.find("processed_models");
+        if (models_it == provenance.end() || !models_it->is_object() ||
+            !models_it->contains(info.model_name)) {
+            return;
+        }
+        models_it->erase(info.model_name);
+        fs::path tmp = provenance_path;
+        tmp += ".tmp";
+        JsonUtils::save_to_file(provenance, path_to_utf8(tmp));
+        std::error_code ec;
+        fs::rename(tmp, provenance_path, ec);
+        if (ec) {
+            fs::remove(tmp, ec);
+            JsonUtils::save_to_file(provenance, path_to_utf8(provenance_path));
+        }
+    } catch (const std::exception& e) {
+        LOG(WARNING, "ModelManager") << "Could not update " << path_to_utf8(provenance_path)
+                                     << ": " << e.what() << std::endl;
+    }
+}
+
 void ModelIngest::fetch_model(const ModelInfo& info, bool do_not_upgrade,
                                  DownloadProgressCallback progress_callback,
                                  const utils::CancelToken& cancel) {
@@ -894,16 +976,23 @@ void ModelIngest::fetch_model(const ModelInfo& info, bool do_not_upgrade,
     // download is still running) must wait for the in-flight download instead
     // of writing the same .partial files concurrently, which corrupts them and
     // sends the hash verification into an endless retry-from-scratch loop.
-    std::shared_ptr<std::mutex> repo_lock;
-    {
-        std::lock_guard<std::mutex> guard(download_locks_mutex_);
-        auto& slot = download_locks_[
-            registry_source_of(info) + ":" +
-            repo_id_from_checkpoint(info.checkpoint("main"))];
-        if (!slot) slot = std::make_shared<std::mutex>();
-        repo_lock = slot;
-    }
+    std::shared_ptr<std::mutex> repo_lock = repo_download_lock(info);
     std::lock_guard<std::mutex> download_lock(*repo_lock);
+
+    // The pin is re-read under the repo lock: `info` may predate a pinned pull
+    // that finished while this download waited, and a download that does not
+    // release the pin must restore whatever is pinned now.
+    ModelInfo download_info = info;
+    const std::string main_repo_id = repo_id_from_checkpoint(info.checkpoint("main"));
+    const std::string current_pin = main_repo_id.empty()
+        ? std::string()
+        : registry_files::pinned_snapshot_id(
+              path_from_utf8(artifacts().root()) /
+                  backends::hf_cache::repo_id_to_cache_dir_name(main_repo_id,
+                                                                registry_source_of(info)),
+              info.model_name);
+    download_info.requested_revision = registry_files::download_revision(
+        info.requested_revision, info.release_pin, current_pin);
 
     // The backend's ops own the download (shared registry engine by default; flm pulls
     // via the flm CLI; cloud is a no-op).
@@ -911,7 +1000,7 @@ void ModelIngest::fetch_model(const ModelInfo& info, bool do_not_upgrade,
     octx.fetch = this;
     octx.artifacts = deps_.artifacts;
     octx.cancel = cancel;
-    backends::ops_for(info.recipe)->download_model(info, do_not_upgrade, progress_callback, octx);
+    backends::ops_for(info.recipe)->download_model(download_info, do_not_upgrade, progress_callback, octx);
 
     // Update cache after successful download
     deps_.store->patch_download(*deps_.artifacts, info.model_name, true);

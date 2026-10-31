@@ -104,6 +104,12 @@ UpdateScanResult run_update_scan(const UpdateScanDeps& deps,
                 continue;
             }
 
+            // A pinned model asked for one commit; reporting the branch tip as an
+            // update would let auto-update silently undo the pin.
+            if (!info.pinned_revision.empty()) {
+                continue;
+            }
+
             const std::string main_cp = info.checkpoint("main");
             if (main_cp.empty()) {
                 continue;

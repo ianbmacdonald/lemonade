@@ -96,6 +96,9 @@ json ModelJson::to_json(const std::string& model_id, const ModelInfo& info, int 
         checkpoint_status.push_back(std::move(entry));
     }
     model_json["checkpoint_status"] = std::move(checkpoint_status);
+    if (!info.pinned_revision.empty()) {
+        model_json["pinned_revision"] = info.pinned_revision;
+    }
 
     // The Model Manager buckets cloud models by provider. Local models omit the
     // field rather than carry an empty one.
@@ -230,6 +233,7 @@ nlohmann::ordered_json ModelJson::schema() {
             "max_completion_tokens": {"type": "integer", "description": "Cloud models only: `max_output_tokens` under its OpenAI name."},
             "downloaded": {"type": "boolean", "description": "Whether the model is downloaded."},
             "update_available": {"type": "boolean", "description": "Whether the model's registry has a newer commit; `false` except for downloaded registry models."},
+            "pinned_revision": {"type": "string", "description": "The commit a `/v1/pull` with `revision` pinned the model to; absent when the model follows its default branch."},
             "suggested": {"type": "boolean", "description": "Whether the model is recommended for general use."},
             "labels": {"type": "array", "items": {"type": "string"}, "description": "The model's capabilities and characteristics; see [Model Labels](./openai.md#model-labels)."},
             "image_defaults": {
