@@ -196,8 +196,8 @@ public:
     // The single live model of this type, or "" when none or more than one is
     // loaded. Endpoints that let the caller omit "model" use this so an
     // ambiguous choice is refused rather than silently resolved.
-    // include_dead_backends also counts a model whose backend has exited; the
-    // request that uses it then reloads it.
+    // include_dead_backends also counts a model whose backend has exited, but
+    // only when no live one matches; the request that uses it then reloads it.
     std::string get_sole_loaded_model_of_type(ModelType type, bool include_dead_backends = false) const;
 
     json get_all_loaded_models() const;
@@ -349,6 +349,7 @@ private:
     // Helper methods for multi-model management
     WrappedServer* find_server_by_model_name(const std::string& model_name) const;
     WrappedServer* get_most_recent_server() const;
+    WrappedServer* sole_loaded_server_of_type_locked(ModelType type, bool include_dead_backends) const;
     void prune_unavailable_servers_locked();
     bool reload_model_after_watchdog_reset(const std::string& requested_model, const RecipeOptions& options, uint64_t failed_instance_id = 0);
     bool is_watchdog_reset_response(const json& response) const;

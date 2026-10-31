@@ -1348,31 +1348,45 @@ std::string Router::get_loaded_recipe() const {
 
 std::string Router::get_sole_loaded_model_of_type(ModelType type, bool include_dead_backends) const {
     std::lock_guard<std::mutex> lock(load_mutex_);
+    WrappedServer* match = sole_loaded_server_of_type_locked(type, include_dead_backends);
+    return match ? model_manager_->get_public_model_name(match->get_model_name()) : "";
+}
 
-    WrappedServer* standard_match = nullptr;
-    WrappedServer* helper_match = nullptr;
-    bool helper_ambiguous = false;
+WrappedServer* Router::sole_loaded_server_of_type_locked(ModelType type,
+                                                         bool include_dead_backends) const {
+    struct Candidates {
+        WrappedServer* server = nullptr;
+        bool ambiguous = false;
+        void add(WrappedServer* s) {
+            if (server) {
+                ambiguous = true;
+            } else {
+                server = s;
+            }
+        }
+        WrappedServer* sole() const { return ambiguous ? nullptr : server; }
+    };
+    Candidates live_standard;
+    Candidates dead_standard;
+    Candidates helper;
     for (const auto& server : loaded_servers_) {
-        if ((!include_dead_backends && !server->is_backend_alive()) ||
-            server->get_model_type() != type) {
+        const bool alive = server->is_backend_alive();
+        if ((!include_dead_backends && !alive) || server->get_model_type() != type) {
             continue;
         }
         if (server->get_residency_class() == ResidencyClass::Standard) {
-            if (standard_match) return "";  // multiple user-facing models
-            standard_match = server.get();
-        } else if (helper_match) {
-            helper_ambiguous = true;
+            (alive ? live_standard : dead_standard).add(server.get());
         } else {
-            helper_match = server.get();
+            helper.add(server.get());
         }
     }
 
     // A single standard model remains an unambiguous default even while an
-    // internal router/classifier model of the same ModelType is resident.
-    WrappedServer* match = standard_match
-        ? standard_match
-        : (helper_ambiguous ? nullptr : helper_match);
-    return match ? model_manager_->get_public_model_name(match->get_model_name()) : "";
+    // internal router/classifier model of the same ModelType is resident, and
+    // a crashed one only stands in when no live one is loaded.
+    if (live_standard.server) return live_standard.sole();
+    if (dead_standard.server) return dead_standard.sole();
+    return helper.sole();
 }
 
 json Router::get_all_loaded_models() const {

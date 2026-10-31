@@ -126,6 +126,22 @@ struct RoutingHelperTestHook {
         return r.ensure_loaded_model_residency_canonical(model_name, load_purpose);
     }
 
+    static std::string sole_of_type(Router& r, lemon::ModelType type, bool include_dead) {
+        std::lock_guard<std::mutex> lock(r.load_mutex_);
+        WrappedServer* s = r.sole_loaded_server_of_type_locked(type, include_dead);
+        return s ? s->get_model_name() : "";
+    }
+
+    static void remove_server(Router& r, const std::string& model_name) {
+        std::lock_guard<std::mutex> lock(r.load_mutex_);
+        for (auto it = r.loaded_servers_.begin(); it != r.loaded_servers_.end(); ++it) {
+            if ((*it)->get_model_name() == model_name) {
+                r.loaded_servers_.erase(it);
+                return;
+            }
+        }
+    }
+
     static ResidencyClass residency_of(Router& r, const std::string& model_name) {
         std::lock_guard<std::mutex> lock(r.load_mutex_);
         for (const auto& s : r.loaded_servers_) {
@@ -475,6 +491,34 @@ static void test_shutdown_with_pending_reclaim(RuntimeConfig& config) {
     check("router shutdown wakes and joins a pending deferred reclaim", completed);
 }
 
+// A crashed model is kept loaded so a request can reload it; it must not make
+// a healthy model of the same type ambiguous.
+static void test_sole_model_prefers_live(Router& router) {
+    using lemon::ModelType;
+    StubWrappedServer* live = RoutingHelperTestHook::add_server(router, make_standard("sole.live"));
+    StubWrappedServer* dead = RoutingHelperTestHook::add_server(router, make_standard("sole.dead"));
+    dead->set_alive(false);
+    check("sole: one live and one dead standard model picks the live one",
+          RoutingHelperTestHook::sole_of_type(router, ModelType::CLASSIFICATION, true) == "sole.live");
+    check("sole: without dead backends the live one is picked too",
+          RoutingHelperTestHook::sole_of_type(router, ModelType::CLASSIFICATION, false) == "sole.live");
+    live->set_alive(false);
+    check("sole: two dead standard models are ambiguous",
+          RoutingHelperTestHook::sole_of_type(router, ModelType::CLASSIFICATION, true).empty());
+    RoutingHelperTestHook::remove_server(router, "sole.live");
+    check("sole: a lone dead model is picked when dead backends count",
+          RoutingHelperTestHook::sole_of_type(router, ModelType::CLASSIFICATION, true) == "sole.dead");
+    check("sole: a lone dead model is not picked otherwise",
+          RoutingHelperTestHook::sole_of_type(router, ModelType::CLASSIFICATION, false).empty());
+    RoutingHelperTestHook::add_server(router, make_standard("sole.live2"));
+    RoutingHelperTestHook::add_server(router, make_standard("sole.live3"));
+    check("sole: two live standard models stay ambiguous",
+          RoutingHelperTestHook::sole_of_type(router, ModelType::CLASSIFICATION, true).empty());
+    for (const char* name : {"sole.dead", "sole.live2", "sole.live3"}) {
+        RoutingHelperTestHook::remove_server(router, name);
+    }
+}
+
 int main() {
     json cfg = json::object();
     cfg["max_loaded_models"] = 4;
@@ -499,6 +543,10 @@ int main() {
         test_deferred_reclaim_waits_for_slot(router);
         test_reclaim_rearms_when_rescued_before_commit(router);
         test_stale_policy_does_not_promote_standard(router);
+    }
+    {
+        Router router(&config, nullptr, nullptr);
+        test_sole_model_prefers_live(router);
     }
 
     test_shutdown_with_pending_reclaim(config);
