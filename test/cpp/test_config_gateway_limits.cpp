@@ -13,6 +13,15 @@ using lemon::RuntimeConfig;
 using test_helpers::check;
 using test_helpers::report_results;
 
+static bool construct_throws(const json& config) {
+    try {
+        RuntimeConfig{config};
+        return false;
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+}
+
 static bool set_throws(const json& changes) {
     try {
         RuntimeConfig(json::object()).set(changes);
@@ -37,12 +46,16 @@ int main() {
     check(gateway.request_receive_timeout() == 30, "receive timeout read from config");
     check(gateway.max_connections_per_client() == 8, "per-client cap read from config");
 
-    const RuntimeConfig bad(json{{"max_request_body_mb", 0},
-                                 {"request_receive_timeout", -1},
-                                 {"max_connections_per_client", "8"}});
+    const RuntimeConfig bad(json{{"max_request_body_mb", 0}, {"request_receive_timeout", -1}});
     check(bad.max_request_body_mb() == 100, "out-of-range body limit falls back to the default");
     check(bad.request_receive_timeout() == 0, "negative timeout falls back to off");
-    check(bad.max_connections_per_client() == 0, "non-integer cap falls back to off");
+
+    check(construct_throws({{"max_connections_per_client", "8"}}),
+          "a string cap in config.json is refused, not read as off");
+    check(construct_throws({{"request_receive_timeout", "30"}}),
+          "a string timeout in config.json is refused, not read as off");
+    check(construct_throws({{"max_request_body_mb", 32.5}}),
+          "a fractional body limit in config.json is refused");
 
     const RuntimeConfig too_big(json{{"max_request_body_mb", 100000},
                                      {"request_receive_timeout", 7200},

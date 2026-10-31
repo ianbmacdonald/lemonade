@@ -311,6 +311,12 @@ RuntimeConfig::RuntimeConfig(const json& config)
     if (config_.contains("beacon_trusted_relays")) {
         parse_beacon_trusted_relays(config_["beacon_trusted_relays"]);
     }
+    // These read back as "off" when mistyped, which must not pass silently.
+    for (const char* key : {"max_request_body_mb", "request_receive_timeout", "max_connections_per_client"}) {
+        if (config_.contains(key) && !config_[key].is_number_integer()) {
+            throw std::invalid_argument(std::string("'") + key + "' must be an integer");
+        }
+    }
     // Migrate legacy no_broadcast if present
     if (config_.contains("no_broadcast")) {
         if (!config_["no_broadcast"].is_boolean()) {
