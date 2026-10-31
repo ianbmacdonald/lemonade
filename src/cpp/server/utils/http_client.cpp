@@ -1609,8 +1609,7 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
                     curl_slist_free_all(head_headers);
                     curl_easy_cleanup(head_curl);
 
-                    if (remote_size > 0 && static_cast<size_t>(remote_size) <= resume_from) {
-                        // Local file is >= remote size, file is complete
+                    if (remote_size > 0 && static_cast<size_t>(remote_size) == resume_from) {
                         LOG(INFO, "Download") << " File verified complete (local: "
                                   << (resume_from / (1024.0 * 1024.0)) << " MB, remote: "
                                   << (remote_size / (1024.0 * 1024.0)) << " MB)" << std::endl;
@@ -1618,7 +1617,7 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
                         result.bytes_downloaded = 0;
                         return result;
                     } else {
-                        // Local file is smaller than remote, or size unknown - corrupted or needs restart
+                        // A size mismatch either way, or an unknown size: restart
                         std::ostringstream oss;
                         oss << "Resume failed - local file (" << (resume_from / (1024.0 * 1024.0))
                             << " MB) doesn't match remote size (" << (remote_size / (1024.0 * 1024.0)) << " MB)";

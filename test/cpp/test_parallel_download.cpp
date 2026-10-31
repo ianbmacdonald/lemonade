@@ -624,6 +624,19 @@ int main() {
                 "after a refused resume the retry restarts and completes byte-identical");
     }
 
+    {
+        const fs::path f = dir / "oversized-partial.bin";
+        write_all(partial_of(f), small + "bytes past the end of the remote file");
+        auto options = parallel_options();
+        options.allow_parallel = false;
+        options.max_retries = 1;
+        auto result = HttpClient::download_file(base + "/small.bin", f.string(), nullptr, {},
+                                                options, policy);
+        log.take();
+        r.check(!result.success || read_all(f) == small,
+                "a partial longer than the remote file is never accepted as complete");
+    }
+
     server.stop();
     server_thread.join();
 
