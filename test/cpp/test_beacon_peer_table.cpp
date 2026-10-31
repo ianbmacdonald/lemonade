@@ -395,6 +395,19 @@ void test_pinned_junk_flood(Clock::time_point t0) {
     check(t.size() == 1, "pinned junk: legitimate row survives the flood");
 }
 
+void test_pinned_junk_parse_bound(Clock::time_point t0) {
+    BeaconPeerTable t;
+    uint32_t peer = ip(192, 168, 1, 40);
+    std::string good = beacon(url_for(peer), "legit");
+    check(feed(t, good, peer, t0) == IngestResult::Accepted, "pinned junk bound: peer accepted");
+    const auto now = t0 + std::chrono::milliseconds(1);
+    for (int i = 0; i < 5000; ++i) feed(t, "not json at all", peer, now);
+    check(t.stat(IngestResult::BadPayload) <= static_cast<uint64_t>(lemon::kGlobalBurst),
+          "pinned junk bound: junk stops being parsed once the global bucket is spent");
+    check(feed(t, good, peer, now) == IngestResult::Refreshed,
+          "pinned junk bound: the peer's real refresh still gets through");
+}
+
 void test_single_source_flood(Clock::time_point t0) {
     BeaconPeerTable t;
     uint32_t noisy = ip(10, 0, 0, 7);
@@ -574,6 +587,7 @@ int main() {
     test_rate_limit_per_source(t0);
     test_flood_survival(t0);
     test_pinned_junk_flood(t0);
+    test_pinned_junk_parse_bound(t0);
     test_single_source_flood(t0);
     test_trusted_relay(t0);
 

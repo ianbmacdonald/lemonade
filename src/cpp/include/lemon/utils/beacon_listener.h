@@ -88,6 +88,8 @@ struct HeardHost {
     uint32_t url_host = 0;
     // Datagram source when the host was heard through a trusted relay, else 0.
     uint32_t via = 0;
+    // The datagram that last created or refreshed the row.
+    std::string payload;
     std::chrono::system_clock::time_point first_seen_wall;
     std::chrono::system_clock::time_point last_seen_wall;
     std::chrono::steady_clock::time_point last_seen;
@@ -134,6 +136,7 @@ private:
     const BeaconTrustedRelay* relay_for_locked(uint32_t src_ip) const;
     bool take_global_token_locked(std::chrono::steady_clock::time_point now);
     bool is_pinned_locked(uint32_t src_ip) const;
+    bool is_repeat_locked(uint32_t src_ip, const char* buf, std::size_t len) const;
     void expire_locked(std::chrono::steady_clock::time_point now);
     IngestResult record_locked(IngestResult result);
 

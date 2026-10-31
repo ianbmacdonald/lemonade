@@ -328,6 +328,17 @@ bool BeaconPeerTable::is_pinned_locked(uint32_t src_ip) const {
     return false;
 }
 
+bool BeaconPeerTable::is_repeat_locked(uint32_t src_ip, const char* buf, std::size_t len) const {
+    if (buf == nullptr) return false;
+    for (const auto& [url, row] : rows_) {
+        if (row.source_ip_host_order == src_ip && row.payload.size() == len &&
+            std::memcmp(row.payload.data(), buf, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 BeaconPeerTable::SourceState& BeaconPeerTable::source_state_locked(uint32_t src_ip,
                                                                    steady_clock::time_point now) {
     auto it = sources_.find(src_ip);
@@ -400,20 +411,22 @@ IngestResult BeaconPeerTable::ingest(const char* buf, std::size_t len, bool trun
     if (!utils::is_rfc1918_ipv4(src_ip)) return record_locked(IngestResult::BadSource);
     expire_locked(now);
 
-    // Pinned sources (those owning a live row) skip the global bucket so a
-    // flood from other addresses cannot starve refreshes from known peers.
-    // Their per-source token is only spent on a structurally valid beacon:
-    // junk forged with a known peer's source IP must not drain the budget of
-    // that peer's real refreshes, so it is charged to the global bucket.
+    // A pinned source (one owning a live row) repeating the datagram that
+    // made or last refreshed its row skips the global bucket, so a flood from
+    // other addresses cannot starve refreshes from known peers. Anything else
+    // it sends may be junk forged with its source IP: that pays the global
+    // bucket before it is parsed, and never drains the peer's own budget.
     if (is_pinned_locked(src_ip)) {
         if (source_state_locked(src_ip, now).bucket.tokens < 1.0) {
             return record_locked(IngestResult::RateLimited);
         }
+        const bool repeat = is_repeat_locked(src_ip, buf, len);
+        if (!repeat && !take_global_token_locked(now)) {
+            return record_locked(IngestResult::RateLimited);
+        }
         IngestResult result = ingest_admitted_locked(buf, len, truncated, src_ip, now);
-        if (result == IngestResult::BadPayload || result == IngestResult::UrlMismatch ||
-            result == IngestResult::RelayHostRefused) {
-            take_global_token_locked(now);
-        } else {
+        if (repeat || (result != IngestResult::BadPayload && result != IngestResult::UrlMismatch &&
+                       result != IngestResult::RelayHostRefused)) {
             auto it = sources_.find(src_ip);
             if (it != sources_.end()) it->second.bucket.tokens -= 1.0;
         }
@@ -497,6 +510,7 @@ IngestResult BeaconPeerTable::ingest_admitted_locked(const char* buf, std::size_
         row.source_ip_host_order = src_ip;
         row.url_host = url_host;
         row.via = via;
+        row.payload.assign(buf, len);
         row.last_seen = now;
         row.last_seen_wall = wall;
         return record_locked(relay != nullptr ? IngestResult::RelayedRefreshed : IngestResult::Refreshed);
@@ -535,6 +549,7 @@ IngestResult BeaconPeerTable::ingest_admitted_locked(const char* buf, std::size_
     row.url_host = url_host;
     row.via = via;
     row.instance_id = instance_id;
+    row.payload.assign(buf, len);
     row.first_seen_wall = wall;
     row.last_seen_wall = wall;
     row.last_seen = now;
