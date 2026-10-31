@@ -199,7 +199,7 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
     <tr>
       <td rowspan="1"><code>vllm</code></td>
       <td><code>rocm</code>†</td>
-      <td>Strix Halo iGPU (gfx1151)</td>
+      <td>Strix Halo iGPU (gfx1151); AMD Instinct MI300X/MI355X (gfx942/gfx950)</td>
       <td>Linux</td>
     </tr>
     <tr>
@@ -209,8 +209,8 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
       <td>Linux</td>
     </tr>
     <tr>
-      <td rowspan="1"><code>litert</code> (experimental)</td>
-      <td><code>system</code></td>
+      <td rowspan="1"><code>litert</code></td>
+      <td><code>system</code>†</td>
       <td><code>x86_64</code>/ARM64 CPU</td>
       <td>Linux</td>
     </tr>
@@ -359,7 +359,7 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
       <td>Windows, Linux</td>
     </tr>
     <tr>
-      <td rowspan="3"><strong>Text classification</strong></td>
+      <td rowspan="5"><strong>Text classification</strong></td>
       <td rowspan="3"><code>onnxruntime</code></td>
       <td><code>cpu</code>†</td>
       <td><code>x86_64</code> CPU</td>
@@ -374,6 +374,18 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
       <td><code>cpu</code>†</td>
       <td><code>arm64</code> CPU</td>
       <td>macOS</td>
+    </tr>
+    <tr>
+      <td rowspan="1"><code>tflite</code></td>
+      <td><code>system</code>†</td>
+      <td><code>x86_64</code>/ARM64 CPU</td>
+      <td>Linux</td>
+    </tr>
+    <tr>
+      <td rowspan="1"><code>executorch</code></td>
+      <td><code>system</code>†</td>
+      <td><code>x86_64</code> CPU</td>
+      <td>Linux</td>
     </tr>
   </tbody>
 </table>
