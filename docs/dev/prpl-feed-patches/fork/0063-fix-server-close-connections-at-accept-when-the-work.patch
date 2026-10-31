@@ -1,0 +1,133 @@
+From cafaa97dc8edfcc93c4148dc1191bd0545b768ac Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 14:59:52 -0400
+Subject: [PATCH 63/71] fix(server): close connections at accept when the
+ worker queue is full
+
+Accepted sockets queued without bound ahead of the connection guard,
+which only runs once a worker picks a socket up. A LAN peer holding every
+worker could keep connecting until lemond ran out of descriptors. The
+pool queue is now bounded at twice the worker count, and httplib closes
+anything beyond that at accept.
+
+cpp-httplib 0.33 put max_threads ahead of max_queued_requests in the
+ThreadPool constructor. The helper picks the form the installed version
+takes, so system builds back to 0.26 still get a queue bound and not a
+thread ceiling.
+
+Assisted-by: claude:opus-5.5
+---
+ .../include/lemon/upgradable_http_server.h    | 14 +++++++++
+ src/cpp/server/core/http_listener.cpp         |  2 +-
+ test/cpp/test_connection_guard.cpp            | 30 +++++++++++++++++++
+ 3 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/src/cpp/include/lemon/upgradable_http_server.h b/src/cpp/include/lemon/upgradable_http_server.h
+index df132d62e..e458cebca 100644
+--- a/src/cpp/include/lemon/upgradable_http_server.h
++++ b/src/cpp/include/lemon/upgradable_http_server.h
+@@ -36,6 +36,7 @@
+ #include <memory>
+ #include <string>
+ #include <thread>
++#include <type_traits>
+ #include <utility>
+ #include <vector>
+ 
+@@ -105,6 +106,19 @@ inline void wrap_route_handlers(httplib::Server& srv, const std::function<void()
+     }
+ }
+ 
++// Connections the pool cannot take are closed at accept instead of queueing
++// without bound, each holding a descriptor. cpp-httplib 0.33 inserted
++// max_threads ahead of max_queued_requests, so a positional queue bound would
++// set the thread ceiling on newer versions.
++template <typename Pool = httplib::ThreadPool>
++httplib::TaskQueue* new_bounded_thread_pool(size_t threads, size_t max_queued) {
++    if constexpr (std::is_constructible<Pool, size_t, size_t, size_t>::value) {
++        return new Pool(threads, 0, max_queued);
++    } else {
++        return new Pool(threads, max_queued);
++    }
++}
++
+ // Peek the first bytes of an accepted connection (without consuming them) and
+ // decide whether it is a WebSocket upgrade for one of our realtime paths.
+ inline bool peek_websocket_upgrade(socket_t sock) {
+diff --git a/src/cpp/server/core/http_listener.cpp b/src/cpp/server/core/http_listener.cpp
+index 066450ec2..3f252430e 100644
+--- a/src/cpp/server/core/http_listener.cpp
++++ b/src/cpp/server/core/http_listener.cpp
+@@ -121,7 +121,7 @@ void HttpListener::create_servers() {
+     std::function<httplib::TaskQueue *(void)> task_queue_factory = [thread_count] {
+         LOG(DEBUG, "Server") << "Creating new thread pool with " << thread_count
+                              << " threads" << std::endl;
+-        return new httplib::ThreadPool(thread_count);
++        return detail::new_bounded_thread_pool(thread_count, thread_count * 2);
+     };
+ 
+     // The fronts own the accept loops (and therefore the task queues)
+diff --git a/test/cpp/test_connection_guard.cpp b/test/cpp/test_connection_guard.cpp
+index 09b8dd344..9c4ef4698 100644
+--- a/test/cpp/test_connection_guard.cpp
++++ b/test/cpp/test_connection_guard.cpp
+@@ -1,5 +1,9 @@
++#include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstdio>
++#include <memory>
++#include <mutex>
+ #include <string>
+ #include <thread>
+ #include <vector>
+@@ -13,6 +17,7 @@
+ #endif
+ 
+ #include <lemon/connection_guard.h>
++#include <lemon/upgradable_http_server.h>
+ 
+ #include "test_config_helpers.h"
+ 
+@@ -38,6 +43,30 @@ static void test_addresses() {
+     check(!ConnectionGuard::is_loopback(""), "an unreadable address is not loopback");
+ }
+ 
++static void test_bounded_task_queue() {
++    std::unique_ptr<httplib::TaskQueue> pool(lemon::detail::new_bounded_thread_pool(1, 2));
++    std::mutex mu;
++    std::condition_variable cv;
++    bool release = false;
++    std::atomic<bool> started{false};
++    check(pool->enqueue([&] {
++        started = true;
++        std::unique_lock<std::mutex> lock(mu);
++        cv.wait(lock, [&] { return release; });
++    }), "a connection goes to the idle worker");
++    while (!started) {
++        std::this_thread::sleep_for(1ms);
++    }
++    check(pool->enqueue([] {}) && pool->enqueue([] {}), "connections queue up to the bound");
++    check(!pool->enqueue([] {}), "a connection past the queue bound is refused");
++    {
++        std::lock_guard<std::mutex> lock(mu);
++        release = true;
++    }
++    cv.notify_all();
++    pool->shutdown();
++}
++
+ static void test_cap() {
+     ConnectionGuard::Limits limits;
+     limits.max_connections_per_client = 2;
+@@ -181,6 +210,7 @@ int main() {
+     std::puts("=== RUNNING CONNECTION GUARD TESTS ===");
+     test_addresses();
+     test_cap();
++    test_bounded_task_queue();
+ #ifndef _WIN32
+     test_deadline_logic();
+     test_watchdog_shuts_down_socket();
+-- 
+2.53.0
+

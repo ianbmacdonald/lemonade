@@ -1,7 +1,7 @@
-From bfaccb41eb2f3ff1629685b2ee200e01f9331910 Mon Sep 17 00:00:00 2001
+From c6e75c66221c73b839d715a01a88f2e0b98fa88f Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:41:41 -0400
-Subject: [PATCH 19/58] test: accept httplib's own 400 for Content-Length plus
+Subject: [PATCH 19/71] test: accept httplib's own 400 for Content-Length plus
  Transfer-Encoding
 
 Assisted-by: claude:opus-5.5

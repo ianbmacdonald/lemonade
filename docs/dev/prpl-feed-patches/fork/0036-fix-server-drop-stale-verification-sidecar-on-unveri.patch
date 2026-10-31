@@ -1,7 +1,7 @@
-From d3bbe9ca5e00e877a17675594f6e16900311e105 Mon Sep 17 00:00:00 2001
+From 774aa0b390acb0c29668d67e813f20c92305b959 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Wed, 12 Aug 2026 00:06:30 -0400
-Subject: [PATCH 36/58] fix(server): drop stale verification sidecar on
+Subject: [PATCH 36/71] fix(server): drop stale verification sidecar on
  unverified replacement
 
 Review round 1 intake (5 families). A download that replaces a file

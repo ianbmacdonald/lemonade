@@ -1,18 +1,22 @@
 # lemond prplOS feed patches
 
 `git format-patch` series that turn upstream lemonade into the
-`feed/prpl-lemond-no3956` tree the prplOS feed builds. Apply it with `git am` (or
-`patch -p1`) on top of the pinned upstream commit:
+`feed/prpl-lemond-no3956` tree the prplOS feed builds. Apply it with `git am --keep-cr`
+on top of the pinned upstream commit:
 
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 58 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base. |
+| Series: `fork/` | 71 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0071). |
 
 ```sh
 git checkout b9a4bc2cd
-git am docs/dev/prpl-feed-patches/fork/*.patch
+git am --keep-cr docs/dev/prpl-feed-patches/fork/*.patch
 ```
+
+`--keep-cr` is needed because 0070 edits `test/cpp/test_routing_helper_reconcile.cpp`,
+which has CRLF line endings upstream. `patch -p1` cannot apply the series: 0016 adds a
+binary test image (`test/test_image_grace_hopper.jpg`) as a git binary diff.
 
 The result is byte-identical to `feed/prpl-lemond-no3956` minus this directory and
 `docs/dev/prpl-feed-dependencies.md` (checked by applying the series to a clean

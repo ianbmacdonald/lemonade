@@ -1,7 +1,7 @@
-From d0473e63f1b00aebc3a9196e16c712b3e19ed2dc Mon Sep 17 00:00:00 2001
+From 7ef2d13fbc549dc66857bf2fdb32779cdfa248ee Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:13:52 -0400
-Subject: [PATCH 11/58] feat(health): report per-backend and server memory in
+Subject: [PATCH 11/71] feat(health): report per-backend and server memory in
  /v1/health
 
 Each all_models_loaded entry with a live pid now carries rss_mib (VmRSS)

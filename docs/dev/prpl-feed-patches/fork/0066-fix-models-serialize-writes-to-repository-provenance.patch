@@ -1,0 +1,163 @@
+From 4704d36e2a76be36ec8a89dc37a715c8187885d1 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 15:00:34 -0400
+Subject: [PATCH 66/71] fix(models): serialize writes to repository provenance
+ files
+
+Pulls of different models hold different repository locks but can record
+into the same shared auxiliary repository. Each write loads the file,
+changes it and saves it through one fixed .tmp name. Two pulls could
+interleave, and one would then drop the other's entry and pin. A single
+process-wide lock now covers the read-modify-write in
+record_processed_model and in forget_registry_provenance. Nothing else
+is locked while it is held, so it cannot deadlock. Because writers no
+longer overlap, the shared .tmp name is now safe.
+
+Assisted-by: claude:opus-5.5
+---
+ .../lemon/models/repository_provenance.h      |  7 ++++
+ src/cpp/server/models/ingest.cpp              |  2 +
+ .../server/models/repository_provenance.cpp   |  6 +++
+ test/cpp/test_registry_provenance.cpp         | 42 +++++++++++++++++++
+ 4 files changed, 57 insertions(+)
+
+diff --git a/src/cpp/include/lemon/models/repository_provenance.h b/src/cpp/include/lemon/models/repository_provenance.h
+index 63125c769..8fff1d9b0 100644
+--- a/src/cpp/include/lemon/models/repository_provenance.h
++++ b/src/cpp/include/lemon/models/repository_provenance.h
+@@ -3,6 +3,7 @@
+ #include <lemon/models/artifact_store.h>
+ 
+ #include <filesystem>
++#include <mutex>
+ #include <string>
+ 
+ namespace lemon {
+@@ -26,6 +27,12 @@ void remove_unused_snapshot(const std::filesystem::path& repo_cache_dir,
+ std::string processed_snapshot_id(const std::filesystem::path& repo_cache_dir,
+                                   const ModelInfo& info);
+ 
++// Held across every read-modify-write of a provenance file. Pulls of different
++// models hold different repository locks yet share auxiliary repositories, so
++// without it one pull's write can drop another's pin. A leaf lock: take no
++// other lock while holding it.
++std::mutex& provenance_file_mutex();
++
+ // checkpoint_type names the slot whose bytes landed in this repository; empty means main.
+ void record_processed_model(const std::filesystem::path& repo_cache_dir, const ModelInfo& info,
+                             const Provenance& provenance, const std::string& checkpoint_type);
+diff --git a/src/cpp/server/models/ingest.cpp b/src/cpp/server/models/ingest.cpp
+index fb18ac997..ee4660f0c 100644
+--- a/src/cpp/server/models/ingest.cpp
++++ b/src/cpp/server/models/ingest.cpp
+@@ -21,6 +21,7 @@
+ #include <lemon/models/registry_descriptors.h>
+ #include <lemon/models/routing_parse_options.h>
+ #include <lemon/models/registry_documents.h>
++#include <lemon/models/repository_provenance.h>
+ #include <lemon/models/store.h>
+ #include <lemon/registry_files.h>
+ #include <lemon/runtime_config.h>
+@@ -942,6 +943,7 @@ void ModelIngest::forget_registry_provenance(const ModelInfo& info) {
+         path_from_utf8(artifacts().root()) /
+         backends::hf_cache::repo_id_to_cache_dir_name(main_repo_id, registry_source_of(info)) /
+         ".lemonade_registry.json";
++    std::lock_guard<std::mutex> provenance_lock(models::provenance_file_mutex());
+     if (!safe_exists(provenance_path)) {
+         return;
+     }
+diff --git a/src/cpp/server/models/repository_provenance.cpp b/src/cpp/server/models/repository_provenance.cpp
+index 44bfe2d89..d181178dd 100644
+--- a/src/cpp/server/models/repository_provenance.cpp
++++ b/src/cpp/server/models/repository_provenance.cpp
+@@ -109,10 +109,16 @@ std::string processed_snapshot_id(const fs::path& repo_cache_dir, const ModelInf
+ // say: which checkpoint of the model landed here. An auxiliary repository
+ // records only its own checkpoint, so a shared side cache knows every model
+ // that filled it without any of them claiming the whole model.
++std::mutex& provenance_file_mutex() {
++    static std::mutex mutex;
++    return mutex;
++}
++
+ void record_processed_model(const fs::path& repo_cache_dir, const ModelInfo& info,
+                               const Provenance& provenance, const std::string& checkpoint_type) {
+     const fs::path provenance_path = repo_cache_dir / kProvenanceFile;
+     const bool is_main = checkpoint_type.empty() || checkpoint_type == "main";
++    std::lock_guard<std::mutex> lock(provenance_file_mutex());
+ 
+     json previous;
+     json processed = json::object();
+diff --git a/test/cpp/test_registry_provenance.cpp b/test/cpp/test_registry_provenance.cpp
+index c2380dcee..8ec4e2bfe 100644
+--- a/test/cpp/test_registry_provenance.cpp
++++ b/test/cpp/test_registry_provenance.cpp
+@@ -9,10 +9,12 @@
+ 
+ #include <nlohmann/json.hpp>
+ 
++#include <atomic>
+ #include <filesystem>
+ #include <fstream>
+ #include <iostream>
+ #include <string>
++#include <thread>
+ 
+ namespace fs = std::filesystem;
+ using lemon::ModelInfo;
+@@ -166,6 +168,45 @@ void test_a_moved_main_snapshot_keeps_the_one_it_left_named() {
+           "the checkpoint slot moves to the new snapshot");
+ }
+ 
++// Pulls of different models hold different repository locks, so two of them
++// can record into one shared repository at the same moment.
++void test_concurrent_writes_to_a_shared_file_keep_every_entry() {
++    ModelArtifactStore store = make_store();
++    const fs::path aux_dir = lemon::test::make_scratch_dir("concurrent-aux");
++
++    ModelInfo first = two_checkpoint_model();
++    ModelInfo second = first;
++    second.model_name = "user.Other-Part";
++    Provenance pin = provenance("vendor/aux", "snap-aux-1");
++    pin.pinned = true;
++
++    bool every_round_kept_both = true;
++    for (int round = 0; round < 200 && every_round_kept_both; ++round) {
++        fs::remove(aux_dir / ".lemonade_registry.json");
++        std::atomic<int> ready{0};
++        auto writer = [&](const ModelInfo& info, const Provenance& p, const std::string& type) {
++            ++ready;
++            while (ready.load() < 2) {
++            }
++            store.record_processed_model(aux_dir, info, p, type);
++        };
++        std::thread a(writer, std::cref(first), provenance("vendor/aux", "snap-aux-1"), "side");
++        std::thread b(writer, std::cref(second), pin, "main");
++        a.join();
++        b.join();
++        try {
++            const nlohmann::json file = read(aux_dir);
++            every_round_kept_both = file["processed_models"].contains("user.Two-Part") &&
++                                    file["processed_models"].contains("user.Other-Part") &&
++                                    file["processed_models"]["user.Other-Part"].value(
++                                        "pinned_revision", "") == "snap-aux-1";
++        } catch (const std::exception&) {
++            every_round_kept_both = false;
++        }
++    }
++    check(every_round_kept_both, "concurrent writers to one file keep both entries and the pin");
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -175,6 +216,7 @@ int main() {
+     test_a_v2_write_records_each_checkpoint_where_it_lands();
+     test_two_models_share_an_auxiliary_file_without_quarrelling();
+     test_a_moved_main_snapshot_keeps_the_one_it_left_named();
++    test_concurrent_writes_to_a_shared_file_keep_every_entry();
+ 
+     if (!g_failures.empty()) {
+         std::cerr << g_failures.size() << " failure(s)" << std::endl;
+-- 
+2.53.0
+

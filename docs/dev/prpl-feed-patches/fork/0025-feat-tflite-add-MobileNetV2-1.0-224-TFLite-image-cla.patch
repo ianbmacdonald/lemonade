@@ -1,7 +1,7 @@
-From e8e4340159224014d25a80058f24642f610b4584 Mon Sep 17 00:00:00 2001
+From b9177db0becdfd44f0ac04717498489ad23af04e Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:28:33 -0400
-Subject: [PATCH 25/58] feat(tflite): add MobileNetV2-1.0-224-TFLite image
+Subject: [PATCH 25/71] feat(tflite): add MobileNetV2-1.0-224-TFLite image
  classifier to the registry
 
 The checkpoint is a complete tflite-server image model directory

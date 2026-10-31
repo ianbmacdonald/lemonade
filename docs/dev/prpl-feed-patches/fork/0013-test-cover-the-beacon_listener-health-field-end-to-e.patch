@@ -1,7 +1,7 @@
-From d2be850fa4f607901873ca9ec61e85281f4f66fc Mon Sep 17 00:00:00 2001
+From 549d881183cb91c4133c3f7e8a1705d0c1f77e4a Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:36:32 -0400
-Subject: [PATCH 13/58] test: cover the beacon_listener health field end to end
+Subject: [PATCH 13/71] test: cover the beacon_listener health field end to end
 
 Toggle beacon_listen at runtime, check the field on all four health
 prefixes, inject a limited-broadcast beacon and a url-mismatch beacon, and

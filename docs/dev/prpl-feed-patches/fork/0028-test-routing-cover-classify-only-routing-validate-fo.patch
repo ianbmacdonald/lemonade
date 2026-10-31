@@ -1,7 +1,7 @@
-From be004b15e3a7a652288f4126029fc2d22d1588a2 Mon Sep 17 00:00:00 2001
+From 36324036e470ffae804db97dc47158dd6dffb001 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:47:41 -0400
-Subject: [PATCH 28/58] test(routing): cover classify-only /routing/validate
+Subject: [PATCH 28/71] test(routing): cover classify-only /routing/validate
  for registered routers
 
 Assisted-by: claude:opus-5.5

@@ -1,0 +1,57 @@
+From c50aa3f6fb892a1bd76239a5a7a4eb009d1d7829 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 14:44:17 -0400
+Subject: [PATCH 61/71] fix(router): do not evict-and-retry a load refused for
+ its arguments
+
+A /load with a reserved *_args flag threw std::invalid_argument, which
+the router treated as retryable: it unloaded every other model and
+tried the same refused arguments again.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/router.cpp              | 6 ++++++
+ test/cpp/test_backend_load_failure.cpp | 3 +++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/src/cpp/server/router.cpp b/src/cpp/server/router.cpp
+index 72e3cf1c0..67bbf55da 100644
+--- a/src/cpp/server/router.cpp
++++ b/src/cpp/server/router.cpp
+@@ -23,6 +23,7 @@
+ #include <lemon/model_manager.h>
+ #include <mutex>
+ #include <queue>
++#include <stdexcept>
+ #include <thread>
+ #include "lemon/utils/aixlog.hpp"
+ #include "lemon/global_vram_monitor.h"
+@@ -127,6 +128,11 @@ bool Router::load_error_skips_nuclear_retry(const std::exception& error) {
+     if (dynamic_cast<const NonRetryableLoadException*>(&error) != nullptr) {
+         return true;
+     }
++    // Refused request arguments (a reserved *_args flag) are refused again
++    // after an eviction; retrying would only unload every other model.
++    if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
++        return true;
++    }
+     // A missing file stays missing after an eviction, so it is the one
+     // message-classified exception to the nuclear policy.
+     const std::string message = error.what();
+diff --git a/test/cpp/test_backend_load_failure.cpp b/test/cpp/test_backend_load_failure.cpp
+index 08b200c2b..7ac38a099 100644
+--- a/test/cpp/test_backend_load_failure.cpp
++++ b/test/cpp/test_backend_load_failure.cpp
+@@ -71,6 +71,9 @@ static void test_nuclear_retry_classification() {
+     check("a missing file still skips it",
+           Router::load_error_skips_nuclear_retry(
+               std::runtime_error("Model directory not found for checkpoint: x")));
++    check("refused request arguments skip it",
++          Router::load_error_skips_nuclear_retry(std::invalid_argument(
++              "Invalid custom tflite-server arguments:\nArgument '--host' is managed by Lemonade")));
+     check("a generic failure keeps it",
+           !Router::load_error_skips_nuclear_retry(
+               std::runtime_error("llama-server failed to allocate VRAM")));
+-- 
+2.53.0
+

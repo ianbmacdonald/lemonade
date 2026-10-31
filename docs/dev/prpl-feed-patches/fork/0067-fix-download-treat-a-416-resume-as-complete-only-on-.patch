@@ -1,0 +1,67 @@
+From 94010c1be956253c91c91ecb177be3e7a9e4a7cc Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 15:00:34 -0400
+Subject: [PATCH 67/71] fix(download): treat a 416 resume as complete only on
+ an exact size match
+
+When a resume was answered with 416, a local partial at least as large as
+the remote file was promoted as complete. A partial that is larger than
+the remote file is not the remote file. Only an exact size match now
+counts as complete. Any other size forces a fresh download.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/utils/http_client.cpp |  5 ++---
+ test/cpp/test_parallel_download.cpp  | 13 +++++++++++++
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/src/cpp/server/utils/http_client.cpp b/src/cpp/server/utils/http_client.cpp
+index 4e13e476b..fe070a401 100644
+--- a/src/cpp/server/utils/http_client.cpp
++++ b/src/cpp/server/utils/http_client.cpp
+@@ -1609,8 +1609,7 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
+                     curl_slist_free_all(head_headers);
+                     curl_easy_cleanup(head_curl);
+ 
+-                    if (remote_size > 0 && static_cast<size_t>(remote_size) <= resume_from) {
+-                        // Local file is >= remote size, file is complete
++                    if (remote_size > 0 && static_cast<size_t>(remote_size) == resume_from) {
+                         LOG(INFO, "Download") << " File verified complete (local: "
+                                   << (resume_from / (1024.0 * 1024.0)) << " MB, remote: "
+                                   << (remote_size / (1024.0 * 1024.0)) << " MB)" << std::endl;
+@@ -1618,7 +1617,7 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
+                         result.bytes_downloaded = 0;
+                         return result;
+                     } else {
+-                        // Local file is smaller than remote, or size unknown - corrupted or needs restart
++                        // A size mismatch either way, or an unknown size: restart
+                         std::ostringstream oss;
+                         oss << "Resume failed - local file (" << (resume_from / (1024.0 * 1024.0))
+                             << " MB) doesn't match remote size (" << (remote_size / (1024.0 * 1024.0)) << " MB)";
+diff --git a/test/cpp/test_parallel_download.cpp b/test/cpp/test_parallel_download.cpp
+index 636ba7337..b3927b804 100644
+--- a/test/cpp/test_parallel_download.cpp
++++ b/test/cpp/test_parallel_download.cpp
+@@ -624,6 +624,19 @@ int main() {
+                 "after a refused resume the retry restarts and completes byte-identical");
+     }
+ 
++    {
++        const fs::path f = dir / "oversized-partial.bin";
++        write_all(partial_of(f), small + "bytes past the end of the remote file");
++        auto options = parallel_options();
++        options.allow_parallel = false;
++        options.max_retries = 1;
++        auto result = HttpClient::download_file(base + "/small.bin", f.string(), nullptr, {},
++                                                options, policy);
++        log.take();
++        r.check(!result.success || read_all(f) == small,
++                "a partial longer than the remote file is never accepted as complete");
++    }
++
+     server.stop();
+     server_thread.join();
+ 
+-- 
+2.53.0
+

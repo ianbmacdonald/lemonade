@@ -1,7 +1,7 @@
-From 26b1ad8cca074a8f4d72e64cc52a0e595028e449 Mon Sep 17 00:00:00 2001
+From ca25206202b29caceef1e53d04fd1bb6db22177a Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 26 Sep 2026 22:06:26 -0400
-Subject: [PATCH 06/58] feat(litert): add Gemma3-1B-IT-LiteRT as the suggested
+Subject: [PATCH 06/71] feat(litert): add Gemma3-1B-IT-LiteRT as the suggested
  litert model
 
 Flat ~0.5 GiB anonymous RSS across requests on a 2 GB x86 gateway, where

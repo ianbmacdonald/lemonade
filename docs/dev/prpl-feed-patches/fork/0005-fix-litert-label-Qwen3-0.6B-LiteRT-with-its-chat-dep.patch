@@ -1,7 +1,7 @@
-From 876f653d406e88385dbd57e24d988e921af13e2a Mon Sep 17 00:00:00 2001
+From 0f585f490404678e8a873416044c0453fe382e61 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 26 Sep 2026 21:33:36 -0400
-Subject: [PATCH 05/58] fix(litert): label Qwen3-0.6B-LiteRT with its chat
+Subject: [PATCH 05/71] fix(litert): label Qwen3-0.6B-LiteRT with its chat
  deployment mode
 
 Assisted-by: claude:opus-5.5

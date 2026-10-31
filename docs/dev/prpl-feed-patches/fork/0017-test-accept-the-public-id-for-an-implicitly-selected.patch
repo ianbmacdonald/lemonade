@@ -1,7 +1,7 @@
-From aca315a14f8a7ed6aa1d2774149fdf712b8d7f13 Mon Sep 17 00:00:00 2001
+From af69875bdd28ff7cbf46c6537103cc876348ad60 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:25:56 -0400
-Subject: [PATCH 17/58] test: accept the public id for an implicitly selected
+Subject: [PATCH 17/71] test: accept the public id for an implicitly selected
  image model
 
 Assisted-by: claude:opus-5.5

@@ -1,7 +1,7 @@
-From f97d399a41b1129976ae92a542cfc2a1c06f8315 Mon Sep 17 00:00:00 2001
+From 6acb6e9f240cb119cb97e2bb140dad2d7329d686 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 21 Jul 2026 12:33:03 -0400
-Subject: [PATCH 01/58] feat: add LiteRT backend (litert-lm-server subprocess,
+Subject: [PATCH 01/71] feat: add LiteRT backend (litert-lm-server subprocess,
  system PATH binary)
 
 New 'litert' recipe backend that launches litert-lm-server (an OpenAI-compatible

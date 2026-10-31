@@ -1,7 +1,7 @@
-From cdc5fdadbed98f1f3bc51b1b237df45d440cf997 Mon Sep 17 00:00:00 2001
+From 799f257c6ead820d96bc3d01e6cf22eea56f86d2 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:23:37 -0400
-Subject: [PATCH 22/58] test: cover tflite in backend mode contract
+Subject: [PATCH 22/71] test: cover tflite in backend mode contract
 
 Assisted-by: claude:opus-5.5
 ---

@@ -1,7 +1,7 @@
-From 92af73166ce9207e98d81a074e9471b613a1f551 Mon Sep 17 00:00:00 2001
+From 4bb5a945a7e557db363271d067587b9da813528b Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 01:40:35 -0400
-Subject: [PATCH 54/58] fix: drop the descriptor experimental flag upstream
+Subject: [PATCH 54/71] fix: drop the descriptor experimental flag upstream
  replaced with tiers
 
 Assisted-by: claude:opus-5.5

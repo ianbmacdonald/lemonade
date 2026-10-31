@@ -1,0 +1,366 @@
+From df22b8c7f1b295af53d5bbe70b4ff97ded2538c9 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 14:27:46 -0400
+Subject: [PATCH 59/71] fix(backends): refuse --host and --weight-cache in
+ tflite/executorch args
+
+tflite_args and executorch_args come from the /load request body. Both
+engines accept --host, so a request could bind the engine to the LAN
+outside lemond's API key, and --weight-cache could point the engine's
+cache write anywhere. Reserve both flags, as litert already reserves
+--host.
+
+Also from the F2 review: tflite and litert load failures are now
+non-retryable (evicting other models cannot fix a CPU engine), tflite
+no longer relaunches an engine the OOM killer stopped, and
+/images/classify sorts scores and keeps the highest per label instead
+of trusting the backend's order.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                                |  7 +++
+ .../lemon/backends/executorch/executorch.h    | 12 +++++
+ .../include/lemon/backends/tflite/tflite.h    | 14 ++++++
+ .../backends/executorch/executorch_server.cpp |  5 +-
+ .../server/backends/litert/litert_server.cpp  |  4 +-
+ .../server/backends/tflite/tflite_server.cpp  | 39 +++++++++------
+ .../lemonade/inference/images_classify.cpp    | 10 +++-
+ test/cpp/test_engine_reserved_args.cpp        | 50 +++++++++++++++++++
+ test/server_image_classify.py                 | 13 +++++
+ 9 files changed, 134 insertions(+), 20 deletions(-)
+ create mode 100644 test/cpp/test_engine_reserved_args.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b8a488ac7..80b5a7690 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3993,6 +3993,13 @@ if(BUILD_TESTING AND EXISTS "${_DS4_INSTALL_TEST_SRC}")
+     add_cpp_ci_test(Ds4InstallParamsTest CI ON COMMAND test_ds4_install_params)
+ endif()
+ 
++set(_ENGINE_RESERVED_ARGS_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_engine_reserved_args.cpp")
++if(BUILD_TESTING AND EXISTS "${_ENGINE_RESERVED_ARGS_TEST_SRC}")
++    add_executable(test_engine_reserved_args test/cpp/test_engine_reserved_args.cpp)
++    target_link_libraries(test_engine_reserved_args PRIVATE lemonade-server-core)
++    add_cpp_ci_test(EngineReservedArgsTest CI ON COMMAND test_engine_reserved_args)
++endif()
++
+ # llamacpp gfx950 (MI350) install gate: only the Linux + stable-channel asset is
+ # published, so the shared Windows/Linux support row must not advertise Windows
+ # or nightly installs for gfx950.
+diff --git a/src/cpp/include/lemon/backends/executorch/executorch.h b/src/cpp/include/lemon/backends/executorch/executorch.h
+index 623c8236c..6a54045bd 100644
+--- a/src/cpp/include/lemon/backends/executorch/executorch.h
++++ b/src/cpp/include/lemon/backends/executorch/executorch.h
+@@ -2,10 +2,22 @@
+ 
+ #include "lemon/backends/backend_descriptor.h"
+ 
++#include <set>
++#include <string>
++
+ namespace lemon {
+ namespace backends {
+ namespace executorch {
+ 
++// Arguments executorch_args must not carry; same reasons as
++// tflite::reserved_custom_arg_flags (the request body sets them).
++inline const std::set<std::string>& reserved_custom_arg_flags() {
++    static const std::set<std::string> flags = {
++        "--model-path", "--port", "--host", "--weight-cache",
++    };
++    return flags;
++}
++
+ // Serves text classification on /v1/classify through an et-server subprocess,
+ // which speaks the same ort-server /classify contract as tflite-server over an
+ // exported ExecuTorch program (model.pte). The binary is pre-built and found on
+diff --git a/src/cpp/include/lemon/backends/tflite/tflite.h b/src/cpp/include/lemon/backends/tflite/tflite.h
+index 23e856eab..8bff64ce4 100644
+--- a/src/cpp/include/lemon/backends/tflite/tflite.h
++++ b/src/cpp/include/lemon/backends/tflite/tflite.h
+@@ -2,10 +2,24 @@
+ 
+ #include "lemon/backends/backend_descriptor.h"
+ 
++#include <set>
++#include <string>
++
+ namespace lemon {
+ namespace backends {
+ namespace tflite {
+ 
++// Arguments tflite_args must not carry. tflite_args comes from the /load
++// request body: --host would publish the engine on the LAN without lemond's
++// API key, and --weight-cache would make the engine write a file at a path
++// the caller chooses.
++inline const std::set<std::string>& reserved_custom_arg_flags() {
++    static const std::set<std::string> flags = {
++        "--model-path", "--port", "--host", "--weight-cache",
++    };
++    return flags;
++}
++
+ // The TFLite backend descriptor (plain data). Serves text classification on
+ // /v1/classify through a tflite-server subprocess: the ort-server /classify
+ // contract on a LiteRT engine, so the same model directory layout (plus
+diff --git a/src/cpp/server/backends/executorch/executorch_server.cpp b/src/cpp/server/backends/executorch/executorch_server.cpp
+index 1ef126feb..608705a5f 100644
+--- a/src/cpp/server/backends/executorch/executorch_server.cpp
++++ b/src/cpp/server/backends/executorch/executorch_server.cpp
+@@ -14,7 +14,6 @@
+ #include "lemon/utils/process_manager.h"
+ #include <algorithm>
+ #include <filesystem>
+-#include <set>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+@@ -178,9 +177,9 @@ void ExecutorchServer::load(const std::string& model_name,
+         "--port", std::to_string(port),
+     };
+ 
+-    std::set<std::string> reserved_flags = {"--model-path", "--port"};
+     if (!extra_args.empty()) {
+-        std::string validation_error = validate_custom_args(extra_args, reserved_flags);
++        std::string validation_error =
++            validate_custom_args(extra_args, executorch::reserved_custom_arg_flags());
+         if (!validation_error.empty()) {
+             throw std::invalid_argument("Invalid custom et-server arguments:\n" + validation_error);
+         }
+diff --git a/src/cpp/server/backends/litert/litert_server.cpp b/src/cpp/server/backends/litert/litert_server.cpp
+index dffbb9d67..d61ba8934 100644
+--- a/src/cpp/server/backends/litert/litert_server.cpp
++++ b/src/cpp/server/backends/litert/litert_server.cpp
+@@ -4,6 +4,7 @@
+ #include "lemon/backends/backend_ops.h"
+ #include "lemon/backends/backend_utils.h"
+ #include "lemon/backend_manager.h"
++#include "lemon/error_types.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
+ #include "lemon/utils/path_utils.h"
+@@ -110,7 +111,8 @@ void LiteRtServer::load(const std::string& model_name,
+                      command);
+     } catch (const std::runtime_error&) {
+         if (load_cancelled()) throw;
+-        throw std::runtime_error("litert-lm-server failed to start or become ready");
++        // A CPU engine that fails to start is not fixed by evicting other models.
++        throw NonRetryableLoadException("litert-lm-server failed to start or become ready");
+     }
+     LOG(INFO, "LiteRtServer") << "Server is ready!" << std::endl;
+ }
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index 2308e0393..2f660bde3 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -7,6 +7,7 @@
+ #include "lemon/backends/hf_cache_util.h"
+ #include "lemon/backend_manager.h"
+ #include "lemon/classify_text_limit.h"
++#include "lemon/error_types.h"
+ #include "lemon/image_classify_request.h"
+ #include "lemon/utils/path_utils.h"
+ #include "lemon/utils/custom_args.h"
+@@ -14,7 +15,6 @@
+ #include "lemon/utils/process_manager.h"
+ #include <algorithm>
+ #include <filesystem>
+-#include <set>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+@@ -173,7 +173,7 @@ void TfliteServer::load(const std::string& model_name,
+     // the resolved path is the only candidate.
+     auto candidates = tflite::find_complete_model_dirs(path_from_utf8(model_path));
+     if (candidates.empty()) {
+-        throw std::runtime_error(
++        throw NonRetryableLoadException(
+             "No servable model directory under '" + model_path +
+             "': need model.tflite + tokenizer.json + config.json for a text classifier "
+             "(manifest.json is optional and overrides the output contract), or "
+@@ -183,7 +183,7 @@ void TfliteServer::load(const std::string& model_name,
+     if (candidates.size() > 1) {
+         std::string listing;
+         for (const auto& c : candidates) listing += "\n  " + path_to_utf8(c);
+-        throw std::runtime_error(
++        throw NonRetryableLoadException(
+             "Ambiguous model layout under '" + model_path + "': " +
+             std::to_string(candidates.size()) +
+             " complete model directories found — keep exactly one:" + listing);
+@@ -196,7 +196,7 @@ void TfliteServer::load(const std::string& model_name,
+     const tflite::TfliteLayout wanted =
+         wants_image ? tflite::TfliteLayout::Image : tflite::TfliteLayout::Text;
+     if (layout != wanted) {
+-        throw std::runtime_error(
++        throw NonRetryableLoadException(
+             "Model '" + model_name + "' is labeled " + model_type_to_string(model_info.type) +
+             " and needs a " + tflite::tflite_layout_name(wanted) + " layout, but '" +
+             model_path + "' is a " + tflite::tflite_layout_name(layout) + " layout");
+@@ -218,15 +218,12 @@ void TfliteServer::load(const std::string& model_name,
+ 
+     // XNNPACK otherwise packs the weights into anonymous memory once per
+     // signature; a cache file holds one packed copy, mapped and shared.
+-    bool has_weight_cache = extra_args.find("--weight-cache") != std::string::npos;
+-    if (!has_weight_cache) {
+-        args.push_back("--weight-cache");
+-        args.push_back(path_to_utf8(path_from_utf8(model_path) / "model.tflite.xnnpack_cache"));
+-    }
++    args.push_back("--weight-cache");
++    args.push_back(path_to_utf8(path_from_utf8(model_path) / "model.tflite.xnnpack_cache"));
+ 
+-    std::set<std::string> reserved_flags = {"--model-path", "--port"};
+     if (!extra_args.empty()) {
+-        std::string validation_error = validate_custom_args(extra_args, reserved_flags);
++        std::string validation_error =
++            validate_custom_args(extra_args, tflite::reserved_custom_arg_flags());
+         if (!validation_error.empty()) {
+             throw std::invalid_argument("Invalid custom tflite-server arguments:\n" + validation_error);
+         }
+@@ -243,13 +240,25 @@ void TfliteServer::load(const std::string& model_name,
+         start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
+                      command);
+     } catch (const std::runtime_error&) {
+-        if (load_cancelled()) throw;
++        // Non-retryable for the same reason as et-server: tflite-server is
++        // CPU-only, so evicting other models cannot fix a failed start.
++        if (load_cancelled()) throw NonRetryableLoadException("tflite-server load cancelled");
++        const int exit_code = startup_exit_code();
++        if (exit_code < 0) {
++            throw NonRetryableLoadException("tflite-server did not become ready");
++        }
++        if (exit_code == 128 + 9) {
++            // SIGKILL during load is the OOM killer's signature; relaunching to
++            // capture stderr would repeat the full load under the same pressure.
++            throw NonRetryableLoadException(
++                "tflite-server was killed by signal 9 (likely out of memory)");
++        }
+         // The subprocess's stderr is invisible when lemond runs windowless (CI,
+         // tray), so a startup failure would otherwise surface only as "not
+         // ready". Re-run it briefly to capture the reason it refused the model.
+         std::string details = capture_startup_error(executable, args);
+-        throw std::runtime_error("tflite-server failed to start or become ready" +
+-                                 (details.empty() ? "" : ": " + details));
++        throw NonRetryableLoadException("tflite-server failed to start or become ready" +
++                                        (details.empty() ? "" : ": " + details));
+     }
+     // A tflite-server older than 0.2.0 reports no task and cannot serve images;
+     // it would otherwise load and then 404 on every request.
+@@ -262,7 +271,7 @@ void TfliteServer::load(const std::string& model_name,
+                          (!wants_image && reported_task == "token-classification");
+     if (!task_ok) {
+         unload();
+-        throw std::runtime_error(
++        throw NonRetryableLoadException(
+             wants_image ? "tflite-server >= 0.2.0 required for image-classification "
+                           "(it reported task '" + reported_task + "')"
+                         : "tflite-server reported task '" + reported_task +
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index 3c38675e5..758deca94 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include <cstdint>
+ #include <optional>
+ #include <string>
+@@ -299,8 +300,15 @@ public:
+                                               ? p["label"].get<std::string>()
+                                               : std::to_string(p["index"].get<long long>());
+                 data.push_back({{"index", p["index"]}, {"label", label}, {"score", p["score"]}});
+-                if (!labels.contains(label)) labels[label] = p["score"];
++                if (!labels.contains(label) ||
++                    labels[label].get<double>() < p["score"].get<double>()) {
++                    labels[label] = p["score"];
++                }
+             }
++            // The documented contract is best-first; do not rely on the backend's order.
++            std::stable_sort(data.begin(), data.end(), [](const json& a, const json& b) {
++                return a["score"].get<double>() > b["score"].get<double>();
++            });
+             json enveloped = {
+                 {"object", "image_classification"},
+                 {"model", model},
+diff --git a/test/cpp/test_engine_reserved_args.cpp b/test/cpp/test_engine_reserved_args.cpp
+new file mode 100644
+index 000000000..580ca4e33
+--- /dev/null
++++ b/test/cpp/test_engine_reserved_args.cpp
+@@ -0,0 +1,50 @@
++#include <iostream>
++#include <set>
++#include <string>
++
++#include "lemon/backends/executorch/executorch.h"
++#include "lemon/backends/tflite/tflite.h"
++#include "lemon/utils/custom_args.h"
++
++namespace {
++
++int failures = 0;
++
++void expect(bool condition, const std::string& label) {
++    if (condition) {
++        std::cout << "PASS: " << label << std::endl;
++    } else {
++        std::cout << "FAIL: " << label << std::endl;
++        ++failures;
++    }
++}
++
++// tflite_args and executorch_args come from the /load request body, so every
++// flag that moves the engine's bind address, port, model or files it writes
++// must be refused in both spellings.
++void check_engine(const std::string& name, const std::set<std::string>& reserved) {
++    for (const char* flag : {"--model-path", "--port", "--host", "--weight-cache"}) {
++        expect(!lemon::utils::validate_custom_args(std::string(flag) + " x", reserved).empty(),
++               name + " rejects " + flag);
++        expect(!lemon::utils::validate_custom_args(std::string(flag) + "=x", reserved).empty(),
++               name + " rejects " + flag + "=");
++    }
++    expect(!lemon::utils::validate_custom_args("--threads 2 --host 0.0.0.0", reserved).empty(),
++           name + " rejects --host after an allowed flag");
++    expect(lemon::utils::validate_custom_args("--threads 2 --verbose", reserved).empty(),
++           name + " allows arguments Lemonade does not manage");
++}
++
++}  // namespace
++
++int main() {
++    check_engine("tflite", lemon::backends::tflite::reserved_custom_arg_flags());
++    check_engine("executorch", lemon::backends::executorch::reserved_custom_arg_flags());
++
++    if (failures == 0) {
++        std::cout << "All engine reserved-argument tests passed" << std::endl;
++        return 0;
++    }
++    std::cout << failures << " test(s) failed" << std::endl;
++    return 1;
++}
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index 6e65c4c67..dc9c03d76 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -486,6 +486,19 @@ class ImageClassifyTests(ServerTestBase):
+             unload_model(MODEL)
+             load_model(MODEL, tflite_args="")
+ 
++    def test_507b_load_refuses_bind_override(self):
++        # tflite_args comes from the request body; --host would put the engine
++        # on the LAN without lemond's API key.
++        self._require_model()
++        unload_model(MODEL)
++        try:
++            for args in ("--host 0.0.0.0", "--host=0.0.0.0", "--weight-cache /tmp/x"):
++                response = load_model(MODEL, tflite_args=args)
++                self.assertNotEqual(response.status_code, 200, args)
++                self.assertIn("managed by Lemonade", response.text, args)
++        finally:
++            load_model(MODEL, tflite_args="")
++
+     def test_508_crash_is_not_replayed(self):
+         if not _opts.fake_backend or not _opts.fake_state_dir:
+             self.skipTest("needs --fake-backend and --fake-state-dir")
+-- 
+2.53.0
+

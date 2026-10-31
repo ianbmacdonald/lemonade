@@ -1,0 +1,106 @@
+From 2df463a0a565ab8f6c53b758a5cd6df4bf0891bc Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 15:00:34 -0400
+Subject: [PATCH 68/71] fix(pull): pin only a full commit id
+
+A pinned pull accepted any safe snapshot id other than the requested
+name. A mirror that answered a revision with a different ref name would
+have that mutable name stored as the pin. Only a 40-character commit id
+can now be pinned. A registry that reports none is still refused with
+"cannot pin it".
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/registry_files.h |  6 ++----
+ src/cpp/server/models/ingest.cpp       |  2 +-
+ src/cpp/server/registry_files.cpp      | 11 +++++------
+ test/cpp/test_pull_revision.cpp        | 18 +++++++++---------
+ 4 files changed, 17 insertions(+), 20 deletions(-)
+
+diff --git a/src/cpp/include/lemon/registry_files.h b/src/cpp/include/lemon/registry_files.h
+index 2602a1461..551539273 100644
+--- a/src/cpp/include/lemon/registry_files.h
++++ b/src/cpp/include/lemon/registry_files.h
+@@ -76,10 +76,8 @@ std::string download_revision(const std::string& requested_revision,
+                               const std::string& current_pin);
+ 
+ // False when a pinned pull must refuse the snapshot id the registry resolved:
+-// not a single safe path component, or the requested name echoed back instead
+-// of a commit id.
+-bool is_pinnable_snapshot_id(const std::string& requested_revision,
+-                             const std::string& snapshot_id);
++// anything but a full commit id.
++bool is_pinnable_snapshot_id(const std::string& snapshot_id);
+ 
+ // content_id identifies content across commits (LFS sha256 or git blob oid),
+ // so revisions compare without downloading anything.
+diff --git a/src/cpp/server/models/ingest.cpp b/src/cpp/server/models/ingest.cpp
+index ee4660f0c..0ea71f74d 100644
+--- a/src/cpp/server/models/ingest.cpp
++++ b/src/cpp/server/models/ingest.cpp
+@@ -262,7 +262,7 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
+         const std::string resolved = main_listing.revision.id.empty()
+             ? main_listing.download_revision
+             : main_listing.revision.id;
+-        if (!registry_files::is_pinnable_snapshot_id(info.requested_revision, resolved)) {
++        if (!registry_files::is_pinnable_snapshot_id(resolved)) {
+             throw std::runtime_error(
+                 source_display + " did not report a commit for revision '" +
+                 info.requested_revision + "' of " + main_repo_id + "; cannot pin it");
+diff --git a/src/cpp/server/registry_files.cpp b/src/cpp/server/registry_files.cpp
+index 18ea6cf90..d9f8b7883 100644
+--- a/src/cpp/server/registry_files.cpp
++++ b/src/cpp/server/registry_files.cpp
+@@ -335,12 +335,11 @@ std::string download_revision(const std::string& requested_revision,
+     return current_pin;
+ }
+ 
+-bool is_pinnable_snapshot_id(const std::string& requested_revision,
+-                             const std::string& snapshot_id) {
+-    // A registry that omits the commit id reports the requested name instead;
+-    // pinning that would persist a pin the load path cannot honour.
+-    return is_snapshot_component(snapshot_id) &&
+-           (snapshot_id != requested_revision || is_commit_sha(snapshot_id));
++bool is_pinnable_snapshot_id(const std::string& snapshot_id) {
++    // Anything but a commit id names a ref the registry can move, which a pin
++    // must not follow: an omitted commit id comes back as the requested name,
++    // and a mirror may answer with another ref altogether.
++    return is_commit_sha(snapshot_id);
+ }
+ 
+ std::map<std::string, std::vector<std::string>> group_aux_checkpoint_variants(
+diff --git a/test/cpp/test_pull_revision.cpp b/test/cpp/test_pull_revision.cpp
+index 3cac80630..960c84379 100644
+--- a/test/cpp/test_pull_revision.cpp
++++ b/test/cpp/test_pull_revision.cpp
+@@ -207,18 +207,18 @@ static void test_download_revision() {
+ static void test_pinnable_snapshot_id() {
+     namespace rf = lemon::registry_files;
+     const std::string sha = "6e091d820cbe8f22eeb604d136403eca290b8c1e";
+-    check("a branch resolved to a commit can be pinned", rf::is_pinnable_snapshot_id("main", sha));
+-    check("a commit sha echoed back can be pinned", rf::is_pinnable_snapshot_id(sha, sha));
++    check("a branch resolved to a commit can be pinned", rf::is_pinnable_snapshot_id(sha));
+     check("a slashed ref echoed back for lack of a commit is refused",
+-          !rf::is_pinnable_snapshot_id("refs/pr/1", "refs/pr/1"));
+-    check("a tag echoed back for lack of a commit is refused",
+-          !rf::is_pinnable_snapshot_id("v1.0", "v1.0"));
+-    check("an empty snapshot id is refused", !rf::is_pinnable_snapshot_id("main", ""));
+-    check("a snapshot id that escapes snapshots/ is refused",
+-          !rf::is_pinnable_snapshot_id("main", "../x"));
++          !rf::is_pinnable_snapshot_id("refs/pr/1"));
++    check("a tag echoed back for lack of a commit is refused", !rf::is_pinnable_snapshot_id("v1.0"));
++    check("another ref name a mirror answers with is refused",
++          !rf::is_pinnable_snapshot_id("release-2"));
++    check("an abbreviated commit is refused", !rf::is_pinnable_snapshot_id(sha.substr(0, 12)));
++    check("an empty snapshot id is refused", !rf::is_pinnable_snapshot_id(""));
++    check("a snapshot id that escapes snapshots/ is refused", !rf::is_pinnable_snapshot_id("../x"));
+     for (const std::string dotted : {".", "..", ".hidden"}) {
+         check("a dot-led snapshot id '" + dotted + "' is refused",
+-              !rf::is_pinnable_snapshot_id("main", dotted));
++              !rf::is_pinnable_snapshot_id(dotted));
+     }
+ }
+ 
+-- 
+2.53.0
+

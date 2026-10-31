@@ -1,7 +1,7 @@
-From 9c36526dc241c24884ce42903494985d0c92c89f Mon Sep 17 00:00:00 2001
+From 68d228db8ce0f7f9487c7103f92754f48dd4f5ce Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Fri, 9 Oct 2026 03:09:23 -0400
-Subject: [PATCH 49/58] fix(server): mark static mount-point files as received
+Subject: [PATCH 49/71] fix(server): mark static mount-point files as received
 
 httplib serves /static files without going through the route tables that
 wrap_route_handlers covers, so with request_receive_timeout on a download

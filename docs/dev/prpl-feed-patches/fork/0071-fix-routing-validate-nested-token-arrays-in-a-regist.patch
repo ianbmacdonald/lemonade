@@ -1,0 +1,64 @@
+From 79fbaf606ea9f16a9e5c78da2a24c087e22bd3b6 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 15:32:56 -0400
+Subject: [PATCH 71/71] fix(routing): validate nested token arrays in a
+ registered validate prompt
+
+With a registered model, /routing/validate accepted any array as a prompt
+element, so [[null]] or [["hi"]] got a 200 and were routed as empty text.
+A prompt element must now be a string, a token id or an array of token
+ids, which are the forms completions accepts.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/routes/router/routing_validate.cpp | 9 ++++++---
+ test/server_endpoints.py                          | 5 +++++
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/cpp/server/routes/router/routing_validate.cpp b/src/cpp/server/routes/router/routing_validate.cpp
+index bd9e8f81c..5fc29e898 100644
+--- a/src/cpp/server/routes/router/routing_validate.cpp
++++ b/src/cpp/server/routes/router/routing_validate.cpp
+@@ -304,10 +304,13 @@ private:
+             const json& prompt = req.arg(kPrompt);
+             // Token ids and token-id arrays are valid completions prompts that dispatch
+             // routes as empty text, so only other element types are rejected.
++            const auto is_integer = [](const json& token) { return token.is_number_integer(); };
+             const bool valid = prompt.is_string() ||
+-                std::all_of(prompt.begin(), prompt.end(), [](const json& part) {
+-                    return part.is_string() || part.is_number_integer() || part.is_array();
+-                });
++                (prompt.is_array() &&
++                 std::all_of(prompt.begin(), prompt.end(), [&](const json& part) {
++                     return part.is_string() || part.is_number_integer() ||
++                            (part.is_array() && std::all_of(part.begin(), part.end(), is_integer));
++                 }));
+             if (!valid) {
+                 write_plain_error(res, kRegisteredInvalid,
+                                   "'prompt' must be a string or an array of strings or token ids");
+diff --git a/test/server_endpoints.py b/test/server_endpoints.py
+index 397cb8e94..4b181a957 100644
+--- a/test/server_endpoints.py
++++ b/test/server_endpoints.py
+@@ -6002,6 +6002,10 @@ class EndpointTests(ServerTestBase):
+             for bad_field in (
+                 {"prompt": [{"text": "hi"}]},
+                 {"prompt": [None]},
++                {"prompt": {"text": "hi"}},
++                {"prompt": [[None]]},
++                {"prompt": [["hi"]]},
++                {"prompt": [[1, [2]]]},
+                 {"input": 42},
+             ):
+                 malformed = requests.post(
+@@ -6014,6 +6018,7 @@ class EndpointTests(ServerTestBase):
+ 
+             for accepted in (
+                 {"prompt": [1, 2, 3]},
++                {"prompt": [[1, 2], [3]]},
+                 {"prompt": ["def f", "code"]},
+                 {"input": [{"role": "user", "content": "code"}]},
+             ):
+-- 
+2.53.0
+

@@ -1,0 +1,31 @@
+From 882045109667465414a70715e79f73d6c3c2b60e Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 14:39:41 -0400
+Subject: [PATCH 60/71] test: fake tflite-server never answers the poison
+ request
+
+os.kill on its own pid is delivered asynchronously, so the request
+thread could send a 200 before the process died (1 in 10 standalone),
+which made test_508/test_510 flaky.
+
+Assisted-by: claude:opus-5.5
+---
+ test/utils/fake_tflite_server.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/test/utils/fake_tflite_server.py b/test/utils/fake_tflite_server.py
+index 5cb6abb38..8b8106d73 100644
+--- a/test/utils/fake_tflite_server.py
++++ b/test/utils/fake_tflite_server.py
+@@ -113,6 +113,8 @@ def make_handler(args):
+             if POISON in image:
+                 _log("crashes.log", str(os.getpid()))
+                 os.kill(os.getpid(), signal.SIGSEGV)
++                # The signal can land on another thread; never answer this request.
++                time.sleep(60)
+             if SLOW in image:
+                 time.sleep(SLOW_SECONDS)
+             if image.startswith(PNG_SIGNATURE):
+-- 
+2.53.0
+

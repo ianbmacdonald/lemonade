@@ -1,0 +1,103 @@
+From 09c52774b087c07fa0561e8893fefd79d0996ecb Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sat, 31 Oct 2026 15:32:56 -0400
+Subject: [PATCH 69/71] fix(tflite): confine labels_file by its resolved path
+
+An image manifest's labels_file was confined lexically: no absolute path
+and no "..". The layout check then followed symlinks, so a model directory
+whose labels.txt linked to a file elsewhere on disk passed.
+
+The canonical target must now stay inside the model's Hugging Face
+repository, which still allows the snapshot-to-blob links, or inside the
+model directory when it is not in a snapshot.
+
+Assisted-by: claude:opus-5.5
+---
+ .../server/backends/tflite/tflite_layout.cpp  | 25 ++++++++++++++++-
+ test/cpp/test_tflite_layout.cpp               | 27 +++++++++++++++++++
+ 2 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/src/cpp/server/backends/tflite/tflite_layout.cpp b/src/cpp/server/backends/tflite/tflite_layout.cpp
+index 6c62008ea..c02767c84 100644
+--- a/src/cpp/server/backends/tflite/tflite_layout.cpp
++++ b/src/cpp/server/backends/tflite/tflite_layout.cpp
+@@ -55,6 +55,28 @@ bool read_image_manifest(const fs::path& dir, std::string& labels_file) {
+     return true;
+ }
+ 
++// A Hugging Face snapshot links each file into its repository's blobs/, so a
++// labels file may resolve anywhere in that repository; outside a snapshot it
++// must resolve inside the model dir. Checked on the resolved target, since the
++// lexical check in read_image_manifest does not see through symlinks.
++bool labels_file_confined(const fs::path& dir, const std::string& labels_file) {
++    std::error_code ec;
++    const fs::path abs_dir = fs::absolute(dir, ec);
++    if (ec) return false;
++    fs::path root = abs_dir;
++    for (fs::path p = abs_dir; p.has_relative_path(); p = p.parent_path()) {
++        if (p.filename() == "snapshots") {
++            root = p.parent_path();
++            break;
++        }
++    }
++    const fs::path base = fs::canonical(root, ec);
++    if (ec) return false;
++    const fs::path target = fs::canonical(abs_dir / fs::path(labels_file), ec);
++    if (ec) return false;
++    return std::mismatch(base.begin(), base.end(), target.begin(), target.end()).first == base.end();
++}
++
+ }  // namespace
+ 
+ TfliteLayout detect_tflite_layout(const fs::path& dir) noexcept {
+@@ -64,7 +86,8 @@ TfliteLayout detect_tflite_layout(const fs::path& dir) noexcept {
+ 
+         std::string labels_file;
+         if (read_image_manifest(dir, labels_file)) {
+-            return fs::is_regular_file(dir / fs::path(labels_file), ec) && !ec
++            return fs::is_regular_file(dir / fs::path(labels_file), ec) && !ec &&
++                           labels_file_confined(dir, labels_file)
+                        ? TfliteLayout::Image
+                        : TfliteLayout::None;
+         }
+diff --git a/test/cpp/test_tflite_layout.cpp b/test/cpp/test_tflite_layout.cpp
+index b705d8da5..9dfd68916 100644
+--- a/test/cpp/test_tflite_layout.cpp
++++ b/test/cpp/test_tflite_layout.cpp
+@@ -103,6 +103,33 @@ int main() {
+     check("missing directory is None",
+           detect_tflite_layout(root / "does_not_exist") == TfliteLayout::None);
+ 
++#ifndef _WIN32
++    {
++        const fs::path repo = root / "hub" / "models--org--img";
++        write(repo / "blobs" / "4f1a", "background\ncat\n");
++        const fs::path snap = repo / "snapshots" / "6e091d820cbe8f22eeb604d136403eca290b8c1e";
++        write(snap / "model.tflite", "x");
++        write(snap / "manifest.json", kImageManifest);
++        fs::create_symlink("../../blobs/4f1a", snap / "labels.txt");
++        check("labels file linked to its repository's blob is Image",
++              detect_tflite_layout(snap) == TfliteLayout::Image);
++
++        const fs::path escape = repo / "snapshots" / "aaaa";
++        write(escape / "model.tflite", "x");
++        write(escape / "manifest.json", kImageManifest);
++        fs::create_symlink(root / "text" / "config.json", escape / "labels.txt");
++        check("labels file linked outside its repository is None",
++              detect_tflite_layout(escape) == TfliteLayout::None);
++
++        const fs::path plain = root / "image_link_escape";
++        write(plain / "model.tflite", "x");
++        write(plain / "manifest.json", kImageManifest);
++        fs::create_symlink(root / "text" / "config.json", plain / "labels.txt");
++        check("labels file linked outside a plain model dir is None",
++              detect_tflite_layout(plain) == TfliteLayout::None);
++    }
++#endif
++
+     const fs::path two = root / "two";
+     make_text(two / "a");
+     make_image(two / "b");
+-- 
+2.53.0
+
