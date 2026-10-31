@@ -58,6 +58,9 @@ struct Provenance {
     std::string processed_snapshot_id;  // What this run fetched, which differs
                                         // when a cancelled pull fell back to the
                                         // snapshot already in place.
+    // Set when a pinned pull fetched processed_snapshot_id; it is then recorded as the
+    // model's pin, and the repository-level fields keep describing refs/main.
+    bool pinned = false;
 };
 
 struct CleanupReport {

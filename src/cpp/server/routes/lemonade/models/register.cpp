@@ -11,6 +11,8 @@ namespace {
 using json = nlohmann::json;
 using ordered_json = nlohmann::ordered_json;
 
+const RouteError kRevisionRefused{
+    400, "", "`revision` is sent; it applies to `/pull` only, since registering downloads nothing"};
 const RouteError kRegisterFailed{
     500, "",
     "The definition is invalid in another way and nothing is registered, for example a GGUF "
@@ -80,7 +82,7 @@ public:
         })");
         s.examples = {example};
         s.errors = {kBodyNotJson, kArgMissing, kArgInvalid, kInvalidModelDefinition, kUnlistedFieldInvalid,
-                    kRegisterFailed};
+                    kRevisionRefused, kRegisterFailed};
         s.request_format = RequestFormat::Json;
         return s;
     }
@@ -88,6 +90,11 @@ public:
     void handle(RouteRequest& req, httplib::Response& res) override {
         try {
             const std::string model_name = req.arg(kModelName).get<std::string>();
+            if (req.body.contains("revision")) {
+                write_plain_error(res, kRevisionRefused,
+                    "`revision` applies to /pull only; /models/register does not download");
+                return;
+            }
             const auto registered = try_register_model_definition(
                 ctx_,
                 model_name,

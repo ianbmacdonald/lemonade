@@ -95,6 +95,10 @@ class ModelIngest : public ArtifactFetchService {
                      DownloadProgressCallback progress,
                      const utils::CancelToken& cancel = utils::CancelToken());
 
+    // Drops a deleted model's entry (and so its pin) from the repository's
+    // .lemonade_registry.json, under the repository's download lock.
+    void forget_registry_provenance(const ModelInfo& info);
+
     // Disk state only: no request, no registration.
     void populate_from_cached_manifest(ModelInfo& info);  // forwards to the collection unit
 
@@ -123,6 +127,8 @@ class ModelIngest : public ArtifactFetchService {
     bool registered_anywhere(const std::string& name) const;
 
     void persist_size(const std::string& canonical_model_name) const;
+
+    std::shared_ptr<std::mutex> repo_download_lock(const ModelInfo& info);
 
     Deps deps_;
 

@@ -759,6 +759,7 @@ void ModelManager::delete_model(const std::string& model_name) {
                                   << canonical_model_name << std::endl;
     }
 
+    ingest_->forget_registry_provenance(info);
     forget_registered_model(canonical_model_name);
     store_.patch_removed(canonical_model_name);
 }

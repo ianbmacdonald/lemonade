@@ -139,6 +139,9 @@ void record_processed_model(const fs::path& repo_cache_dir, const ModelInfo& inf
         }
         entry["selection"] = processed_selection(info);
         entry["snapshot_id"] = provenance.processed_snapshot_id;
+        if (provenance.pinned) {
+            entry["pinned_revision"] = provenance.processed_snapshot_id;
+        }
     }
 
     // v2: what this model processed from this repository, checkpoint by checkpoint.
@@ -164,7 +167,26 @@ void record_processed_model(const fs::path& repo_cache_dir, const ModelInfo& inf
              {"snapshot_id", provenance.active_snapshot_id},
              {"processed_models", std::move(processed)}};
     if (!is_main) out["version"] = 2;
-    utils::JsonUtils::save_to_file(out, utils::path_to_utf8(provenance_path));
+    if (provenance.pinned) {
+        // The repository-level fields describe refs/main, which a pin leaves alone.
+        for (const char* field : {"revision", "snapshot_id"}) {
+            if (previous.is_object() && previous.contains(field)) {
+                out[field] = previous[field];
+            } else {
+                out.erase(field);
+            }
+        }
+    }
+    // Loads read the pin from this file concurrently; a torn read would drop it.
+    fs::path tmp = provenance_path;
+    tmp += ".tmp";
+    utils::JsonUtils::save_to_file(out, utils::path_to_utf8(tmp));
+    std::error_code ec;
+    fs::rename(tmp, provenance_path, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        utils::JsonUtils::save_to_file(out, utils::path_to_utf8(provenance_path));
+    }
 }
 
 }  // namespace models
