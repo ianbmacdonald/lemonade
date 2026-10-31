@@ -25,7 +25,7 @@ inline const BackendDescriptor descriptor = {
          "Custom arguments to pass to et-server", "ExecuTorch Options"},
     },
     /*support*/ {
-        {"system", {"linux"}, {{"cpu", {"x86_64"}}}, "x86_64 CPU"},
+        {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64"}}}, "x86_64 CPU"},
     },
     /*supported_modes*/ {"classification"},
     /*required_checkpoints*/ {"main"},

@@ -212,7 +212,12 @@ private:
             "Content-Type: application/json\r\nContent-Length: " +
             std::to_string(kBody.size()) + "\r\n\r\n" + kBody;
         httplib::detail::send_socket(sock, kBusy.data(), kBusy.size(), 0);
-        httplib::detail::shutdown_socket(sock);
+        // httplib declares shutdown_socket only in its implementation section.
+#ifdef _WIN32
+        ::shutdown(sock, SD_BOTH);
+#else
+        ::shutdown(sock, SHUT_RDWR);
+#endif
         httplib::detail::close_socket(sock);
         // A client at its cap is usually retrying in a loop; log the first
         // refusal and then every 100th rather than every one.

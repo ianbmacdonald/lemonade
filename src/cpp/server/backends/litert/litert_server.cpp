@@ -6,6 +6,7 @@
 #include "lemon/backend_manager.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
+#include "lemon/utils/path_utils.h"
 #include "lemon/utils/process_manager.h"
 #include <algorithm>
 #include <filesystem>
