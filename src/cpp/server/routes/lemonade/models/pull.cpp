@@ -7,7 +7,6 @@
 #include "lemon/server/model_sync.h"
 #include "lemon/model_manager.h"
 #include "lemon/model_types.h"
-#include "lemon/models/registry_descriptors.h"
 #include "lemon/models/registry_types.h"
 #include "lemon/runtime_config.h"
 #include "lemon/server/api_route.h"
@@ -471,8 +470,8 @@ private:
         }
         bool hugging_face = false;
         try {
-            hugging_face = parse_remote_registry_source(pinned_registry) ==
-                           models::huggingface_descriptor().id;
+            hugging_face = remote_registry_source_name(
+                               parse_remote_registry_source(pinned_registry)) == "huggingface";
         } catch (const std::exception&) {
             // An unrecognized registry name cannot be pinned either.
         }
