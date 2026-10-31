@@ -3,6 +3,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 
 namespace lemon {
@@ -32,6 +33,9 @@ private:
     std::atomic<bool> running_;
     int interval_ms_;
     std::thread engine_thread_;
+    // stop() wakes the loop, so a shutdown does not wait out the interval.
+    std::mutex wake_mutex_;
+    std::condition_variable wake_cv_;
 };
 
 } // namespace lemon

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <thread>
 #include <functional>
 #include <mutex>
@@ -42,6 +43,9 @@ private:
     std::atomic<bool> running_;
     int poll_interval_ms_;
     std::thread monitor_thread_;
+    // stop() wakes the loop, so a shutdown does not wait out the interval.
+    std::mutex wake_mutex_;
+    std::condition_variable wake_cv_;
 
     std::mutex callback_mutex_;
     VramPressureCallback pressure_callback_;

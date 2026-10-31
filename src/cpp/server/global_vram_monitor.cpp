@@ -21,7 +21,11 @@ void GlobalVramMonitor::start(int poll_interval_ms) {
 }
 
 void GlobalVramMonitor::stop() {
-    running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(wake_mutex_);
+        running_ = false;
+    }
+    wake_cv_.notify_all();
     if (monitor_thread_.joinable()) {
         monitor_thread_.join();
     }
@@ -54,7 +58,8 @@ void GlobalVramMonitor::monitor_loop() {
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms_));
+        std::unique_lock<std::mutex> lock(wake_mutex_);
+        wake_cv_.wait_for(lock, std::chrono::milliseconds(poll_interval_ms_), [this] { return !running_; });
     }
 }
 
