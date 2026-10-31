@@ -335,12 +335,11 @@ std::string download_revision(const std::string& requested_revision,
     return current_pin;
 }
 
-bool is_pinnable_snapshot_id(const std::string& requested_revision,
-                             const std::string& snapshot_id) {
-    // A registry that omits the commit id reports the requested name instead;
-    // pinning that would persist a pin the load path cannot honour.
-    return is_snapshot_component(snapshot_id) &&
-           (snapshot_id != requested_revision || is_commit_sha(snapshot_id));
+bool is_pinnable_snapshot_id(const std::string& snapshot_id) {
+    // Anything but a commit id names a ref the registry can move, which a pin
+    // must not follow: an omitted commit id comes back as the requested name,
+    // and a mirror may answer with another ref altogether.
+    return is_commit_sha(snapshot_id);
 }
 
 std::map<std::string, std::vector<std::string>> group_aux_checkpoint_variants(

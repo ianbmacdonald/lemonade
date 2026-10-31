@@ -207,18 +207,18 @@ static void test_download_revision() {
 static void test_pinnable_snapshot_id() {
     namespace rf = lemon::registry_files;
     const std::string sha = "6e091d820cbe8f22eeb604d136403eca290b8c1e";
-    check("a branch resolved to a commit can be pinned", rf::is_pinnable_snapshot_id("main", sha));
-    check("a commit sha echoed back can be pinned", rf::is_pinnable_snapshot_id(sha, sha));
+    check("a branch resolved to a commit can be pinned", rf::is_pinnable_snapshot_id(sha));
     check("a slashed ref echoed back for lack of a commit is refused",
-          !rf::is_pinnable_snapshot_id("refs/pr/1", "refs/pr/1"));
-    check("a tag echoed back for lack of a commit is refused",
-          !rf::is_pinnable_snapshot_id("v1.0", "v1.0"));
-    check("an empty snapshot id is refused", !rf::is_pinnable_snapshot_id("main", ""));
-    check("a snapshot id that escapes snapshots/ is refused",
-          !rf::is_pinnable_snapshot_id("main", "../x"));
+          !rf::is_pinnable_snapshot_id("refs/pr/1"));
+    check("a tag echoed back for lack of a commit is refused", !rf::is_pinnable_snapshot_id("v1.0"));
+    check("another ref name a mirror answers with is refused",
+          !rf::is_pinnable_snapshot_id("release-2"));
+    check("an abbreviated commit is refused", !rf::is_pinnable_snapshot_id(sha.substr(0, 12)));
+    check("an empty snapshot id is refused", !rf::is_pinnable_snapshot_id(""));
+    check("a snapshot id that escapes snapshots/ is refused", !rf::is_pinnable_snapshot_id("../x"));
     for (const std::string dotted : {".", "..", ".hidden"}) {
         check("a dot-led snapshot id '" + dotted + "' is refused",
-              !rf::is_pinnable_snapshot_id("main", dotted));
+              !rf::is_pinnable_snapshot_id(dotted));
     }
 }
 

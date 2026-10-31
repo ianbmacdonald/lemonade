@@ -262,7 +262,7 @@ void ModelIngest::download_from_registry(const ModelInfo& info,
         const std::string resolved = main_listing.revision.id.empty()
             ? main_listing.download_revision
             : main_listing.revision.id;
-        if (!registry_files::is_pinnable_snapshot_id(info.requested_revision, resolved)) {
+        if (!registry_files::is_pinnable_snapshot_id(resolved)) {
             throw std::runtime_error(
                 source_display + " did not report a commit for revision '" +
                 info.requested_revision + "' of " + main_repo_id + "; cannot pin it");
