@@ -1729,6 +1729,7 @@ With cloud providers configured, their models are listed too, with `recipe: "clo
   - `max_completion_tokens` - Cloud models only: `max_output_tokens` under its OpenAI name.
   - `downloaded` - Whether the model is downloaded.
   - `update_available` - Whether the model's registry has a newer commit; `false` except for downloaded registry models.
+  - `pinned_revision` - The commit a `/v1/pull` with `revision` pinned the model to; absent when the model follows its default branch.
   - `suggested` - Whether the model is recommended for general use.
   - `labels` - The model's capabilities and characteristics; see [Model Labels](./openai.md#model-labels).
   - `image_defaults` - Image models only: default generation parameters.
@@ -1917,6 +1918,7 @@ Requires `LEMONADE_API_KEY` when it is set.
 - `max_completion_tokens` - Cloud models only: `max_output_tokens` under its OpenAI name.
 - `downloaded` - Whether the model is downloaded.
 - `update_available` - Whether the model's registry has a newer commit; `false` except for downloaded registry models.
+- `pinned_revision` - The commit a `/v1/pull` with `revision` pinned the model to; absent when the model follows its default branch.
 - `suggested` - Whether the model is recommended for general use.
 - `labels` - The model's capabilities and characteristics; see [Model Labels](./openai.md#model-labels).
 - `image_defaults` - Image models only: default generation parameters.

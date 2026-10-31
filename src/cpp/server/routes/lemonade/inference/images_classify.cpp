@@ -97,19 +97,18 @@ public:
             "Classifies one image and returns the top-scoring labels. The model must be labeled "
             "`image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` "
             "(0.2.0 or newer) subprocess on the CPU. The request is either `multipart/form-data` "
-            "(the same shape as `/v1/images/edits`) or `application/json`. Only JPEG and PNG are "
-            "accepted, and EXIF orientation is not applied.";
+            "(the same shape as `/v1/images/edits`) or `application/json`, and only JPEG and PNG "
+            "are accepted, with EXIF orientation not applied.";
         s.notes = {
             "`data` is sorted by descending score and is authoritative. `labels` has the same shape "
             "as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` "
             "classes), so a repeated name keeps only its highest score there; use `data[].index` "
             "to tell classes apart.",
-            "The body is capped before it is read: a request without `Content-Length`, or with any "
-            "`Transfer-Encoding`, gets `411`; any `Content-Encoding` gets `415`; and a "
-            "`Content-Length` over 23 MiB gets `413`. At most two requests run at once.",
+            "The body is checked before it is read: it needs a `Content-Length` of at most 23 MiB, "
+            "and no `Transfer-Encoding` or `Content-Encoding`. At most two requests run at once.",
             "An image that crashes the backend is never replayed, because replaying it would crash "
-            "the restarted backend too: this request fails with `502` `backend_crashed_on_input` "
-            "and the next request restarts the backend.",
+            "the restarted backend too: this request fails with `backend_crashed_on_input` and the "
+            "next request restarts the backend.",
             "### Model Directory\n\n"
             "An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 "
             "output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the "
@@ -161,12 +160,17 @@ public:
                 "labels": {
                     "type": "object",
                     "description": "Each class's score keyed by label; a repeated label keeps its highest score, and `data` is authoritative.",
-                    "additionalProperties": {"type": "number"}
+                    "additionalProperties": {"type": "number", "description": "The label's highest score."}
                 },
                 "timings": {"type": "object", "description": "Backend timings, when the backend reports them."}
             }
         })");
         s.responses = {response};
+
+        RouteExample example;
+        example.format = ResponseFormat::Json;
+        example.args = {{"model", "MobileNetV2-1.0-224-TFLite"}, {"image", "@fixtures/image.png"}, {"top_k", 3}};
+        s.examples = {example};
         s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired, kContentEncoding,
                                  kServerBusy, kCrashCooldown,
                                  kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput,
@@ -183,7 +187,7 @@ public:
         auto send_if_paused = [this, &res](const std::string& model) {
             auto paused = ctx_.router->classify_cooldown_error(model);
             if (!paused) return false;
-            res.status = 503;
+            res.status = kCrashCooldown.status;
             res.set_header("Retry-After",
                            std::to_string((*paused)["error"]["retry_after"].get<long long>()));
             res.set_content(paused->dump(), "application/json");
@@ -205,8 +209,8 @@ public:
             if (http.is_multipart_form_data()) {
                 std::optional<std::string> model;
                 std::optional<std::string> top_k;
-                if (http.form.has_field("model")) model = http.form.get_field("model");
-                if (http.form.has_field("top_k")) top_k = http.form.get_field("top_k");
+                if (http.form.has_field(kModel.name)) model = http.form.get_field(kModel.name);
+                if (http.form.has_field(kTopK.name)) top_k = http.form.get_field(kTopK.name);
                 std::vector<std::string_view> parts;
                 for (const auto& [name, file] : http.form.files) {
                     if (name == "image" || name == "file") parts.emplace_back(file.content);

@@ -578,10 +578,10 @@ DISTINCT_ARGUMENTS = {
             ],
         ),
         (
-            "Text to continue or an image to generate, versus text to route",
+            "A classifier, optional when one is loaded, versus a registered router to classify against",
             [
-                "routes/ollama/generate.cpp:kPrompt",
-                "routes/router/routing_validate.cpp:kPrompt",
+                "routes/lemonade/inference/classify.cpp:kModel",
+                "routes/router/routing_validate.cpp:kModel",
             ],
         ),
         (
@@ -848,10 +848,13 @@ def lint_sources() -> list[str]:
         lists = " ".join(m.group(0) for m in ERROR_LISTS.finditer(text))
         inherited = "ModelLoader::errors()" in lists
         # MCP's JSON-RPC endpoint answers its own parse errors, in-band with a 200.
+        # images/classify takes JSON or multipart and checks the body's size and
+        # encoding headers before httplib reads it.
         if (
             not RECEIVES_BODY.search(text)
             and "http.body" in text
             and path.parent.name != "mcp"
+            and path.name != "images_classify.cpp"
         ):
             problems.append(
                 f"{where} reads its request body, which its RequestFormat skips"

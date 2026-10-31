@@ -11,6 +11,7 @@ We have designed a set of Lemonade-specific endpoints to enable client applicati
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | [`/v1/classify`](#post-v1classify) | Score text against a classifier model's labels |
+| `POST` | [`/v1/images/classify`](#post-v1imagesclassify) | Classify an image |
 | `POST` | [`/v1/models/check-updates`](#post-v1modelscheck-updates) | Manually check downloaded models for upstream updates |
 | `POST` | [`/v1/models/register`](#post-v1modelsregister) | Register or update a user model definition without downloading it |
 | `POST` | [`/v1/pull`](#post-v1pull) | Install a model |
@@ -52,7 +53,7 @@ Some Lemonade endpoints live on other pages: the per-model [`/v1/models/{id}/fil
 ## `POST /v1/classify`
 <sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
 
-Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on a string and returns a score for each label. It serves `onnxruntime` sequence classifiers (one label set), token classifiers (aggregated span labels) and zero-shot models (labels sent with each request). It provides the classification that the router's `classifier` and `zero_shot` conditions use.
+Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on a string and returns a score for each label. It serves `onnxruntime` sequence classifiers (one label set), token classifiers (aggregated span labels) and zero-shot models (labels sent with each request), and `tflite` text classifiers; image models are served by [`POST /v1/images/classify`](#post-v1imagesclassify). It provides the classification that the router's `classifier` and `zero_shot` conditions use.
 
 Requires `LEMONADE_API_KEY` when it is set.
 
@@ -130,6 +131,7 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
 | `400` | `missing_argument` | A required argument is missing |
 | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
 | `400` |  | `model` is omitted and not exactly one classification model is loaded |
+| `400` | `model_not_applicable` | `model` is an image-classification model, served by `POST /v1/images/classify` |
 | `400` |  | The backend rejects the request, for example because `model` is not a classification model, which is found only after it loads, or because `labels` is sent to a fixed-label model or left out for a zero-shot one |
 | `404` |  | The model is unloaded while the request waits for it |
 | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
@@ -140,7 +142,122 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
 | `500` |  | The backend's response lacks a field the route returns, such as `choices` or `labels` |
 | `500` |  | The request fails unexpectedly |
 | `500` | `model_load_error` | Loading the requested model fails for another reason, such as a failed download or a backend that does not start |
+| `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
+| `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
 <!-- END GENERATED: lemonade.classify -->
+
+<!-- BEGIN GENERATED: lemonade.images_classify -->
+## `POST /v1/images/classify`
+<sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
+
+Classifies one image and returns the top-scoring labels. The model must be labeled `image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` (0.2.0 or newer) subprocess on the CPU. The request is either `multipart/form-data` (the same shape as `/v1/images/edits`) or `application/json`, and only JPEG and PNG are accepted, with EXIF orientation not applied.
+
+Requires `LEMONADE_API_KEY` when it is set.
+
+### Parameters
+
+| Parameter | Required | Description | Status |
+|-----------|----------|-------------|--------|
+| `model` | No | The image-classification model to use. Optional when exactly one is loaded. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+| `image` or `file` | Yes | Multipart: exactly one file part named `image` (or `file`). JSON: a base64 string, or a `data:image/jpeg;base64,...` / `data:image/png;base64,...` URL. Remote `http(s)` URLs are not fetched. At most 16 MiB decoded. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+| `top_k` | No | Number of labels to return. Defaults to 5; the backend caps it at the model's label count. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+
+`data` is sorted by descending score and is authoritative. `labels` has the same shape as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` classes), so a repeated name keeps only its highest score there; use `data[].index` to tell classes apart.
+
+The body is checked before it is read: it needs a `Content-Length` of at most 23 MiB, and no `Transfer-Encoding` or `Content-Encoding`. At most two requests run at once.
+
+An image that crashes the backend is never replayed, because replaying it would crash the restarted backend too: this request fails with `backend_crashed_on_input` and the next request restarts the backend.
+
+### Model Directory
+
+An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the task and preprocessing:
+
+```json
+{
+  "task": "image-classification",
+  "labels_file": "labels.txt",
+  "score_normalization": "none",
+  "preprocess": {
+    "resize": "stretch",
+    "mean": [127.5, 127.5, 127.5],
+    "std": [127.5, 127.5, 127.5],
+    "channel_order": "RGB",
+    "layout": "auto"
+  },
+  "top_k_default": 5
+}
+```
+
+A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps serving `/v1/classify`. Loading fails with a message naming both layouts when a model's label and its directory disagree, and when the installed `tflite-server` is too old to report the image-classification task. The per-model `tflite_args` option passes flags such as `--max-image-pixels` through to `tflite-server`.
+
+### Example
+
+=== "PowerShell"
+
+    ```powershell
+    curl.exe http://localhost:13305/v1/images/classify `
+      -F "model=MobileNetV2-1.0-224-TFLite" `
+      -F "top_k=3" `
+      -F image=@image.png
+    ```
+
+=== "Bash"
+
+    ```bash
+    curl http://localhost:13305/v1/images/classify \
+      -F "model=MobileNetV2-1.0-224-TFLite" \
+      -F "top_k=3" \
+      -F image=@image.png
+    ```
+
+**Response:** `200 OK`
+
+```json
+{
+  "object": "image_classification",
+  "model": "MobileNetV2-1.0-224-TFLite",
+  "data": [{"index": 418, "label": "balloon", "score": 0.5941151976585388}, ... 2 more],
+  "labels": {"balloon": 0.5941151976585388, ... 2 more},
+  "timings": {"decode_ms": 0.37189, "inference_ms": 4.289716, "preprocess_ms": 1.0587}
+}
+```
+
+### Response format
+
+- `object` - Always `image_classification`.
+- `model` - The model that classified the image.
+- `data` - The highest-scoring classes, best first.
+  - `index` - The class index in the model's output.
+  - `label` - The class name, or the index as a string when the model has no label file.
+  - `score` - The class score.
+- `labels` - Each class's score keyed by label; a repeated label keeps its highest score, and `data` is authoritative.
+  - The label's highest score.
+- `timings` - Backend timings, when the backend reports them.
+
+### Errors
+
+| Status | Code | When |
+|--------|------|------|
+| `400` |  | `Content-Type` is neither `multipart/form-data` nor `application/json` |
+| `400` |  | Malformed request: zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG image, a bad `top_k`, or an image the backend cannot decode |
+| `400` | `model_not_applicable` | `model` is not an image-classification model |
+| `400` |  | `model` is omitted and not exactly one image-classification model is loaded |
+| `404` |  | The model is unloaded while the request waits for it |
+| `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+| `404` | `model_not_found` | The requested model is not in the registry |
+| `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+| `409` | `slots_pinned_error` | Every loaded model of the requested model's type is pinned, so none can be unloaded to make room |
+| `411` | `length_required` | No `Content-Length`, or any `Transfer-Encoding` header, even alongside a `Content-Length`; refused before the body is read |
+| `413` | `payload_too_large` | The decoded image exceeds 16 MiB, or the body exceeds 23 MiB |
+| `415` | `unsupported_content_encoding` | Any `Content-Encoding` header, such as a gzip-compressed body; refused before the body is read |
+| `500` |  | The backend reports an error; the backend's own status replaces this one when it sends one |
+| `500` |  | The backend's response lacks a field the route returns, such as `choices` or `labels` |
+| `500` |  | The request fails unexpectedly |
+| `500` | `model_load_error` | Loading the requested model fails for another reason, such as a failed download or a backend that does not start |
+| `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
+| `503` | `server_busy` | Two image-classification requests are already in progress (`Retry-After: 1`) |
+| `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
+<!-- END GENERATED: lemonade.images_classify -->
 
 <!-- BEGIN GENERATED: lemonade.models_check_updates -->
 ## `POST /v1/models/check-updates`
@@ -290,6 +407,7 @@ Requires `LEMONADE_API_KEY` when it is set.
   - `max_completion_tokens` - Cloud models only: `max_output_tokens` under its OpenAI name.
   - `downloaded` - Whether the model is downloaded.
   - `update_available` - Whether the model's registry has a newer commit; `false` except for downloaded registry models.
+  - `pinned_revision` - The commit a `/v1/pull` with `revision` pinned the model to; absent when the model follows its default branch.
   - `suggested` - Whether the model is recommended for general use.
   - `labels` - The model's capabilities and characteristics; see [Model Labels](./openai.md#model-labels).
   - `image_defaults` - Image models only: default generation parameters.
@@ -330,6 +448,7 @@ Requires `LEMONADE_API_KEY` when it is set.
 | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
 | `400` |  | The definition is malformed and nothing is registered, for example a name outside the `user.` namespace or with a reserved `extra.`/`builtin.` prefix, an empty `recipe` where one is required, `checkpoints` without `main`, an unsupported `source`, `components` that are empty or name the collection itself, another collection or an unregistered model, or an invalid routing policy |
 | `400` |  | A field not listed above has the wrong JSON type |
+| `400` |  | `revision` is sent; it applies to `/pull` only, since registering downloads nothing |
 | `500` |  | The definition is invalid in another way and nothing is registered, for example a GGUF `checkpoint` without a variant, a recipe this system cannot run, or labels that name two deployment modes |
 <!-- END GENERATED: lemonade.models_register -->
 
@@ -363,12 +482,27 @@ Requires `LEMONADE_API_KEY` when it is set.
 | `registry_source` | No | Same as `source`; when both are given they must name the same registry. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
 | `do_not_upgrade` | No | `true` skips checking an already-downloaded model's registry for updates. Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
 | `local_import` | No | Register model files a client already copied into the Hugging Face cache, without downloading. Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+| `revision` | No | Pin the download to an exact Hugging Face revision of the model's main checkpoint repository: a 40-character commit sha, or a branch or tag name. Omitted or empty pulls the registry's default branch, and an explicit pull without it releases an existing pin. See Pin a Revision below. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
 
 Pulling an already-downloaded model downloads any newer commit from its registry. Loading a model never checks for updates, and [`POST /v1/models/check-updates`](#post-v1modelscheck-updates) only reports them.
 
 With `stream`, the error event or the job reports an unknown model.
 
 In offline mode a new definition is still registered, but nothing is downloaded.
+
+### Pin a Revision
+
+A client can look up a model's commits on the Hub (for example `https://huggingface.co/api/models/<owner>/<repo>/commits/main`) and download exactly one of them by passing `revision`; the non-streaming response then carries the resolved commit as `revision`.
+
+- `revision` must be a 40-character hexadecimal commit sha, or a branch/tag name of at most 128 characters made of `A-Z a-z 0-9 . _ / -` that does not contain `..` and does not start with `/` or `-` (for example `main` or `refs/pr/1`). Anything else is rejected before any registration or network request.
+- A branch or tag is resolved to its commit when the pull runs; the model stays on that commit even if the branch moves later.
+- The pin applies to the main checkpoint's repository only. Auxiliary checkpoints in other repositories follow their default branch; auxiliary files in the main repository come from the pinned commit.
+- Files are stored under `snapshots/<commit sha>/`. A pinned pull never moves `refs/main`, so other models that share the repository keep loading the default-branch snapshot.
+- The model records the pinned commit in the repository's `.lemonade_registry.json`, and every later load of that model uses the pinned snapshot. [`GET /v1/models/{id}`](./openai.md#get-v1modelsid) reports it as `pinned_revision`. A pinned model is excluded from update checks and auto-update.
+- An explicit pull with `revision` always fetches and pins that revision, even with `do_not_upgrade` and an already-downloaded model, so it also moves an existing pin. Pulling again without `revision` removes the pin.
+- `revision` is rejected for collections, local imports, models from a non-Hugging Face registry, backends that manage their own downloads (`flm`, `cloud`), a request that also changes an existing model's recipe or source, and in offline mode. [`POST /v1/models/register`](#post-v1modelsregister) does not download and rejects `revision`.
+- Streaming and server-owned job responses do not carry the resolved sha; read `pinned_revision` after the download completes.
+- If a repository's `.lemonade_registry.json` is corrupt, models in that repository that are not on the `refs/main` snapshot (pinned models included) report not downloaded. A later download of that repository rewrites the file and drops the pins it held.
 
 ### Register and Install a Model
 
@@ -571,6 +705,7 @@ Without `stream`, or with `local_import`: the model is installed or registered.
 
 - `status` - Always `success`.
 - `model_name` - The installed model.
+- `revision` - Only with `revision`: the commit sha the model is pinned to.
 - `message` - Only with `local_import`: a confirmation that the files were registered.
 
 ##### Download job
@@ -622,6 +757,8 @@ A `progress` event reports one file; a `complete` event follows the last one, an
 | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
 | `400` |  | `source` or `registry_source` names an unsupported source, or the checkpoint URLs disagree with it or with each other |
 | `400` |  | The definition is malformed and nothing is registered, for example a name outside the `user.` namespace or with a reserved `extra.`/`builtin.` prefix, an empty `recipe` where one is required, `checkpoints` without `main`, an unsupported `source`, `components` that are empty or name the collection itself, another collection or an unregistered model, or an invalid routing policy |
+| `400` |  | `revision` is malformed, or cannot pin this model: a collection, a local import, a non-Hugging Face registry, a backend that manages its own downloads, or a request that also changes an existing model's recipe or source |
+| `400` | `lemond_offline` | `revision` is sent while the server is in offline mode |
 | `400` | `lemond_offline` | `offline` is set to `true` |
 | `400` | `unknown_model` | Without `stream`, the model is not registered and its name has no `user.` prefix |
 | `400` |  | Labels or `embedding`/`reranking` flags name a deployment mode the recipe cannot serve, or name two |
@@ -1748,6 +1885,8 @@ This endpoint does not take any parameters.
   - `is_streaming` - Whether the model is generating output tokens: `true` from the first chunk until every streaming request completes.
   - `backend_url` - URL of the backend process serving the model.
   - `pid` - Process ID of the backend process serving the model.
+  - `rss_mib` - Resident memory of the backend process in MiB (`VmRSS`, rounded to one decimal). Includes memory-mapped model weights and shared libraries, so pages shared between backends can be counted more than once. Linux only; a best-effort sample, omitted when it can't be read. Only the direct backend process is measured, not its children.
+  - `anon_mib` - Private anonymous memory of the backend process in MiB (`RssAnon`, rounded to one decimal): the part of `rss_mib` not backed by files. Same availability as `rss_mib`.
   - `launch_command` - The command that started the model's backend, program first, with the values actually used: an automatic `ctx_size` appears as a number, and flags Lemonade added are included. Absent for cloud models.
   - `recipe` - Recipe used to load the model, e.g. `llamacpp` or `flm`.
   - `recipe_options` - Options the model was loaded with, such as `ctx_size` or `llamacpp_args`.
@@ -1778,6 +1917,27 @@ This endpoint does not take any parameters.
   - `captures` - The parts of each request telemetry captures, present when `enabled` is `true`.
 - `pinned_helper_models` - Loaded pinned routing-helper models, counted per model type.
   - How many pinned routing-helper models of this type are loaded.
+- `beacon_listener` - State of the LAN beacon listener, controlled by the `beacon_listen` setting in [Server Configuration](../guide/configuration/README.md). The list is display-only: Lemonade never contacts a heard host, sends it credentials, or routes requests to it. When the listener is off, this is `{"enabled": false}`.
+  - `enabled` - Whether the listener is running.
+  - `supported` - `false` on Windows, where the listener is not available in this release.
+  - `listening` - Whether at least one UDP socket is bound.
+  - `error` - Platform-level error, or `null`. If the listener thread could not be started, `listening` is `false`, `sockets` is empty and `error` says why; toggling `beacon_listen` retries.
+  - `sockets` - One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each listened interface's subnet broadcast address (worked out from its address and netmask) plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on.
+  - `interfaces` - The interfaces being listened on: `name`, `address`, `netmask` and `broadcast`. By default this is every interface with an RFC1918 address. The `beacon_listen_interfaces` setting narrows it; on a gateway whose WAN side is also RFC1918, set it to the LAN bridges or WAN-side hosts are listed too.
+  - `interface_allowlist` - The `beacon_listen_interfaces` setting, or `[]` when every RFC1918 interface is heard.
+  - `trusted_relays` - The `beacon_trusted_relays` setting, with each `allow_hosts` entry written as a CIDR (`192.168.79.20` becomes `192.168.79.20/32`).
+  - `unmatched_interfaces` - Entries of `beacon_listen_interfaces` that name no interface with an RFC1918 address. When none match, `listening` is `false` and `error` names them.
+  - `self_instance_id` - This server's beacon `instance_id`, used to drop its own beacons.
+  - `self_port` - This server's HTTP port, used to drop its own beacons.
+  - `ttl_seconds` - Seconds a host stays listed after its last beacon.
+  - `max_hosts` - Maximum listed hosts.
+  - `distinct_instances` - Number of distinct servers heard; a multi-homed server has one row per interface.
+  - `hosts` - Heard servers, sorted by hostname: `hostname` (sanitised to `[A-Za-z0-9._-]`), `url`, `source_ip` (the datagram's sender), `via` (the relay's address when the host was heard through a `beacon_trusted_relays` entry, else `null`), `instance_id` (or `null` for older servers), `first_seen` and `last_seen` (Unix seconds), `age_seconds`.
+  - `stats` - Counters per outcome: `accepted`, `refreshed`, `self`, `bad_source` (not RFC1918), `bad_payload`, `url_mismatch`, `rate_limited`, `table_full`, `wrong_interface` (arrived on an interface that is not being listened on), `unknown_interface` (the arrival interface could not be determined while `beacon_listen_interfaces` is set), `evicted`. With trusted relays also `relayed_accepted` and `relayed_refreshed` (as `accepted` and `refreshed`, for hosts heard through a trusted relay) and `relay_host_refused` (a trusted relay advertised a host outside its `allow_hosts`, or a non-RFC1918 host); `url_mismatch` then excludes trusted relays, and `table_full` also counts a relay that already vouches for 16 hosts.
+- `server_process` - The Lemonade Server process itself.
+  - `pid` - Process ID of the server.
+  - `rss_mib` - Resident memory of the server in MiB, with the same meaning and availability as the per-model field.
+  - `anon_mib` - Private anonymous memory of the server in MiB, with the same meaning and availability as the per-model field.
 <!-- END GENERATED: lemonade.health -->
 
 <!-- BEGIN GENERATED: lemonade.stats -->

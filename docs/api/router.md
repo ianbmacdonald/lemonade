@@ -5,7 +5,7 @@ A `collection.router` model is a virtual model whose routing policy picks one of
 <!-- BEGIN GENERATED: router.summary -->
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | [`/v1/routing/validate`](#post-v1routingvalidate) | Test a routing policy against a prompt without registering it |
+| `POST` | [`/v1/routing/validate`](#post-v1routingvalidate) | Test a routing policy or registered router against a prompt |
 <!-- END GENERATED: router.summary -->
 
 ## Routing (`collection.router`)
@@ -33,7 +33,7 @@ See [Router Policies](../dev/router-policy.md) for authoring the policy.
 ## `POST /v1/routing/validate`
 <sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
 
-Returns the decision a routing policy makes for a prompt, without registering the policy or sending the request to the chosen candidate. The Router Builder's **Test Prompt** tab uses it to iterate on a policy before attaching it to a `collection.router` model.
+Returns the decision a routing policy makes for a prompt, without registering the policy or sending the request to the chosen candidate. The Router Builder's **Test Prompt** tab uses it to iterate on a policy before attaching it to a `collection.router` model. Sent `model` instead of `policy`, it returns the decision a registered router would make for the request body, without dispatching it.
 
 Requires `LEMONADE_API_KEY` when it is set.
 
@@ -41,11 +41,18 @@ Requires `LEMONADE_API_KEY` when it is set.
 
 | Parameter | Required | Description | Status |
 |-----------|----------|-------------|--------|
-| `policy` | Yes | A `collection.router` policy document. `model_name` is accepted but is not required for validation. See [Router Policies](../dev/router-policy.md). | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
-| `prompt` | No | The prompt text to route. Defaults to `""`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+| `policy` | No | A `collection.router` policy document. `model_name` is accepted but is not required for validation. See [Router Policies](../dev/router-policy.md). Required unless `model` is sent, and refused alongside it. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+| `model` | No | A registered `collection.router` model, by public or `user.` name, to classify against instead of `policy`. The rest of the body is then read exactly as a chat, completions or responses request to that router would be: `messages`, `prompt`, `input`, `tools`, `metadata` and `max_tokens` build the routing context, and `has_images`/`has_tools` are refused, since they come from the body itself. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+| `prompt` | No | The prompt text to route. Defaults to `""`. With `model`, an array of strings or token ids is accepted too, as on completions. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
 | `has_images` | No | Simulate a request carrying image input. Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
 | `has_tools` | No | Simulate a request carrying tool definitions. Defaults to `false`. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
 | `metadata` | No | String-valued metadata pairs matched by `metadata` conditions. | <sub>![Status](https://img.shields.io/badge/available-green)</sub> |
+
+### Classify Against a Registered Router
+
+Send `model` naming a registered `collection.router` model, instead of `policy`, to ask where that router would send a request without dispatching it. The router's registered policy is evaluated by the same code path dispatch uses, so the returned `decision` is the one a real request with the same body would get, and it equals the `x_lemonade_route` object a routed completion of that body returns with `route_trace: true`. The trace is always included, and the response carries the router's public name as `model` instead of `normalized_policy`.
+
+No candidate is loaded and nothing is forwarded to a backend. Deterministic rules are evaluated locally; model-backed conditions load and run their helper models as they do on dispatch, which can evict other models to make room. Classify-only requests are not counted in the routing metrics. Unlike dispatch, which falls back to the collection itself when routing fails, a failure here is an error.
 
 Validation is structural: every `candidates` entry, `default_model`, rule `route_to` and classifier model must be listed in `components`. Component names are not looked up in the model registry, so a policy can be tested before its candidates are downloaded, and registration's model-type checks, such as whether a `semantic_similarity` model can embed, do not run.
 
@@ -187,15 +194,19 @@ Match `decision.matched_rule` against this document: a policy written with only 
 ### Response format
 
 - `decision` - The routing decision for the prompt, with the per-condition `trace` included. See [Routing](#routing-collectionrouter) for the decision object.
-- `normalized_policy` - The policy as evaluated, with any `routing.router` shorthand expanded.
+- `normalized_policy` - The policy as evaluated, with any `routing.router` shorthand expanded. Present with `policy`.
+- `model` - The router's public name. Present with `model`.
 
 ### Errors
 
 | Status | Code | When |
 |--------|------|------|
 | `400` | `invalid_json` | The body is not a JSON object |
-| `400` | `missing_argument` | A required argument is missing |
 | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
 | `400` |  | `policy` is invalid or internally inconsistent |
+| `400` |  | Neither or both of `policy` and `model` are sent |
+| `400` |  | With `model`: the model is not a `collection.router`, `has_images`/`has_tools` are sent, `prompt` is not a string or an array of strings or token ids, `input` is not a string or array, or `messages` is not an array |
+| `404` |  | With `model`: no model by that name is registered |
 | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+| `500` |  | With `model`: the router's registered policy failed to parse, or a helper model failed in a way its `on_error` policy does not absorb |
 <!-- END GENERATED: router.routing_validate -->

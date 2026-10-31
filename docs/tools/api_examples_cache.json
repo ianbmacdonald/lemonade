@@ -1452,6 +1452,58 @@
       }
     }
   },
+  "5e4f45411731a6b534045ea8818a2d1e48c012b5629986fb153d81e192ee4bea": {
+    "route": "lemonade.images_classify",
+    "format": "Json",
+    "request": {
+      "method": "POST",
+      "path": "/v1/images/classify",
+      "query": {},
+      "json": null,
+      "form": {
+        "model": "MobileNetV2-1.0-224-TFLite",
+        "top_k": 3
+      },
+      "files": {
+        "image": "@fixtures/image.png"
+      }
+    },
+    "response": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": {
+        "data": [
+          {
+            "index": 418,
+            "label": "balloon",
+            "score": 0.5941151976585388
+          },
+          {
+            "index": 723,
+            "label": "ping-pong ball",
+            "score": 0.2999834716320038
+          },
+          {
+            "index": 853,
+            "label": "tennis ball",
+            "score": 0.008562449365854263
+          }
+        ],
+        "labels": {
+          "balloon": 0.5941151976585388,
+          "ping-pong ball": 0.2999834716320038,
+          "tennis ball": 0.008562449365854263
+        },
+        "model": "MobileNetV2-1.0-224-TFLite",
+        "object": "image_classification",
+        "timings": {
+          "decode_ms": 0.37189,
+          "inference_ms": 4.289716,
+          "preprocess_ms": 1.0587
+        }
+      }
+    }
+  },
   "1745dcfda3bde7f0ca399fa264071c682f0e78fb5121bb7a426946f70dcfc7c3": {
     "route": "lemonade.install",
     "format": "EventStream",

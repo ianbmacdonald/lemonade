@@ -63,7 +63,7 @@ public:
         s.id = "router.routing_validate";
         s.methods = {"POST"};
         s.paths = {"routing/validate"};
-        s.summary = "Test an ad-hoc or registered routing policy against a prompt without dispatching it";
+        s.summary = "Test a routing policy or registered router against a prompt";
         s.experimental = true;
         s.description =
             "Returns the decision a routing policy makes for a prompt, without registering the "
@@ -193,7 +193,7 @@ public:
             "prompt": "please write a def to reverse a list"
         })");
         s.examples = {example};
-        s.errors = {kBodyNotJson, kArgMissing, kArgInvalid, kInvalidPolicy, kPolicyOrModel,
+        s.errors = {kBodyNotJson, kArgInvalid, kInvalidPolicy, kPolicyOrModel,
                     kRegisteredInvalid, kRouterNotFound, kRouterEvaluationFailed,
                     ModelLoader::kRouterResidencyConflict};
         s.request_format = RequestFormat::Json;
