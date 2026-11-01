@@ -96,6 +96,7 @@ Also served at `/v1/reranking` and `/v1/reranker`. Requires `LEMONADE_API_KEY` w
 | `400` | `missing_argument` | A required argument is missing |
 | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
 | `400` |  | `model` is not a llama.cpp model |
+| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
 | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
 | `404` | `model_not_found` | The requested model is not in the registry |
 | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |

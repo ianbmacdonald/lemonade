@@ -133,6 +133,7 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
 | `400` |  | `model` is omitted and not exactly one classification model is loaded |
 | `400` | `model_not_applicable` | `model` is an image-classification model, served by `POST /v1/images/classify` |
 | `400` |  | The backend rejects the request, for example because `model` is not a classification model, which is found only after it loads, or because `labels` is sent to a fixed-label model or left out for a zero-shot one |
+| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
 | `404` |  | The model is unloaded while the request waits for it |
 | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
 | `404` | `model_not_found` | The requested model is not in the registry |
@@ -144,6 +145,7 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
 | `500` | `model_load_error` | Loading the requested model fails for another reason, such as a failed download or a backend that does not start |
 | `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
 | `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
+| `504` | `backend_unresponsive_on_input` | The backend stopped answering its health checks while working on this input and was stopped; the request is not retried and does not count toward the crash pause |
 <!-- END GENERATED: lemonade.classify -->
 
 <!-- BEGIN GENERATED: lemonade.images_classify -->
@@ -242,6 +244,7 @@ A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps
 | `400` |  | Malformed request: zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG image, a bad `top_k`, or an image the backend cannot decode |
 | `400` | `model_not_applicable` | `model` is not an image-classification model |
 | `400` |  | `model` is omitted and not exactly one image-classification model is loaded |
+| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
 | `404` |  | The model is unloaded while the request waits for it |
 | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
 | `404` | `model_not_found` | The requested model is not in the registry |
@@ -257,6 +260,7 @@ A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps
 | `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
 | `503` | `server_busy` | Two image-classification requests are already in progress (`Retry-After: 1`) |
 | `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
+| `504` | `backend_unresponsive_on_input` | The backend stopped answering its health checks while working on this input and was stopped; the request is not retried and does not count toward the crash pause |
 <!-- END GENERATED: lemonade.images_classify -->
 
 <!-- BEGIN GENERATED: lemonade.models_check_updates -->
@@ -1378,6 +1382,7 @@ A collection, which has no checkpoint of its own.
 | `400` | `invalid_json` | The body is not a JSON object |
 | `400` | `missing_argument` | A required argument is missing |
 | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
 | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
 | `404` | `model_not_found` | The requested model is not in the registry |
 | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
@@ -1559,6 +1564,7 @@ Format the `lyrics` value the way the ACE-Step authors recommend:
 | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
 | `400` | `model_not_applicable` | `model` is not an audio-generation model |
 | `400` |  | `response_format` is not a format `model`'s backend produces, or, when streaming, one it streams |
+| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
 | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
 | `404` | `model_not_found` | The requested model is not in the registry |
 | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
@@ -1630,6 +1636,7 @@ Errors carry a JSON `error` object.
 | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
 | `400` |  | `image` is not base64 data, or is a `data:` URL without a base64 payload |
 | `400` |  | `image` is not a PNG, JPEG, BMP or GIF |
+| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
 | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
 | `404` | `model_not_found` | The requested model is not in the registry |
 | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
@@ -1878,7 +1885,7 @@ This endpoint does not take any parameters.
   - `model_name` - Name of the loaded model
   - `checkpoint` - The model's main checkpoint.
   - `last_use` - Monotonic timestamp of last access (load or inference), in milliseconds
-  - `type` - Model type: `llm`, `embedding`, `reranking`, `transcription`, `image`, `tts`, `audio-generation`, `classification` or `mesh`.
+  - `type` - Model type: `llm`, `embedding`, `reranking`, `transcription`, `image`, `tts`, `audio-generation`, `classification`, `image-classification` or `mesh`.
   - `device` - Devices the model runs on, joined by `|`: `cpu`, `gpu` and `npu`, such as `gpu|npu`, or `none`.
   - `pinned` - Whether the model is pinned, which exempts it from auto-eviction
   - `is_busy` - Whether the model has active requests or maintenance in progress
@@ -1911,6 +1918,7 @@ This endpoint does not take any parameters.
   - `image` - Maximum image models
   - `tts` - Maximum text-to-speech models
   - `classification` - Maximum classification models
+  - `image-classification` - Maximum image-classification models
 - `websocket_port` - Port of the dedicated WebSocket server for the [Realtime Audio Transcription API](./openai.md#ws-realtime) and [Log Streaming API](#log-streaming-api-websocket), present while it runs; the main port serves both APIs too. The port is OS-assigned, or set by the `websocket_port` setting in [Server Configuration](../guide/configuration/README.md).
 - `telemetry` - Telemetry state.
   - `enabled` - Whether telemetry collection is active

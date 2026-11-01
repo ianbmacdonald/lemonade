@@ -57,7 +57,7 @@ ordered_json health_schema() {
                         "model_name": {"type": "string", "description": "Name of the loaded model"},
                         "checkpoint": {"type": "string", "description": "The model's main checkpoint."},
                         "last_use": {"type": "integer", "description": "Monotonic timestamp of last access (load or inference), in milliseconds"},
-                        "type": {"type": "string", "description": "Model type: `llm`, `embedding`, `reranking`, `transcription`, `image`, `tts`, `audio-generation`, `classification` or `mesh`."},
+                        "type": {"type": "string", "description": "Model type: `llm`, `embedding`, `reranking`, `transcription`, `image`, `tts`, `audio-generation`, `classification`, `image-classification` or `mesh`."},
                         "device": {"type": "string", "description": "Devices the model runs on, joined by `|`: `cpu`, `gpu` and `npu`, such as `gpu|npu`, or `none`."},
                         "pinned": {"type": "boolean", "description": "Whether the model is pinned, which exempts it from auto-eviction"},
                         "is_busy": {"type": "boolean", "description": "Whether the model has active requests or maintenance in progress"},
@@ -94,7 +94,8 @@ ordered_json health_schema() {
                     "transcription": {"type": "integer", "description": "Maximum speech-to-text models"},
                     "image": {"type": "integer", "description": "Maximum image models"},
                     "tts": {"type": "integer", "description": "Maximum text-to-speech models"},
-                    "classification": {"type": "integer", "description": "Maximum classification models"}
+                    "classification": {"type": "integer", "description": "Maximum classification models"},
+                    "image-classification": {"type": "integer", "description": "Maximum image-classification models"}
                 },
                 "additionalProperties": {"type": "integer"}
             },
