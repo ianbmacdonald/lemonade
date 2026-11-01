@@ -1,7 +1,7 @@
-From 32a17304bd9d39e89bd83aece5f226d6a3b4d366 Mon Sep 17 00:00:00 2001
+From 6ace0eccba452ab685e18bc090d492db93364899 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 18:34:03 -0400
-Subject: [PATCH 34/77] test(routing): malformed prompt/input in classify-only
+Subject: [PATCH 34/85] test(routing): malformed prompt/input in classify-only
  validate return 400
 
 Assisted-by: claude:opus-5.5

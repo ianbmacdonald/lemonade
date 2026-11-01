@@ -1,7 +1,7 @@
-From e968d9073c3d68ec4bcd2eb3a67795b14c2ee085 Mon Sep 17 00:00:00 2001
+From eda247fa5620bea3adcd7d3e19fdccd3bd23f2fc Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 19:02:19 -0400
-Subject: [PATCH 43/77] fix(beacon): fail closed on an unknown arrival
+Subject: [PATCH 43/85] fix(beacon): fail closed on an unknown arrival
  interface; report unmatched allow-list names
 
 With beacon_listen_interfaces set, a beacon whose arrival interface cannot

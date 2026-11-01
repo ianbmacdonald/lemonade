@@ -1,7 +1,7 @@
-From a72f1814a1c4abe46b867d3d8346f141777efc3a Mon Sep 17 00:00:00 2001
+From 2e62be3b54cc5ff56b52d4b8f3e60cda6e018b82 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 17:55:22 -0400
-Subject: [PATCH 74/77] docs(config): WebSocket connections now count against
+Subject: [PATCH 74/85] docs(config): WebSocket connections now count against
  the per-client cap
 
 Assisted-by: claude:opus-5.5

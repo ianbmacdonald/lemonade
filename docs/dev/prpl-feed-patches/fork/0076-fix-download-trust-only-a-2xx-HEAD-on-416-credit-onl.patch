@@ -1,7 +1,7 @@
-From 2e3074a8a2f4bcbc202bb4eaa2814d2e88817358 Mon Sep 17 00:00:00 2001
+From 528ce69372898f9da6ebb72d373e4329d78fd0cf Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 18:11:29 -0400
-Subject: [PATCH 76/77] fix(download): trust only a 2xx HEAD on 416, credit
+Subject: [PATCH 76/85] fix(download): trust only a 2xx HEAD on 416, credit
  only the resumable prefix
 
 A resume answered 416 is checked with a HEAD whose Content-Length must

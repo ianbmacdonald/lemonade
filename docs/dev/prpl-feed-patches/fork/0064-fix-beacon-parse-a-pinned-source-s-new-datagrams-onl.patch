@@ -1,7 +1,7 @@
-From 6bb8f04e990f60b86f4f6063bd9add43ef884764 Mon Sep 17 00:00:00 2001
+From a021effeec42188c525f8311da367d8376de9b9d Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:00:10 -0400
-Subject: [PATCH 64/77] fix(beacon): parse a pinned source's new datagrams only
+Subject: [PATCH 64/85] fix(beacon): parse a pinned source's new datagrams only
  on a global token
 
 A pinned source skipped the global bucket and spent its own token only on

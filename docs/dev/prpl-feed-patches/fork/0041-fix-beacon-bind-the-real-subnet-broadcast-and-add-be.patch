@@ -1,7 +1,7 @@
-From 40aa823d31c3c5e6799ee7986b8d0fbb8c51f4a5 Mon Sep 17 00:00:00 2001
+From 6bf52a636a5536ccf854feddbd3bf697f667d333 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 18:41:37 -0400
-Subject: [PATCH 41/77] fix(beacon): bind the real subnet broadcast and add
+Subject: [PATCH 41/85] fix(beacon): bind the real subnet broadcast and add
  beacon_listen_interfaces
 
 The listener bound NetworkInterfaceInfo::broadcastAddress, which came from

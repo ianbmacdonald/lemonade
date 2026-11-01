@@ -1,0 +1,156 @@
+From 9092cbd74078599f9fc2a9e3c877b24bfce079bf Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 01:53:44 -0400
+Subject: [PATCH 84/85] fix(process): Linux backends inherit only stdin, stdout
+ and stderr
+
+httplib accepts without SOCK_CLOEXEC, so a client socket waiting in the worker
+queue was still inheritable when a backend was forked. Both fork paths now
+close every descriptor above 2 before exec (close_range, or a loop).
+
+Assisted-by: claude:opus-5.5
+---
+ .../server/utils/platform/process_linux.cpp   | 21 ++++++++
+ test/cpp/test_connection_guard.cpp            | 52 +++++++++++++++++++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/src/cpp/server/utils/platform/process_linux.cpp b/src/cpp/server/utils/platform/process_linux.cpp
+index 8827cfe62..f669c25eb 100644
+--- a/src/cpp/server/utils/platform/process_linux.cpp
++++ b/src/cpp/server/utils/platform/process_linux.cpp
+@@ -21,6 +21,7 @@
+ #include <cctype>
+ 
+ #include <sys/prctl.h>
++#include <sys/syscall.h>
+ 
+ #ifdef HAVE_LIBCAP
+ #include <sys/capability.h>
+@@ -55,6 +56,24 @@ static void log_process_line(const std::string& line) {
+     }
+ }
+ 
++// Runs in the forked child before exec. Sockets lemond holds are not all
++// close-on-exec in time (httplib accepts without SOCK_CLOEXEC), so the backend
++// keeps only stdin, stdout and stderr.
++static void close_inherited_descriptors() {
++#ifdef SYS_close_range
++    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0) {
++        return;
++    }
++#endif
++    long max_fd = sysconf(_SC_OPEN_MAX);
++    if (max_fd < 0 || max_fd > 65536) {
++        max_fd = 65536;
++    }
++    for (int fd = 3; fd < max_fd; ++fd) {
++        close(fd);
++    }
++}
++
+ #ifdef HAVE_LIBCAP
+ static void preserve_capabilities_for_exec() {
+     cap_t caps = cap_get_proc();
+@@ -194,6 +213,7 @@ pid_t LinuxProcessPlatform::spawn_process(
+         }
+         argv_ptrs.push_back(nullptr);
+ 
++        close_inherited_descriptors();
+         execvp(executable.c_str(), argv_ptrs.data());
+ 
+         // If execvp returns, it failed
+@@ -540,6 +560,7 @@ int LinuxProcessPlatform::run_with_output(
+         }
+         argv_ptrs.push_back(nullptr);
+ 
++        close_inherited_descriptors();
+         execvp(executable.c_str(), argv_ptrs.data());
+         _exit(127);
+     }
+diff --git a/test/cpp/test_connection_guard.cpp b/test/cpp/test_connection_guard.cpp
+index a884116fe..2f4eb1d65 100644
+--- a/test/cpp/test_connection_guard.cpp
++++ b/test/cpp/test_connection_guard.cpp
+@@ -3,6 +3,7 @@
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstring>
++#include <fstream>
+ #include <memory>
+ #include <mutex>
+ #include <string>
+@@ -20,6 +21,7 @@
+ #include <lemon/connection_guard.h>
+ #include <lemon/upgradable_http_server.h>
+ #include <lemon/utils/network_beacon.h>
++#include <lemon/utils/process_manager.h>
+ 
+ #include "test_config_helpers.h"
+ 
+@@ -261,6 +263,55 @@ static void test_beacon_socket_is_close_on_exec() {
+           "the beacon's broadcast socket is not inherited by child processes");
+     beacon.stopBroadcasting();
+ }
++
++static bool listing_has(const std::vector<std::string>& lines, int fd) {
++    for (const auto& line : lines) {
++        if (line == std::to_string(fd)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// A socket lemond has not marked close-on-exec yet, such as one still waiting
++// in the worker queue, must not reach a backend.
++static void test_children_get_only_stdio() {
++    int fds[2];
++    check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
++    const int inheritable = ::fcntl(fds[0], F_DUPFD, 200);
++    check(inheritable >= 200, "an inheritable descriptor at 200 or above");
++
++    std::vector<std::string> lines;
++    lemon::utils::ProcessManager::run_process_with_output(
++        "/bin/sh", {"-c", "ls /proc/self/fd"},
++        [&lines](const std::string& line) {
++            lines.push_back(line);
++            return true;
++        });
++    check(listing_has(lines, 1), "run_process_with_output: the child's descriptors are listed");
++    check(!listing_has(lines, inheritable),
++          "run_process_with_output: the child does not inherit lemond's descriptors");
++
++    char path[] = "/tmp/lemon-fd-listing-XXXXXX";
++    const int out = ::mkstemp(path);
++    ::close(out);
++    auto handle = lemon::utils::ProcessManager::start_process(
++        "/bin/sh", {"-c", std::string("ls /proc/self/fd > ") + path});
++    lemon::utils::ProcessManager::wait_for_exit(handle, 10);
++    lines.clear();
++    std::ifstream listing(path);
++    for (std::string line; std::getline(listing, line);) {
++        lines.push_back(line);
++    }
++    ::unlink(path);
++    check(listing_has(lines, 0), "start_process: the child's descriptors are listed");
++    check(!listing_has(lines, inheritable),
++          "start_process: the child does not inherit lemond's descriptors");
++
++    ::close(inheritable);
++    ::close(fds[0]);
++    ::close(fds[1]);
++}
+ #endif
+ 
+ // A peer that connects and sends nothing, or stops mid-headers, must not hold
+@@ -308,6 +359,7 @@ int main() {
+ #ifdef __linux__
+     test_watch_socket_is_close_on_exec();
+     test_beacon_socket_is_close_on_exec();
++    test_children_get_only_stdio();
+ #endif
+ #endif
+     return report_results("connection guard");
+-- 
+2.53.0
+

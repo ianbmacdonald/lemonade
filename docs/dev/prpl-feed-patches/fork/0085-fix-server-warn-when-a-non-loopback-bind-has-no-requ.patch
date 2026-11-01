@@ -1,0 +1,38 @@
+From c75e99de7d1c97067fabc777ccce00cbb8380edd Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 01:53:44 -0400
+Subject: [PATCH 85/85] fix(server): warn when a non-loopback bind has no
+ request_receive_timeout
+
+The limits stay off by default; a LAN-facing server without them can be held
+by clients that send one byte at a time.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/core/http_listener.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/cpp/server/core/http_listener.cpp b/src/cpp/server/core/http_listener.cpp
+index 3f252430e..c162a4913 100644
+--- a/src/cpp/server/core/http_listener.cpp
++++ b/src/cpp/server/core/http_listener.cpp
+@@ -285,6 +285,16 @@ void HttpListener::warn_if_unsecured(const std::string& bound_host, const std::s
+                "endpoints (/api, /v0, /v1) are reachable from other machines "
+                "unauthenticated. Set LEMONADE_API_KEY to secure them." << std::endl;
+     }
++#ifndef _WIN32
++    if (config_->request_receive_timeout() <= 0) {
++        LOG(WARNING, "Server")
++            << "Serving on non-loopback host '" << bound_host
++            << "' with request_receive_timeout off. A client that sends one byte at a time "
++               "can hold a server worker for as long as it likes, and enough of them stop "
++               "every endpoint. Set request_receive_timeout (and max_connections_per_client) "
++               "for a server other machines can reach." << std::endl;
++    }
++#endif
+ }
+ 
+ void HttpListener::start_beacon() {
+-- 
+2.53.0
+

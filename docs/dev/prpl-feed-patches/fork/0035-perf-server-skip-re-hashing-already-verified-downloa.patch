@@ -1,7 +1,7 @@
-From faf922ce69b075986459e737958f71aabffed5d8 Mon Sep 17 00:00:00 2001
+From dee1b04e984812e458816de74211729eebafb0bc Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 11 Aug 2026 22:07:39 -0400
-Subject: [PATCH 35/77] perf(server): skip re-hashing already-verified
+Subject: [PATCH 35/85] perf(server): skip re-hashing already-verified
  downloads
 
 A completed download with an expected hash is re-hashed in full on every

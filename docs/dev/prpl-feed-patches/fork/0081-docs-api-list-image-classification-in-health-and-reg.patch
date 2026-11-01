@@ -1,0 +1,205 @@
+From e89411d1fc74bd68f78f3110179ae478fd6ae674 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 01:08:19 -0400
+Subject: [PATCH 81/85] docs(api): list image-classification in /health and
+ regenerate the reference
+
+Assisted-by: claude:opus-5.5
+---
+ docs/api/lemonade.md                             | 10 +++++++++-
+ docs/api/llamacpp.md                             |  1 +
+ docs/api/openai.md                               |  9 +++++++++
+ src/cpp/server/routes/lemonade/system/health.cpp |  5 +++--
+ 4 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/docs/api/lemonade.md b/docs/api/lemonade.md
+index 34344bbe5..0efea65d7 100644
+--- a/docs/api/lemonade.md
++++ b/docs/api/lemonade.md
+@@ -133,6 +133,7 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
+ | `400` |  | `model` is omitted and not exactly one classification model is loaded |
+ | `400` | `model_not_applicable` | `model` is an image-classification model, served by `POST /v1/images/classify` |
+ | `400` |  | The backend rejects the request, for example because `model` is not a classification model, which is found only after it loads, or because `labels` is sent to a fixed-label model or left out for a zero-shot one |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` |  | The model is unloaded while the request waits for it |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+@@ -144,6 +145,7 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
+ | `500` | `model_load_error` | Loading the requested model fails for another reason, such as a failed download or a backend that does not start |
+ | `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
+ | `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
++| `504` | `backend_unresponsive_on_input` | The backend stopped answering its health checks while working on this input and was stopped; the request is not retried and does not count toward the crash pause |
+ <!-- END GENERATED: lemonade.classify -->
+ 
+ <!-- BEGIN GENERATED: lemonade.images_classify -->
+@@ -242,6 +244,7 @@ A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps
+ | `400` |  | Malformed request: zero or several image parts, invalid base64, a remote URL, a non-JPEG/PNG image, a bad `top_k`, or an image the backend cannot decode |
+ | `400` | `model_not_applicable` | `model` is not an image-classification model |
+ | `400` |  | `model` is omitted and not exactly one image-classification model is loaded |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` |  | The model is unloaded while the request waits for it |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+@@ -257,6 +260,7 @@ A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps
+ | `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
+ | `503` | `server_busy` | Two image-classification requests are already in progress (`Retry-After: 1`) |
+ | `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
++| `504` | `backend_unresponsive_on_input` | The backend stopped answering its health checks while working on this input and was stopped; the request is not retried and does not count toward the crash pause |
+ <!-- END GENERATED: lemonade.images_classify -->
+ 
+ <!-- BEGIN GENERATED: lemonade.models_check_updates -->
+@@ -1378,6 +1382,7 @@ A collection, which has no checkpoint of its own.
+ | `400` | `invalid_json` | The body is not a JSON object |
+ | `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -1559,6 +1564,7 @@ Format the `lyrics` value the way the ACE-Step authors recommend:
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` | `model_not_applicable` | `model` is not an audio-generation model |
+ | `400` |  | `response_format` is not a format `model`'s backend produces, or, when streaming, one it streams |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -1630,6 +1636,7 @@ Errors carry a JSON `error` object.
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `image` is not base64 data, or is a `data:` URL without a base64 payload |
+ | `400` |  | `image` is not a PNG, JPEG, BMP or GIF |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -1878,7 +1885,7 @@ This endpoint does not take any parameters.
+   - `model_name` - Name of the loaded model
+   - `checkpoint` - The model's main checkpoint.
+   - `last_use` - Monotonic timestamp of last access (load or inference), in milliseconds
+-  - `type` - Model type: `llm`, `embedding`, `reranking`, `transcription`, `image`, `tts`, `audio-generation`, `classification` or `mesh`.
++  - `type` - Model type: `llm`, `embedding`, `reranking`, `transcription`, `image`, `tts`, `audio-generation`, `classification`, `image-classification` or `mesh`.
+   - `device` - Devices the model runs on, joined by `|`: `cpu`, `gpu` and `npu`, such as `gpu|npu`, or `none`.
+   - `pinned` - Whether the model is pinned, which exempts it from auto-eviction
+   - `is_busy` - Whether the model has active requests or maintenance in progress
+@@ -1911,6 +1918,7 @@ This endpoint does not take any parameters.
+   - `image` - Maximum image models
+   - `tts` - Maximum text-to-speech models
+   - `classification` - Maximum classification models
++  - `image-classification` - Maximum image-classification models
+ - `websocket_port` - Port of the dedicated WebSocket server for the [Realtime Audio Transcription API](./openai.md#ws-realtime) and [Log Streaming API](#log-streaming-api-websocket), present while it runs; the main port serves both APIs too. The port is OS-assigned, or set by the `websocket_port` setting in [Server Configuration](../guide/configuration/README.md).
+ - `telemetry` - Telemetry state.
+   - `enabled` - Whether telemetry collection is active
+diff --git a/docs/api/llamacpp.md b/docs/api/llamacpp.md
+index e1b493941..8925fb078 100644
+--- a/docs/api/llamacpp.md
++++ b/docs/api/llamacpp.md
+@@ -96,6 +96,7 @@ Also served at `/v1/reranking` and `/v1/reranker`. Requires `LEMONADE_API_KEY` w
+ | `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `model` is not a llama.cpp model |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+diff --git a/docs/api/openai.md b/docs/api/openai.md
+index 32fc477a8..c2720e68d 100644
+--- a/docs/api/openai.md
++++ b/docs/api/openai.md
+@@ -414,6 +414,7 @@ Sent in place of the rest of the stream when the backend fails after the stream
+ | `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `model` is not an LLM, which is checked after it loads |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -628,6 +629,7 @@ Sent in place of the rest of the stream when the backend fails after the stream
+ | `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `model` is not an LLM, which is checked after it loads |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -721,6 +723,7 @@ Requires `LEMONADE_API_KEY` when it is set.
+ | `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `model`'s backend cannot embed, such as a text-to-speech model |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -917,6 +920,7 @@ Sent in place of the rest of the stream when the backend fails after the stream
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | The request does not stream and `model` is a FastFlowLM or cloud model, which has no Responses API |
+ | `400` | `model_not_applicable` | The request does not stream and `model` is not an LLM |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -1013,6 +1017,7 @@ On FastFlowLM, which reports no segment timestamps, `verbose_json` has no `segme
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | `model` cannot transcribe, which is found after it loads; the error's `type` is `unsupported_operation` |
+ | `400` |  | `response_format` is `srt` or `vtt` and `model` is a FastFlowLM model, which reports no segment timestamps |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -1230,6 +1235,7 @@ Requires `LEMONADE_API_KEY` when it is set.
+ | `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | The backend's reply does not parse, or a request field not listed above has the wrong JSON type |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -1342,6 +1348,7 @@ Requires `LEMONADE_API_KEY` when it is set.
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | The form has files under both `image` and `image[]` |
+ | `400` |  | The backend's reply does not parse, or a request field not listed above has the wrong JSON type |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -1443,6 +1450,7 @@ Requires `LEMONADE_API_KEY` when it is set.
+ | `400` | `missing_argument` | A required argument is missing |
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` |  | The backend's reply does not parse, or a request field not listed above has the wrong JSON type |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+@@ -1635,6 +1643,7 @@ Accepted `response_format` values depend on the backend: `kokoro-v1` encodes `mp
+ | `400` | `invalid_argument` | An argument or a value nested in it has the wrong JSON type, or a value its schema does not list |
+ | `400` | `model_not_applicable` | `model` is not a text-to-speech model, which is checked before it loads |
+ | `400` |  | `response_format` is not a format `model`'s backend produces, or, when streaming, one it streams |
++| `400` | `invalid_backend_args` | The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's port or bind address |
+ | `404` | `model_not_supported` | The requested model is filtered out on this system, such as an NPU model without an NPU |
+ | `404` | `model_not_found` | The requested model is not in the registry |
+ | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
+diff --git a/src/cpp/server/routes/lemonade/system/health.cpp b/src/cpp/server/routes/lemonade/system/health.cpp
+index 7b9906e0b..ca9849576 100644
+--- a/src/cpp/server/routes/lemonade/system/health.cpp
++++ b/src/cpp/server/routes/lemonade/system/health.cpp
+@@ -57,7 +57,7 @@ ordered_json health_schema() {
+                         "model_name": {"type": "string", "description": "Name of the loaded model"},
+                         "checkpoint": {"type": "string", "description": "The model's main checkpoint."},
+                         "last_use": {"type": "integer", "description": "Monotonic timestamp of last access (load or inference), in milliseconds"},
+-                        "type": {"type": "string", "description": "Model type: `llm`, `embedding`, `reranking`, `transcription`, `image`, `tts`, `audio-generation`, `classification` or `mesh`."},
++                        "type": {"type": "string", "description": "Model type: `llm`, `embedding`, `reranking`, `transcription`, `image`, `tts`, `audio-generation`, `classification`, `image-classification` or `mesh`."},
+                         "device": {"type": "string", "description": "Devices the model runs on, joined by `|`: `cpu`, `gpu` and `npu`, such as `gpu|npu`, or `none`."},
+                         "pinned": {"type": "boolean", "description": "Whether the model is pinned, which exempts it from auto-eviction"},
+                         "is_busy": {"type": "boolean", "description": "Whether the model has active requests or maintenance in progress"},
+@@ -94,7 +94,8 @@ ordered_json health_schema() {
+                     "transcription": {"type": "integer", "description": "Maximum speech-to-text models"},
+                     "image": {"type": "integer", "description": "Maximum image models"},
+                     "tts": {"type": "integer", "description": "Maximum text-to-speech models"},
+-                    "classification": {"type": "integer", "description": "Maximum classification models"}
++                    "classification": {"type": "integer", "description": "Maximum classification models"},
++                    "image-classification": {"type": "integer", "description": "Maximum image-classification models"}
+                 },
+                 "additionalProperties": {"type": "integer"}
+             },
+-- 
+2.53.0
+

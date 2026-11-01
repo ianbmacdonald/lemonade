@@ -1,0 +1,135 @@
+From c20f5a61a81f8184dd31894358021e54ea3f9f68 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 01:53:44 -0400
+Subject: [PATCH 83/85] fix(download): a refused 416 resume restarts, and a
+ size match alone does not complete
+
+- A 416 whose HEAD check failed set can_resume=false but kept http_code 416,
+  which the retry loop treats as a permanent 4xx: it deleted the partial and
+  gave up instead of fetching from byte 0. A 416 now takes the fresh retry.
+- A 416 whose 2xx HEAD length matched the partial completed the download.
+  With no digest to check afterwards, that accepted any same-length partial.
+  Without a digest it now restarts from byte 0.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/utils/http_client.h |  1 +
+ src/cpp/server/utils/http_client.cpp      | 13 ++++++++-
+ test/cpp/test_parallel_download.cpp       | 33 ++++++++++++++++++++---
+ 3 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/src/cpp/include/lemon/utils/http_client.h b/src/cpp/include/lemon/utils/http_client.h
+index 448f5de85..8c60f3a95 100644
+--- a/src/cpp/include/lemon/utils/http_client.h
++++ b/src/cpp/include/lemon/utils/http_client.h
+@@ -53,6 +53,7 @@ struct DownloadResult {
+     bool can_resume = false;          // Whether partial download can be resumed
+     bool disk_full = false;            // True if download failed due to insufficient disk space
+     bool permanent = false;            // Non-recoverable failure (e.g. unsupported protocol, malformed URL); do not retry
++    bool size_only_completion = false; // A 416 resume whose partial matched the remote length; content unchecked
+ };
+ 
+ class HttpClientException : public std::runtime_error {
+diff --git a/src/cpp/server/utils/http_client.cpp b/src/cpp/server/utils/http_client.cpp
+index d2847d6b2..4684c7fe0 100644
+--- a/src/cpp/server/utils/http_client.cpp
++++ b/src/cpp/server/utils/http_client.cpp
+@@ -1619,6 +1619,7 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
+                                   << (resume_from / (1024.0 * 1024.0)) << " MB, remote: "
+                                   << (remote_size / (1024.0 * 1024.0)) << " MB)" << std::endl;
+                         result.success = true;
++                        result.size_only_completion = true;
+                         result.bytes_downloaded = 0;
+                         return result;
+                     } else {
+@@ -2607,6 +2608,14 @@ DownloadResult HttpClient::download_file(const std::string& url,
+             return final_result;
+         }
+ 
++        // Without a digest, a matching length says nothing about the bytes.
++        if (final_result.success && final_result.size_only_completion && !expected_hash.present()) {
++            final_result.success = false;
++            final_result.can_resume = false;
++            final_result.error_message = "A resume of " + output_path +
++                                         " found the partial at full length, with no digest to check it";
++        }
++
+         if (final_result.success) {
+             if (expected_hash.present()) {
+                 auto hash_result = verify_file_hash(partial_path_fs, expected_hash);
+@@ -2667,9 +2676,11 @@ DownloadResult HttpClient::download_file(const std::string& url,
+         }
+ 
+         // Don't retry permanent HTTP failures (4xx client errors).
+-        // 408 Request Timeout and 429 Too Many Requests are transient and still retried.
++        // 408 Request Timeout and 429 Too Many Requests are transient and still retried;
++        // a 416 refuses only the resume, so the fresh retry below handles it.
+         bool is_permanent_4xx = (final_result.http_code >= 400 && final_result.http_code < 500
+                                  && final_result.http_code != 408
++                                 && final_result.http_code != 416
+                                  && final_result.http_code != 429);
+         if (is_permanent_4xx) {
+             LOG(ERROR, "HttpClient") << "[Download] " << final_result.error_message << std::endl;
+diff --git a/test/cpp/test_parallel_download.cpp b/test/cpp/test_parallel_download.cpp
+index 64fae028c..f48fb773c 100644
+--- a/test/cpp/test_parallel_download.cpp
++++ b/test/cpp/test_parallel_download.cpp
+@@ -209,14 +209,25 @@ int main() {
+         }
+         res.set_content(payload, "application/octet-stream");
+     });
+-    // Every resume is refused with 416, and HEAD answers 404 with a body the
++    // Every resume past byte 0 is refused with 416, and HEAD answers 404 with a body the
+     // size of the partial: an error page whose length happens to match.
+     server.Get("/head404.bin", [&](const httplib::Request& req, httplib::Response& res) {
+         log.add(req);
+         if (req.method == "HEAD") {
+             res.status = 404;
+             res.set_content(small, "text/plain");
+-        } else if (!req.get_header_value("Range").empty()) {
++        } else if (range_start(req.get_header_value("Range")) > 0) {
++            res.status = 416;
++            res.set_content("", "text/plain");
++        } else {
++            res.set_content(small, "application/octet-stream");
++        }
++    });
++    // Every resume past byte 0 is refused with 416 and HEAD answers 200 with the real
++    // length, so a same-length partial looks complete by size alone.
++    server.Get("/head200.bin", [&](const httplib::Request& req, httplib::Response& res) {
++        log.add(req);
++        if (range_start(req.get_header_value("Range")) > 0) {
+             res.status = 416;
+             res.set_content("", "text/plain");
+         } else {
+@@ -657,11 +668,25 @@ int main() {
+         write_all(partial_of(f), garbage);
+         auto options = parallel_options();
+         options.allow_parallel = false;
++        options.max_retries = 1;
+         auto result = HttpClient::download_file(base + "/head404.bin", f.string(), nullptr, {},
+                                                 options, policy);
+         log.take();
+-        r.check(!(result.success && read_all(f) == garbage),
+-                "a 404 HEAD whose length matches the partial does not complete the download");
++        r.check(result.success && read_all(f) == small,
++                "a 404 HEAD whose length matches the partial restarts the download from byte 0");
++    }
++
++    {
++        const fs::path f = dir / "head200.bin";
++        write_all(partial_of(f), std::string(small.size(), 'x'));
++        auto options = parallel_options();
++        options.allow_parallel = false;
++        options.max_retries = 1;
++        auto result = HttpClient::download_file(base + "/head200.bin", f.string(), nullptr, {},
++                                                options, policy);
++        log.take();
++        r.check(result.success && read_all(f) == small,
++                "with no digest, a same-length partial is not taken as complete on a 416");
+     }
+ 
+     server.stop();
+-- 
+2.53.0
+

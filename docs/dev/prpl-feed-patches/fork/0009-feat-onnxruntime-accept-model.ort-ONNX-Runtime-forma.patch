@@ -1,7 +1,7 @@
-From 283fe16aac246a75070a379bdb8637b85f677b78 Mon Sep 17 00:00:00 2001
+From 168c924f699c115019cd8c2e83c5aed4e3da83e9 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 27 Sep 2026 11:22:23 -0400
-Subject: [PATCH 09/77] feat(onnxruntime): accept model.ort (ONNX Runtime
+Subject: [PATCH 09/85] feat(onnxruntime): accept model.ort (ONNX Runtime
  format) model directories
 
 A --minimal_build ONNX Runtime, which keeps ort-server small enough for a

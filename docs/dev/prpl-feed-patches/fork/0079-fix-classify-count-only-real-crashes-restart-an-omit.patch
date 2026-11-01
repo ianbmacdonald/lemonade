@@ -1,0 +1,455 @@
+From 5672e3c9794b335f70a52faeb0edb417e8a2efbd Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 01:08:19 -0400
+Subject: [PATCH 79/85] fix(classify): count only real crashes, restart an
+ omitted model, keep routing off a paused model
+
+- The watchdog stops a backend whose /health stays silent for three probes
+  after a request has run its 90 s grace, about 105 s, inside the 120 s
+  classify forward. That kill was recorded as backend_crashed_on_input, so
+  three slow inputs paused a model that never crashed. It now answers 504
+  backend_unresponsive_on_input, is still not retried, and is not counted.
+- /v1/classify without "model" looked for the sole classifier among live
+  backends only, so after a crash it answered 400 and never restarted the
+  model or reported its pause. Dead backends now count, as on the image route.
+- Router classifier helpers loaded their model before Router::classify checked
+  the crash pause, so a registered router restarted a paused classifier. The
+  helper now fails before loading, and the classifier's on_error applies.
+- record_classify_crash no longer throws when a backend error's code is not a
+  string.
+
+The fake engine gains a hang input that also blocks its /health, and the
+suite gains a 12 MiB multipart upload (accepted: httplib parses multipart
+into the form and leaves the body empty, so it is not counted twice).
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/wrapped_server.h        |   7 +-
+ src/cpp/server/router.cpp                     |  14 ++-
+ .../routes/lemonade/inference/classify.cpp    |  12 +-
+ .../lemonade/inference/images_classify.cpp    |   6 +-
+ .../routing_classifier_services_router.cpp    |  13 ++-
+ src/cpp/server/wrapped_server.cpp             |   7 +-
+ test/server_image_classify.py                 | 108 ++++++++++++++++++
+ test/utils/fake_tflite_server.py              |  18 ++-
+ 8 files changed, 173 insertions(+), 12 deletions(-)
+
+diff --git a/src/cpp/include/lemon/wrapped_server.h b/src/cpp/include/lemon/wrapped_server.h
+index a9f45e140..825d6fa7f 100644
+--- a/src/cpp/include/lemon/wrapped_server.h
++++ b/src/cpp/include/lemon/wrapped_server.h
+@@ -425,8 +425,12 @@ public:
+     // True once the backend watchdog force-reset the child process.
+     bool was_watchdog_triggered() const { return watchdog_triggered_.load(std::memory_order_acquire); }
+ 
++    // True when that reset stopped a live process whose health endpoint went silent,
++    // not one that had already exited.
++    bool was_reset_unresponsive() const { return watchdog_reset_unresponsive_.load(std::memory_order_acquire); }
++
+     // Request backend reset from watchdog (stops process immediately).
+-    void request_backend_reset_from_watchdog(const std::string& reason);
++    void request_backend_reset_from_watchdog(const std::string& reason, bool unresponsive = false);
+ 
+     // Human-readable state for /health and debugging endpoints.
+     virtual std::string get_backend_health_state() const;
+@@ -702,6 +706,7 @@ private:
+     std::atomic<bool> watchdog_stop_requested_{false};
+     std::atomic<bool> watchdog_running_{false};
+     std::atomic<bool> watchdog_triggered_{false};
++    std::atomic<bool> watchdog_reset_unresponsive_{false};
+     std::atomic<int> active_backend_requests_{0};
+     std::atomic<int> active_streaming_requests_{0};
+     std::atomic<int> active_non_streaming_requests_{0};
+diff --git a/src/cpp/server/router.cpp b/src/cpp/server/router.cpp
+index 712a7458c..0a220621c 100644
+--- a/src/cpp/server/router.cpp
++++ b/src/cpp/server/router.cpp
+@@ -1679,6 +1679,18 @@ auto Router::execute_inference(const json& request, Func&& inference_func,
+             server->release_inference();
+ 
+             if (watchdog_reset && !retry_after_watchdog_reset) {
++                // A slow input can outlast the watchdog's health probes without
++                // crashing anything; only a real crash may count against the model.
++                if (server->was_reset_unresponsive()) {
++                    return json{{"error", {
++                        {"message", "The backend for model '" + requested_model +
++                                        "' stopped responding while processing this input and was "
++                                        "stopped; it was not retried"},
++                        {"type", ErrorType::BACKEND_ERROR},
++                        {"code", "backend_unresponsive_on_input"},
++                        {"status_code", 504},
++                        {"retryable", false}}}};
++                }
+                 return json{{"error", {
+                     {"message", "The backend for model '" + requested_model +
+                                     "' crashed while processing this input; it was not retried"},
+@@ -2195,7 +2207,7 @@ json Router::classify(const json& request) {
+ 
+ void Router::record_classify_crash(const json& response, const std::string& requested_model) {
+     if (response.contains("error") && response["error"].is_object() &&
+-        response["error"].value("code", "") == "backend_crashed_on_input" &&
++        response["error"].contains("code") && response["error"]["code"] == "backend_crashed_on_input" &&
+         classify_crash_breaker_.record_crash(resolve_model_name(requested_model),
+                                              CrashBreaker::Clock::now())) {
+         LOG(WARNING, "Router") << "Classification for '" << requested_model
+diff --git a/src/cpp/server/routes/lemonade/inference/classify.cpp b/src/cpp/server/routes/lemonade/inference/classify.cpp
+index 42a40405a..b031a5483 100644
+--- a/src/cpp/server/routes/lemonade/inference/classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/classify.cpp
+@@ -31,6 +31,10 @@ const RouteError kCrashCooldown{
+ const RouteError kCrashedOnInput{
+     502, "backend_crashed_on_input",
+     "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
++const RouteError kUnresponsiveOnInput{
++    504, "backend_unresponsive_on_input",
++    "The backend stopped answering its health checks while working on this input and was stopped; the "
++    "request is not retried and does not count toward the crash pause"};
+ 
+ const RouteArg kModel{"model", ArgIn::JsonBody, {{"type", "string"}}, false, Support::Available,
+                       "The classifier model. Optional when exactly one classification model is loaded; that "
+@@ -119,7 +123,7 @@ public:
+         s.examples = {example};
+         s.errors = join_errors({{kBodyNotJson, kArgMissing, kArgInvalid,
+                                  kNoSoleClassifier, kImageModel, kCrashCooldown,
+-                                 kBackendRejected, kCrashedOnInput, kModelUnloaded, kBackendError,
++                                 kBackendRejected, kCrashedOnInput, kUnresponsiveOnInput, kModelUnloaded, kBackendError,
+                                  kMalformedBackendResponse, kUnexpectedException},
+                                 ModelLoader::errors()});
+         s.error_format = ErrorFormat::OpenAi;
+@@ -156,9 +160,11 @@ protected:
+         }
+ 
+         // The router requires a model on every request, so an omitted one is resolved
+-        // here, which is only possible when exactly one classifier is loaded.
++        // here, which is only possible when exactly one classifier is loaded. A crashed
++        // one still counts: this request either reloads it or reports its pause.
+         if (!req.has(kModel)) {
+-            req.model = ctx_.router->get_sole_loaded_model_of_type(ModelType::CLASSIFICATION);
++            req.model = ctx_.router->get_sole_loaded_model_of_type(
++                ModelType::CLASSIFICATION, /*include_dead_backends=*/true);
+             if (req.model.empty()) {
+                 write_openai_error(res, kNoSoleClassifier,
+                     "No 'model' specified and no single classification model "
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index c4301365e..070898ba4 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -46,6 +46,10 @@ const RouteError kNoSoleImageClassifier{
+ const RouteError kCrashedOnInput{
+     502, "backend_crashed_on_input",
+     "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
++const RouteError kUnresponsiveOnInput{
++    504, "backend_unresponsive_on_input",
++    "The backend stopped answering its health checks while working on this input and was stopped; the "
++    "request is not retried and does not count toward the crash pause"};
+ 
+ const RouteArg kModel{"model", ArgIn::Form, {{"type", "string"}}, false, Support::Available,
+                       "The image-classification model to use. Optional when exactly one is loaded."};
+@@ -173,7 +177,7 @@ public:
+         s.examples = {example};
+         s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired, kContentEncoding,
+                                  kServerBusy, kCrashCooldown,
+-                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput,
++                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput, kUnresponsiveOnInput,
+                                  kModelUnloaded, kBackendError, kMalformedBackendResponse,
+                                  kUnexpectedException},
+                                 ModelLoader::errors()});
+diff --git a/src/cpp/server/routing_classifier_services_router.cpp b/src/cpp/server/routing_classifier_services_router.cpp
+index 6a4392e8a..87800733c 100644
+--- a/src/cpp/server/routing_classifier_services_router.cpp
++++ b/src/cpp/server/routing_classifier_services_router.cpp
+@@ -5,6 +5,7 @@
+ #include <lemon/models/model_info.h>
+ #include <map>
+ #include <mutex>
++#include <stdexcept>
+ #include <utility>
+ 
+ namespace lemon {
+@@ -12,10 +13,20 @@ namespace lemon {
+ ClassifierServices make_router_classifier_services(
+     Router& router,
+     EnsureClassifierModelLoaded ensure_loaded) {
++    // A classifier paused by its crash breaker must not be reloaded by routing either.
++    EnsureClassifierModelLoaded ensure_unpaused =
++        [&router, ensure_loaded = std::move(ensure_loaded)](const std::string& model) {
++            if (auto paused = router.classify_cooldown_error(model)) {
++                throw std::runtime_error((*paused)["error"]["message"].get<std::string>());
++            }
++            if (ensure_loaded) {
++                ensure_loaded(model);
++            }
++        };
+     return make_classifier_services_from_router_calls(
+         [&router](const json& request) { return router.embeddings(request); },
+         [&router](const json& request) { return router.chat_completion(request); },
+-        std::move(ensure_loaded),
++        std::move(ensure_unpaused),
+         [&router](const json& request) { return router.classify(request); },
+         [&router](const std::string& model) { return router.get_model_type(model); });
+ }
+diff --git a/src/cpp/server/wrapped_server.cpp b/src/cpp/server/wrapped_server.cpp
+index 04e8c7cf6..55d6889e8 100644
+--- a/src/cpp/server/wrapped_server.cpp
++++ b/src/cpp/server/wrapped_server.cpp
+@@ -358,6 +358,7 @@ void WrappedServer::start_backend_watchdog(const BackendWatchdogPolicy& policy)
+     }
+ 
+     watchdog_triggered_.store(false, std::memory_order_release);
++    watchdog_reset_unresponsive_.store(false, std::memory_order_release);
+     watchdog_stop_requested_.store(false, std::memory_order_release);
+     active_backend_requests_.store(0, std::memory_order_release);
+     active_streaming_requests_.store(0, std::memory_order_release);
+@@ -439,10 +440,11 @@ void WrappedServer::stop_server() {
+     }
+ }
+ 
+-void WrappedServer::request_backend_reset_from_watchdog(const std::string& reason) {
++void WrappedServer::request_backend_reset_from_watchdog(const std::string& reason, bool unresponsive) {
+     if (watchdog_triggered_.exchange(true, std::memory_order_acq_rel)) {
+         return;
+     }
++    watchdog_reset_unresponsive_.store(unresponsive, std::memory_order_release);
+ 
+     {
+         std::lock_guard<std::mutex> lock(watchdog_mutex_);
+@@ -554,7 +556,8 @@ void WrappedServer::backend_watchdog_loop() {
+         if (consecutive_failures >= max_failures) {
+             request_backend_reset_from_watchdog(
+                 "health endpoint did not respond after " + std::to_string(max_failures) +
+-                " consecutive probes while a request was active");
++                " consecutive probes while a request was active",
++                /*unresponsive=*/true);
+             break;
+         }
+     }
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index 76cda431a..081e03450 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -19,6 +19,11 @@ Usage:
+     crashes on demand; pass --fake-state-dir, the FAKE_TFLITE_STATE_DIR the server
+     was started with.
+ 
++    --short-watchdog says the server was started with
++    LEMONADE_BACKEND_WATCHDOG_GRACE_SECONDS=10 and
++    LEMONADE_BACKEND_WATCHDOG_POLL_SECONDS=1, which enables the test of an input
++    that hangs the engine without crashing it.
++
+     --lemond-pid enables the resident-memory assertion on the oversized upload.
+ 
+ Negative tests need no model and run first. Positive tests skip, with the
+@@ -57,6 +62,7 @@ TIMEOUT_CLASSIFY = 300
+ MODEL = "user.MobileNetV2-1.0-224-TFLite"
+ TEXT_MODEL = "user.B194-Text-TFLite"
+ POISON_TEXT = "B194-POISON-TEXT"
++HANG_TEXT = "B194-HANG-TEXT"
+ FIXTURE = os.path.join(
+     os.path.dirname(os.path.abspath(__file__)), "test_image_grace_hopper.jpg"
+ )
+@@ -72,6 +78,7 @@ _opts = argparse.Namespace(
+     fake_backend=False,
+     fake_state_dir=None,
+     lemond_pid=None,
++    short_watchdog=False,
+ )
+ 
+ 
+@@ -86,6 +93,7 @@ def _parse_own_args():
+         "--fake-state-dir", default=os.environ.get("FAKE_TFLITE_STATE_DIR")
+     )
+     parser.add_argument("--lemond-pid", type=int)
++    parser.add_argument("--short-watchdog", action="store_true")
+     args, _ = parser.parse_known_args()
+     return args
+ 
+@@ -754,7 +762,46 @@ class ImageClassifyTests(ServerTestBase):
+             _line_count(starts) - starts_before, 1, "expected exactly one reload"
+         )
+ 
++    def test_512b_omitted_text_model_restarts_after_a_crash(self):
++        self._require_text_model()
++        starts = os.path.join(_opts.fake_state_dir, "starts.log")
++        self._assert_status(self._classify_text("hello"), 200, "warm-up")
++        self._assert_status(self._classify_text(POISON_TEXT), 502, "poison text")
++        starts_before = _line_count(starts)
++
++        # No model named: the sole classifier is chosen even though its
++        # backend is down, and this request restarts it.
++        response = requests.post(
++            f"{self.base_url}/classify",
++            json={"input": "hello"},
++            timeout=TIMEOUT_CLASSIFY,
++        )
++        self._assert_status(response, 200, "omitted model after a crash")
++        self.assertEqual(
++            _line_count(starts) - starts_before, 1, "expected exactly one restart"
++        )
++
++    def test_512c_unresponsive_text_is_not_counted_as_a_crash(self):
++        if not _opts.short_watchdog:
++            self.skipTest("needs --short-watchdog")
++        self._require_text_model()
++        hangs = os.path.join(_opts.fake_state_dir, "hangs.log")
++        self._assert_status(self._classify_text("hello"), 200, "warm-up")
++        for attempt in range(3):
++            hangs_before = _line_count(hangs)
++            response = self._classify_text(HANG_TEXT)
++            self._assert_status(response, 504, f"hanging text {attempt + 1}")
++            self.assertEqual(
++                response.json()["error"]["code"], "backend_unresponsive_on_input"
++            )
++            self.assertEqual(
++                _line_count(hangs) - hangs_before, 1, "the hanging text was replayed"
++            )
++        # Three slow inputs are not three crashes, so the model is not paused.
++        self._assert_status(self._classify_text("hello"), 200, "after three hangs")
++
+     def test_513_repeated_text_crashes_pause_the_model(self):
++        self._require_model()
+         self._require_text_model()
+         crashes = os.path.join(_opts.fake_state_dir, "crashes.log")
+         starts = os.path.join(_opts.fake_state_dir, "starts.log")
+@@ -769,6 +816,57 @@ class ImageClassifyTests(ServerTestBase):
+ 
+         crashes_before, starts_before = _line_count(crashes), _line_count(starts)
+         self._assert_status(self._classify_text("hello"), 503, "good text while paused")
++
++        # A registered router that uses the paused model as its classifier takes
++        # its on_error path; it must not restart the model to find that out.
++        # Routing loads a helper only for a registered policy, hence /pull.
++        collection = "user.B194-Text-Router"
++        policy = {
++            "version": "1",
++            "model_name": collection,
++            "recipe": "collection.router",
++            "components": [TEXT_MODEL, MODEL],
++            "routing": {
++                "candidates": [MODEL],
++                "default_model": MODEL,
++                "classifiers": [
++                    {
++                        "id": "safety",
++                        "type": "classifier",
++                        "model": TEXT_MODEL,
++                        "labels": ["safe", "unsafe"],
++                        "default_label": "unsafe",
++                        "on_error": "match_false",
++                    }
++                ],
++                "rules": [
++                    {
++                        "id": "unsafe",
++                        "match": {"classifier": "safety", "min_score": 0.5},
++                        "route_to": MODEL,
++                    }
++                ],
++            },
++        }
++        # Offline, /pull registers the definition and answers lemond_offline.
++        response = requests.post(f"{self.base_url}/pull", json=policy, timeout=600)
++        if response.status_code != 200:
++            self._assert_status(response, 400, "register the router collection")
++            self.assertEqual(response.json().get("code"), "lemond_offline")
++        try:
++            response = requests.post(
++                f"{self.base_url}/routing/validate",
++                json={"model": collection, "prompt": "hello"},
++                timeout=TIMEOUT_CLASSIFY,
++            )
++            self._assert_status(response, 200, "routing/validate while paused")
++        finally:
++            requests.post(
++                f"{self.base_url}/delete",
++                json={"model_name": collection},
++                timeout=TIMEOUT_DEFAULT,
++            )
++
+         self.assertEqual(
+             _line_count(crashes), crashes_before, "paused model crashed again"
+         )
+@@ -776,6 +874,16 @@ class ImageClassifyTests(ServerTestBase):
+             _line_count(starts), starts_before, "paused model was reloaded"
+         )
+ 
++    def test_514_large_multipart_image_is_accepted(self):
++        # 12 MiB is under the 16 MiB image cap and the 23 MiB body cap.
++        self._require_model()
++        image = _jpeg_like(b"\x01" * (12 * 1024 * 1024))
++        response = self._post_form(
++            {"image": ("big.jpg", image, "image/jpeg")},
++            data={"model": MODEL, "top_k": "1"},
++        )
++        self._assert_status(response, 200, "12 MiB multipart image")
++
+ 
+ if __name__ == "__main__":
+     _opts = _parse_own_args()
+diff --git a/test/utils/fake_tflite_server.py b/test/utils/fake_tflite_server.py
+index 81bfc424c..ad5aad36d 100644
+--- a/test/utils/fake_tflite_server.py
++++ b/test/utils/fake_tflite_server.py
+@@ -17,10 +17,12 @@ task=image-classification, and serves POST /classify/image:
+ 
+ A model dir with tokenizer.json and config.json and no manifest.json is served
+ as a text classifier instead: POST /classify takes {"text"}, crashes on text
+-containing POISON_TEXT, and otherwise returns fixed label scores.
++containing POISON_TEXT, never answers text containing HANG_TEXT and stops
++answering GET /health meanwhile, as a single-threaded engine would, and
++otherwise returns fixed label scores.
+ 
+-When FAKE_TFLITE_STATE_DIR is set, each start and each crash appends a line to
+-starts.log / crashes.log there, and each start writes its arguments as a JSON
++When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
++starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
+ list to args.log.
+ """
+ 
+@@ -30,6 +32,7 @@ import os
+ import signal
+ import struct
+ import sys
++import threading
+ import time
+ from email.parser import BytesParser
+ from email.policy import HTTP
+@@ -38,6 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ POISON = b"B169-POISON-IMAGE"
+ SLOW = b"B169-SLOW-IMAGE"
+ POISON_TEXT = "B194-POISON-TEXT"
++HANG_TEXT = "B194-HANG-TEXT"
+ SLOW_SECONDS = 4
+ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+ 
+@@ -84,6 +88,8 @@ def _crash():
+ 
+ 
+ def make_handler(args, task):
++    busy = threading.Lock()
++
+     class Handler(BaseHTTPRequestHandler):
+         def log_message(self, *a):
+             pass
+@@ -98,6 +104,8 @@ def make_handler(args, task):
+ 
+         def do_GET(self):
+             if self.path == "/health":
++                with busy:
++                    pass
+                 self._send(
+                     200,
+                     {"status": "ok", "engine": "fake", "task": task},
+@@ -114,6 +122,10 @@ def make_handler(args, task):
+                 text = json.loads(body or b"{}").get("text", "")
+                 if POISON_TEXT in text:
+                     _crash()
++                if HANG_TEXT in text:
++                    _log("hangs.log", str(os.getpid()))
++                    with busy:
++                        time.sleep(600)
+                 self._send(200, {"labels": {"safe": 0.9, "unsafe": 0.1}})
+                 return
+             if self.path == "/classify":
+-- 
+2.53.0
+

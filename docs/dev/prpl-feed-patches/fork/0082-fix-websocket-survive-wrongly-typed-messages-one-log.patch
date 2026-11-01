@@ -1,0 +1,333 @@
+From fcb4e3dbb82b8759b329a6ea043297612973b428 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 01:53:43 -0400
+Subject: [PATCH 82/85] fix(websocket): survive wrongly typed messages, one log
+ subscription per connection, drop stalled readers
+
+- handle_message caught only json::parse_error. Valid JSON of the wrong shape
+  ([], null, {"type":0}, a numeric token) threw type_error out of the
+  libwebsockets callback and terminated lemond, before authentication on
+  /spans/stream. Non-objects are refused and any exception from a message is
+  answered with an error.
+- Each logs.subscribe added a LogStreamHub subscriber and kept only the newest
+  id, so repeats multiplied every log line and outlived the connection (and,
+  holding this, the server after a WebSocket restart). A repeat now replaces
+  the connection's subscription.
+- The outbound queues had no bound. A connection that stops reading is closed
+  once 16 MiB is queued for it.
+
+These are upstream code paths; the gateway exposes them on the LAN.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/websocket_server.h |  8 +++
+ src/cpp/server/websocket_server.cpp      | 62 ++++++++++++++++--
+ test/cpp/test_websocket_limits.cpp       | 83 ++++++++++++++++++++++++
+ 3 files changed, 148 insertions(+), 5 deletions(-)
+
+diff --git a/src/cpp/include/lemon/websocket_server.h b/src/cpp/include/lemon/websocket_server.h
+index ab87624aa..d9732a519 100644
+--- a/src/cpp/include/lemon/websocket_server.h
++++ b/src/cpp/include/lemon/websocket_server.h
+@@ -12,6 +12,7 @@
+ #include <string>
+ #include <thread>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ #include <libwebsockets.h>
+ #include <nlohmann/json.hpp>
+@@ -51,6 +52,8 @@ public:
+     };
+ 
+     static constexpr size_t kMaxMessageBytes = 4 * 1024 * 1024;
++    // Outbound bytes held for one connection before it is closed as a stalled reader.
++    static constexpr size_t kMaxQueuedBytes = 16 * 1024 * 1024;
+ 
+     WebSocketServer(Router* router, const std::string& host, int requested_port);
+     ~WebSocketServer();
+@@ -151,6 +154,9 @@ private:
+     std::unordered_map<std::string, struct lws*> connection_websockets_;
+     // Per-connection outbound message queues (deferred write pattern)
+     std::unordered_map<std::string, std::queue<std::string>> message_queues_;
++    std::unordered_map<std::string, size_t> queued_bytes_;
++    // Connections over kMaxQueuedBytes, closed on the service thread
++    std::unordered_set<std::string> overflowed_;
+     // Per-connection inbound reassembly buffers (libwebsockets may fragment frames)
+     std::unordered_map<std::string, std::string> receive_buffers_;
+     std::mutex connections_mutex_;
+@@ -184,6 +190,8 @@ private:
+ 
+     // Send JSON message to WebSocket by connection ID
+     void send_json(const std::string& connection_id, const json& msg);
++    // Caller holds connections_mutex_.
++    void enqueue_locked(const std::string& connection_id, std::string payload);
+ 
+     void handle_log_subscribe(const std::string& connection_id,
+                               std::optional<uint64_t> after_seq);
+diff --git a/src/cpp/server/websocket_server.cpp b/src/cpp/server/websocket_server.cpp
+index 0c7847f33..20e8bcc9f 100644
+--- a/src/cpp/server/websocket_server.cpp
++++ b/src/cpp/server/websocket_server.cpp
+@@ -213,7 +213,17 @@ int WebSocketServer::ws_callback(struct lws* wsi,
+                     complete_msg = std::move(server->receive_buffers_[conn_id]);
+                     server->receive_buffers_[conn_id].clear();
+                 }
+-                server->handle_message(conn_id, complete_msg);
++                // A wrongly typed field throws from nlohmann; escaping into
++                // libwebsockets would terminate the process.
++                try {
++                    server->handle_message(conn_id, complete_msg);
++                } catch (const std::exception& e) {
++                    server->send_json(conn_id, {
++                        {"type", "error"},
++                        {"error", {{"message", "Invalid message: " + std::string(e.what())},
++                                   {"type", "invalid_request_error"}}},
++                    });
++                }
+             }
+             break;
+         }
+@@ -316,6 +326,8 @@ void WebSocketServer::stop() {
+         connection_states_.clear();
+         connection_websockets_.clear();
+         message_queues_.clear();
++        queued_bytes_.clear();
++        overflowed_.clear();
+         receive_buffers_.clear();
+         pending_authenticated_tokens_.clear();
+         per_client_.clear();
+@@ -564,12 +576,19 @@ void WebSocketServer::handle_log_subscribe(const std::string& connection_id,
+         after_seq,
+         snapshot_entries);
+ 
++    std::string previous_subscriber_id;
+     {
+         std::lock_guard<std::mutex> lock(connections_mutex_);
+         auto& state = connection_states_[connection_id];
+         state.kind = ConnectionKind::logs;
++        previous_subscriber_id = std::move(state.log_subscriber_id);
+         state.log_subscriber_id = subscriber_id;
+     }
++    // A repeated subscribe replaces the connection's subscription; close and
++    // stop() only know the latest one.
++    if (!previous_subscriber_id.empty()) {
++        LogStreamHub::instance().remove_subscriber(previous_subscriber_id);
++    }
+ 
+     json entries_json = json::array();
+     for (const auto& entry : snapshot_entries) {
+@@ -609,6 +628,14 @@ void WebSocketServer::handle_message(const std::string& connection_id, const std
+         return;
+     }
+ 
++    if (!request.is_object()) {
++        send_json(connection_id, {
++            {"type", "error"},
++            {"error", {{"message", "Invalid message: expected a JSON object"}, {"type", "invalid_request_error"}}},
++        });
++        return;
++    }
++
+     const std::string msg_type = request.value("type", "");
+ 
+     if (!is_authenticated) {
+@@ -751,6 +778,8 @@ void WebSocketServer::handle_close(const std::string& connection_id) {
+ 
+         connection_websockets_.erase(connection_id);
+         message_queues_.erase(connection_id);
++        queued_bytes_.erase(connection_id);
++        overflowed_.erase(connection_id);
+         receive_buffers_.erase(connection_id);
+     }
+ 
+@@ -776,6 +805,7 @@ void WebSocketServer::handle_writable(const std::string& connection_id, struct l
+         }
+         msg = std::move(it->second.front());
+         it->second.pop();
++        queued_bytes_[connection_id] -= msg.size();
+         has_more = !it->second.empty();
+     }
+ 
+@@ -884,8 +914,7 @@ void WebSocketServer::send_json(const std::string& connection_id, const json& ms
+         std::lock_guard<std::mutex> lock(connections_mutex_);
+         auto it = connection_websockets_.find(connection_id);
+         if (it != connection_websockets_.end() && it->second != nullptr) {
+-            message_queues_[connection_id].push(std::move(payload));
+-            writable_dispatch_pending_.store(true);
++            enqueue_locked(connection_id, std::move(payload));
+         }
+     } catch (const std::exception& e) {
+         std::fprintf(stderr, "WebSocket send_json failed for %s: %s\n",
+@@ -900,12 +929,36 @@ void WebSocketServer::send_json(const std::string& connection_id, const json& ms
+     }
+ }
+ 
++void WebSocketServer::enqueue_locked(const std::string& connection_id, std::string payload) {
++    if (overflowed_.count(connection_id)) {
++        return;
++    }
++    size_t& queued = queued_bytes_[connection_id];
++    if (queued + payload.size() > kMaxQueuedBytes) {
++        // The peer is not reading; drop it rather than buffer without bound.
++        LOG(WARNING, "WebSocket") << "Closing connection " << connection_id << ": over "
++                                  << kMaxQueuedBytes << " bytes queued for a client that is not reading"
++                                  << std::endl;
++        overflowed_.insert(connection_id);
++    } else {
++        queued += payload.size();
++        message_queues_[connection_id].push(std::move(payload));
++    }
++    writable_dispatch_pending_.store(true);
++}
++
+ void WebSocketServer::schedule_pending_writes() {
+     if (!writable_dispatch_pending_.exchange(false)) {
+         return;
+     }
+ 
+     std::lock_guard<std::mutex> lock(connections_mutex_);
++    for (const auto& connection_id : overflowed_) {
++        auto ws_it = connection_websockets_.find(connection_id);
++        if (ws_it != connection_websockets_.end() && ws_it->second != nullptr) {
++            lws_set_timeout(ws_it->second, PENDING_TIMEOUT_USER_OK, LWS_TO_KILL_ASYNC);
++        }
++    }
+     for (const auto& [connection_id, wsi] : connection_websockets_) {
+         if (wsi == nullptr) {
+             continue;
+@@ -1006,8 +1059,7 @@ void WebSocketServer::broadcast_span(const json& span) {
+                     std::string payload = filtered_span.dump(-1, ' ', false, json::error_handler_t::replace);
+                     auto it = connection_websockets_.find(conn_id);
+                     if (it != connection_websockets_.end() && it->second != nullptr) {
+-                        message_queues_[conn_id].push(std::move(payload));
+-                        writable_dispatch_pending_.store(true);
++                        enqueue_locked(conn_id, std::move(payload));
+                     }
+                 } catch (const std::exception& e) {
+                     std::fprintf(stderr, "WebSocket broadcast_span failed for %s: %s\n",
+diff --git a/test/cpp/test_websocket_limits.cpp b/test/cpp/test_websocket_limits.cpp
+index 539226a9b..783c3c8ed 100644
+--- a/test/cpp/test_websocket_limits.cpp
++++ b/test/cpp/test_websocket_limits.cpp
+@@ -20,6 +20,7 @@
+ #include <unistd.h>
+ #endif
+ 
++#include <lemon/log_stream.h>
+ #include <lemon/websocket_server.h>
+ 
+ #include "test_config_helpers.h"
+@@ -70,6 +71,10 @@ public:
+ 
+     bool upgraded() const { return upgraded_; }
+ 
++    void set_receive_buffer(int bytes) {
++        ::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
++    }
++
+     void set_timeout(int seconds) {
+         timeval tv{seconds, 0};
+         ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+@@ -112,6 +117,16 @@ public:
+         }
+     }
+ 
++    // True only on EOF or a reset; any data is read and discarded.
++    bool reaches_eof() {
++        char buf[65536];
++        while (true) {
++            const auto n = ::recv(fd_, buf, sizeof(buf), 0);
++            if (n == 0) return true;
++            if (n < 0) return errno != EAGAIN && errno != EWOULDBLOCK;
++        }
++    }
++
+     std::string read_text_frame() {
+         uint8_t header[2];
+         if (!recv_all(header, 2)) return "";
+@@ -268,6 +283,71 @@ void test_spans_auth_deadline() {
+     server.stop();
+ }
+ 
++// Valid JSON of the wrong shape, before authentication.
++void test_wrongly_typed_messages() {
++    ::setenv("LEMONADE_API_KEY", "test-key", 1);
++    WebSocketServer server(nullptr, "127.0.0.1", 0);
++    ::unsetenv("LEMONADE_API_KEY");
++    check(server.start(), "typed messages: server starts");
++    Client c("127.0.0.1", server.get_port(), "/spans/stream");
++    check(c.upgraded(), "typed messages: connection admitted");
++    for (const char* msg : {"[]", "null", "5", R"({"type":0})", R"({"type":"auth","token":123})"}) {
++        check(c.send_frame(0x1, true, msg) &&
++                  c.read_text_frame().find("\"error\"") != std::string::npos,
++              (std::string("typed messages: ") + msg + " is answered with an error").c_str());
++    }
++    check(c.send_frame(0x1, true, R"({"type":"auth","token":"test-key"})") &&
++              c.read_text_frame().find("auth.ok") != std::string::npos,
++          "typed messages: the connection still authenticates afterwards");
++    server.stop();
++}
++
++// Count the logs.entry frames that carry `marker` until the socket goes quiet.
++int entries_with(Client& c, const std::string& marker) {
++    int n = 0;
++    c.set_timeout(1);
++    for (std::string frame = c.read_text_frame(); !frame.empty(); frame = c.read_text_frame()) {
++        if (frame.find("logs.entry") != std::string::npos && frame.find(marker) != std::string::npos) {
++            ++n;
++        }
++    }
++    return n;
++}
++
++void test_repeated_subscribe() {
++    WebSocketServer server(nullptr, "127.0.0.1", 0);
++    check(server.start(), "repeated subscribe: server starts");
++    Client c("127.0.0.1", server.get_port(), "/logs/stream");
++    check(c.upgraded(), "repeated subscribe: connection admitted");
++    for (int i = 0; i < 3; ++i) {
++        check(c.send_frame(0x1, true, R"({"type":"logs.subscribe"})") &&
++                  c.read_text_frame().find("logs.snapshot") != std::string::npos,
++              "repeated subscribe: each subscribe is answered with a snapshot");
++    }
++    lemon::LogStreamHub::instance().publish(AixLog::Metadata(), "repeated-subscribe-marker");
++    check(entries_with(c, "repeated-subscribe-marker") == 1,
++          "repeated subscribe: one log line is delivered once");
++    server.stop();
++}
++
++void test_stalled_reader_is_dropped() {
++    WebSocketServer server(nullptr, "127.0.0.1", 0);
++    check(server.start(), "stalled reader: server starts");
++    Client c("127.0.0.1", server.get_port(), "/logs/stream");
++    c.set_receive_buffer(4096);
++    check(c.upgraded() && c.send_frame(0x1, true, R"({"type":"logs.subscribe"})") &&
++              c.read_text_frame().find("logs.snapshot") != std::string::npos,
++          "stalled reader: subscribed");
++    // The client reads nothing more while 40 MiB is published.
++    const std::string line(64 * 1024, 'q');
++    for (size_t sent = 0; sent < (40u << 20); sent += line.size()) {
++        lemon::LogStreamHub::instance().publish(AixLog::Metadata(), line);
++    }
++    c.set_timeout(5);
++    check(c.reaches_eof(), "stalled reader: a client that stops reading is disconnected");
++    server.stop();
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -278,6 +358,9 @@ int main() {
+     test_per_client_cap();
+     test_message_cap();
+     test_spans_auth_deadline();
++    test_wrongly_typed_messages();
++    test_repeated_subscribe();
++    test_stalled_reader_is_dropped();
+     return report_results("websocket limits");
+ }
+ 
+-- 
+2.53.0
+
