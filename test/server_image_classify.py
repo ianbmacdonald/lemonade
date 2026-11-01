@@ -71,6 +71,7 @@ REFERENCE_SCORE = 0.803491
 REFERENCE_TOL = 0.02
 POISON = b"B169-POISON-IMAGE"
 SLOW = b"B169-SLOW-IMAGE"
+HANG_IMAGE = b"B194-HANG-IMAGE"
 
 _opts = argparse.Namespace(
     image_model_dir=None,
@@ -799,6 +800,31 @@ class ImageClassifyTests(ServerTestBase):
             )
         # Three slow inputs are not three crashes, so the model is not paused.
         self._assert_status(self._classify_text("hello"), 200, "after three hangs")
+
+    def test_512d_hanging_image_resets_the_backend(self):
+        # Under the default watchdog (about 105 s to a kill) the image forward
+        # must outlast the kill, or a hung engine is never reset.
+        if _opts.short_watchdog:
+            self.skipTest("needs the default watchdog")
+        hangs = os.path.join(_opts.fake_state_dir, "hangs.log")
+        self._post_form(
+            {"image": ("g.jpg", self._fixture(), "image/jpeg")}, {"model": MODEL}
+        )
+        hangs_before = _line_count(hangs)
+        response = self._post_form(
+            {"image": ("hang.jpg", _jpeg_like(HANG_IMAGE), "image/jpeg")},
+            data={"model": MODEL},
+        )
+        self._assert_status(response, 504, "hanging image")
+        self.assertEqual(
+            response.json()["error"]["code"], "backend_unresponsive_on_input"
+        )
+        self.assertEqual(_line_count(hangs) - hangs_before, 1)
+        response = self._post_form(
+            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+            data={"model": MODEL, "top_k": "1"},
+        )
+        self._assert_reference(response, 1)
 
     def test_513_repeated_text_crashes_pause_the_model(self):
         self._require_model()

@@ -13,6 +13,8 @@ task=image-classification, and serves POST /classify/image:
   in-flight cap test hold requests open;
 - a PNG whose IHDR claims more than --max-image-pixels pixels, or whose data
   is truncated, gets 400 like the real decoder;
+- an image containing HANG_IMAGE is never answered, and GET /health stops
+  answering meanwhile;
 - anything else gets a fixed ranked prediction list.
 
 A model dir with tokenizer.json and config.json and no manifest.json is served
@@ -40,6 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 POISON = b"B169-POISON-IMAGE"
 SLOW = b"B169-SLOW-IMAGE"
+HANG_IMAGE = b"B194-HANG-IMAGE"
 POISON_TEXT = "B194-POISON-TEXT"
 HANG_TEXT = "B194-HANG-TEXT"
 SLOW_SECONDS = 4
@@ -148,6 +151,10 @@ def make_handler(args, task):
                 _crash()
             if SLOW in image:
                 time.sleep(SLOW_SECONDS)
+            if HANG_IMAGE in image:
+                _log("hangs.log", str(os.getpid()))
+                with busy:
+                    time.sleep(600)
             if image.startswith(PNG_SIGNATURE):
                 problem = _png_problem(image, args.max_image_pixels)
                 if problem:

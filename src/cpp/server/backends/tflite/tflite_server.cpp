@@ -361,7 +361,7 @@ json TfliteServer::classify_image(const json& params, std::string image_bytes) {
     if (mime.empty()) mime = "application/octet-stream";
     fields.push_back({"image", std::move(image_bytes), "image", std::move(mime)});
     fields.push_back({"top_k", std::to_string(top_k), "", ""});
-    return normalize_backend_error(forward_multipart_request("/classify/image", fields, 60));
+    return normalize_backend_error(forward_multipart_request("/classify/image", fields, 120));
 }
 
 }  // namespace backends
