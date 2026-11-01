@@ -5,6 +5,7 @@
 #include <lemon/models/model_info.h>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <utility>
 
 namespace lemon {
@@ -12,10 +13,20 @@ namespace lemon {
 ClassifierServices make_router_classifier_services(
     Router& router,
     EnsureClassifierModelLoaded ensure_loaded) {
+    // A classifier paused by its crash breaker must not be reloaded by routing either.
+    EnsureClassifierModelLoaded ensure_unpaused =
+        [&router, ensure_loaded = std::move(ensure_loaded)](const std::string& model) {
+            if (auto paused = router.classify_cooldown_error(model)) {
+                throw std::runtime_error((*paused)["error"]["message"].get<std::string>());
+            }
+            if (ensure_loaded) {
+                ensure_loaded(model);
+            }
+        };
     return make_classifier_services_from_router_calls(
         [&router](const json& request) { return router.embeddings(request); },
         [&router](const json& request) { return router.chat_completion(request); },
-        std::move(ensure_loaded),
+        std::move(ensure_unpaused),
         [&router](const json& request) { return router.classify(request); },
         [&router](const std::string& model) { return router.get_model_type(model); });
 }

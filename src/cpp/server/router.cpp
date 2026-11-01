@@ -1679,6 +1679,18 @@ auto Router::execute_inference(const json& request, Func&& inference_func,
             server->release_inference();
 
             if (watchdog_reset && !retry_after_watchdog_reset) {
+                // A slow input can outlast the watchdog's health probes without
+                // crashing anything; only a real crash may count against the model.
+                if (server->was_reset_unresponsive()) {
+                    return json{{"error", {
+                        {"message", "The backend for model '" + requested_model +
+                                        "' stopped responding while processing this input and was "
+                                        "stopped; it was not retried"},
+                        {"type", ErrorType::BACKEND_ERROR},
+                        {"code", "backend_unresponsive_on_input"},
+                        {"status_code", 504},
+                        {"retryable", false}}}};
+                }
                 return json{{"error", {
                     {"message", "The backend for model '" + requested_model +
                                     "' crashed while processing this input; it was not retried"},
@@ -2195,7 +2207,7 @@ json Router::classify(const json& request) {
 
 void Router::record_classify_crash(const json& response, const std::string& requested_model) {
     if (response.contains("error") && response["error"].is_object() &&
-        response["error"].value("code", "") == "backend_crashed_on_input" &&
+        response["error"].contains("code") && response["error"]["code"] == "backend_crashed_on_input" &&
         classify_crash_breaker_.record_crash(resolve_model_name(requested_model),
                                              CrashBreaker::Clock::now())) {
         LOG(WARNING, "Router") << "Classification for '" << requested_model

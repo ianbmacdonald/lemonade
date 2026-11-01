@@ -46,6 +46,10 @@ const RouteError kNoSoleImageClassifier{
 const RouteError kCrashedOnInput{
     502, "backend_crashed_on_input",
     "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
+const RouteError kUnresponsiveOnInput{
+    504, "backend_unresponsive_on_input",
+    "The backend stopped answering its health checks while working on this input and was stopped; the "
+    "request is not retried and does not count toward the crash pause"};
 
 const RouteArg kModel{"model", ArgIn::Form, {{"type", "string"}}, false, Support::Available,
                       "The image-classification model to use. Optional when exactly one is loaded."};
@@ -173,7 +177,7 @@ public:
         s.examples = {example};
         s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired, kContentEncoding,
                                  kServerBusy, kCrashCooldown,
-                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput,
+                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput, kUnresponsiveOnInput,
                                  kModelUnloaded, kBackendError, kMalformedBackendResponse,
                                  kUnexpectedException},
                                 ModelLoader::errors()});

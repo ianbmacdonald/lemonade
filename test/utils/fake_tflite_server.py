@@ -17,10 +17,12 @@ task=image-classification, and serves POST /classify/image:
 
 A model dir with tokenizer.json and config.json and no manifest.json is served
 as a text classifier instead: POST /classify takes {"text"}, crashes on text
-containing POISON_TEXT, and otherwise returns fixed label scores.
+containing POISON_TEXT, never answers text containing HANG_TEXT and stops
+answering GET /health meanwhile, as a single-threaded engine would, and
+otherwise returns fixed label scores.
 
-When FAKE_TFLITE_STATE_DIR is set, each start and each crash appends a line to
-starts.log / crashes.log there, and each start writes its arguments as a JSON
+When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
+starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
 list to args.log.
 """
 
@@ -30,6 +32,7 @@ import os
 import signal
 import struct
 import sys
+import threading
 import time
 from email.parser import BytesParser
 from email.policy import HTTP
@@ -38,6 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 POISON = b"B169-POISON-IMAGE"
 SLOW = b"B169-SLOW-IMAGE"
 POISON_TEXT = "B194-POISON-TEXT"
+HANG_TEXT = "B194-HANG-TEXT"
 SLOW_SECONDS = 4
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -84,6 +88,8 @@ def _crash():
 
 
 def make_handler(args, task):
+    busy = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -98,6 +104,8 @@ def make_handler(args, task):
 
         def do_GET(self):
             if self.path == "/health":
+                with busy:
+                    pass
                 self._send(
                     200,
                     {"status": "ok", "engine": "fake", "task": task},
@@ -114,6 +122,10 @@ def make_handler(args, task):
                 text = json.loads(body or b"{}").get("text", "")
                 if POISON_TEXT in text:
                     _crash()
+                if HANG_TEXT in text:
+                    _log("hangs.log", str(os.getpid()))
+                    with busy:
+                        time.sleep(600)
                 self._send(200, {"labels": {"safe": 0.9, "unsafe": 0.1}})
                 return
             if self.path == "/classify":

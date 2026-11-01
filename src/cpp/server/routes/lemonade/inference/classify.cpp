@@ -31,6 +31,10 @@ const RouteError kCrashCooldown{
 const RouteError kCrashedOnInput{
     502, "backend_crashed_on_input",
     "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
+const RouteError kUnresponsiveOnInput{
+    504, "backend_unresponsive_on_input",
+    "The backend stopped answering its health checks while working on this input and was stopped; the "
+    "request is not retried and does not count toward the crash pause"};
 
 const RouteArg kModel{"model", ArgIn::JsonBody, {{"type", "string"}}, false, Support::Available,
                       "The classifier model. Optional when exactly one classification model is loaded; that "
@@ -119,7 +123,7 @@ public:
         s.examples = {example};
         s.errors = join_errors({{kBodyNotJson, kArgMissing, kArgInvalid,
                                  kNoSoleClassifier, kImageModel, kCrashCooldown,
-                                 kBackendRejected, kCrashedOnInput, kModelUnloaded, kBackendError,
+                                 kBackendRejected, kCrashedOnInput, kUnresponsiveOnInput, kModelUnloaded, kBackendError,
                                  kMalformedBackendResponse, kUnexpectedException},
                                 ModelLoader::errors()});
         s.error_format = ErrorFormat::OpenAi;
@@ -156,9 +160,11 @@ protected:
         }
 
         // The router requires a model on every request, so an omitted one is resolved
-        // here, which is only possible when exactly one classifier is loaded.
+        // here, which is only possible when exactly one classifier is loaded. A crashed
+        // one still counts: this request either reloads it or reports its pause.
         if (!req.has(kModel)) {
-            req.model = ctx_.router->get_sole_loaded_model_of_type(ModelType::CLASSIFICATION);
+            req.model = ctx_.router->get_sole_loaded_model_of_type(
+                ModelType::CLASSIFICATION, /*include_dead_backends=*/true);
             if (req.model.empty()) {
                 write_openai_error(res, kNoSoleClassifier,
                     "No 'model' specified and no single classification model "

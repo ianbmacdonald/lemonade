@@ -19,6 +19,11 @@ Usage:
     crashes on demand; pass --fake-state-dir, the FAKE_TFLITE_STATE_DIR the server
     was started with.
 
+    --short-watchdog says the server was started with
+    LEMONADE_BACKEND_WATCHDOG_GRACE_SECONDS=10 and
+    LEMONADE_BACKEND_WATCHDOG_POLL_SECONDS=1, which enables the test of an input
+    that hangs the engine without crashing it.
+
     --lemond-pid enables the resident-memory assertion on the oversized upload.
 
 Negative tests need no model and run first. Positive tests skip, with the
@@ -57,6 +62,7 @@ TIMEOUT_CLASSIFY = 300
 MODEL = "user.MobileNetV2-1.0-224-TFLite"
 TEXT_MODEL = "user.B194-Text-TFLite"
 POISON_TEXT = "B194-POISON-TEXT"
+HANG_TEXT = "B194-HANG-TEXT"
 FIXTURE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "test_image_grace_hopper.jpg"
 )
@@ -72,6 +78,7 @@ _opts = argparse.Namespace(
     fake_backend=False,
     fake_state_dir=None,
     lemond_pid=None,
+    short_watchdog=False,
 )
 
 
@@ -86,6 +93,7 @@ def _parse_own_args():
         "--fake-state-dir", default=os.environ.get("FAKE_TFLITE_STATE_DIR")
     )
     parser.add_argument("--lemond-pid", type=int)
+    parser.add_argument("--short-watchdog", action="store_true")
     args, _ = parser.parse_known_args()
     return args
 
@@ -754,7 +762,46 @@ class ImageClassifyTests(ServerTestBase):
             _line_count(starts) - starts_before, 1, "expected exactly one reload"
         )
 
+    def test_512b_omitted_text_model_restarts_after_a_crash(self):
+        self._require_text_model()
+        starts = os.path.join(_opts.fake_state_dir, "starts.log")
+        self._assert_status(self._classify_text("hello"), 200, "warm-up")
+        self._assert_status(self._classify_text(POISON_TEXT), 502, "poison text")
+        starts_before = _line_count(starts)
+
+        # No model named: the sole classifier is chosen even though its
+        # backend is down, and this request restarts it.
+        response = requests.post(
+            f"{self.base_url}/classify",
+            json={"input": "hello"},
+            timeout=TIMEOUT_CLASSIFY,
+        )
+        self._assert_status(response, 200, "omitted model after a crash")
+        self.assertEqual(
+            _line_count(starts) - starts_before, 1, "expected exactly one restart"
+        )
+
+    def test_512c_unresponsive_text_is_not_counted_as_a_crash(self):
+        if not _opts.short_watchdog:
+            self.skipTest("needs --short-watchdog")
+        self._require_text_model()
+        hangs = os.path.join(_opts.fake_state_dir, "hangs.log")
+        self._assert_status(self._classify_text("hello"), 200, "warm-up")
+        for attempt in range(3):
+            hangs_before = _line_count(hangs)
+            response = self._classify_text(HANG_TEXT)
+            self._assert_status(response, 504, f"hanging text {attempt + 1}")
+            self.assertEqual(
+                response.json()["error"]["code"], "backend_unresponsive_on_input"
+            )
+            self.assertEqual(
+                _line_count(hangs) - hangs_before, 1, "the hanging text was replayed"
+            )
+        # Three slow inputs are not three crashes, so the model is not paused.
+        self._assert_status(self._classify_text("hello"), 200, "after three hangs")
+
     def test_513_repeated_text_crashes_pause_the_model(self):
+        self._require_model()
         self._require_text_model()
         crashes = os.path.join(_opts.fake_state_dir, "crashes.log")
         starts = os.path.join(_opts.fake_state_dir, "starts.log")
@@ -769,12 +816,73 @@ class ImageClassifyTests(ServerTestBase):
 
         crashes_before, starts_before = _line_count(crashes), _line_count(starts)
         self._assert_status(self._classify_text("hello"), 503, "good text while paused")
+
+        # A registered router that uses the paused model as its classifier takes
+        # its on_error path; it must not restart the model to find that out.
+        # Routing loads a helper only for a registered policy, hence /pull.
+        collection = "user.B194-Text-Router"
+        policy = {
+            "version": "1",
+            "model_name": collection,
+            "recipe": "collection.router",
+            "components": [TEXT_MODEL, MODEL],
+            "routing": {
+                "candidates": [MODEL],
+                "default_model": MODEL,
+                "classifiers": [
+                    {
+                        "id": "safety",
+                        "type": "classifier",
+                        "model": TEXT_MODEL,
+                        "labels": ["safe", "unsafe"],
+                        "default_label": "unsafe",
+                        "on_error": "match_false",
+                    }
+                ],
+                "rules": [
+                    {
+                        "id": "unsafe",
+                        "match": {"classifier": "safety", "min_score": 0.5},
+                        "route_to": MODEL,
+                    }
+                ],
+            },
+        }
+        # Offline, /pull registers the definition and answers lemond_offline.
+        response = requests.post(f"{self.base_url}/pull", json=policy, timeout=600)
+        if response.status_code != 200:
+            self._assert_status(response, 400, "register the router collection")
+            self.assertEqual(response.json().get("code"), "lemond_offline")
+        try:
+            response = requests.post(
+                f"{self.base_url}/routing/validate",
+                json={"model": collection, "prompt": "hello"},
+                timeout=TIMEOUT_CLASSIFY,
+            )
+            self._assert_status(response, 200, "routing/validate while paused")
+        finally:
+            requests.post(
+                f"{self.base_url}/delete",
+                json={"model_name": collection},
+                timeout=TIMEOUT_DEFAULT,
+            )
+
         self.assertEqual(
             _line_count(crashes), crashes_before, "paused model crashed again"
         )
         self.assertEqual(
             _line_count(starts), starts_before, "paused model was reloaded"
         )
+
+    def test_514_large_multipart_image_is_accepted(self):
+        # 12 MiB is under the 16 MiB image cap and the 23 MiB body cap.
+        self._require_model()
+        image = _jpeg_like(b"\x01" * (12 * 1024 * 1024))
+        response = self._post_form(
+            {"image": ("big.jpg", image, "image/jpeg")},
+            data={"model": MODEL, "top_k": "1"},
+        )
+        self._assert_status(response, 200, "12 MiB multipart image")
 
 
 if __name__ == "__main__":

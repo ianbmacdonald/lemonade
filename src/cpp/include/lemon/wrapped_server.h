@@ -425,8 +425,12 @@ public:
     // True once the backend watchdog force-reset the child process.
     bool was_watchdog_triggered() const { return watchdog_triggered_.load(std::memory_order_acquire); }
 
+    // True when that reset stopped a live process whose health endpoint went silent,
+    // not one that had already exited.
+    bool was_reset_unresponsive() const { return watchdog_reset_unresponsive_.load(std::memory_order_acquire); }
+
     // Request backend reset from watchdog (stops process immediately).
-    void request_backend_reset_from_watchdog(const std::string& reason);
+    void request_backend_reset_from_watchdog(const std::string& reason, bool unresponsive = false);
 
     // Human-readable state for /health and debugging endpoints.
     virtual std::string get_backend_health_state() const;
@@ -702,6 +706,7 @@ private:
     std::atomic<bool> watchdog_stop_requested_{false};
     std::atomic<bool> watchdog_running_{false};
     std::atomic<bool> watchdog_triggered_{false};
+    std::atomic<bool> watchdog_reset_unresponsive_{false};
     std::atomic<int> active_backend_requests_{0};
     std::atomic<int> active_streaming_requests_{0};
     std::atomic<int> active_non_streaming_requests_{0};
