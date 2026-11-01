@@ -22,6 +22,15 @@ static bool construct_throws(const json& config) {
     }
 }
 
+static std::string construct_error(const json& config) {
+    try {
+        RuntimeConfig{config};
+        return "";
+    } catch (const std::invalid_argument& e) {
+        return e.what();
+    }
+}
+
 static bool set_throws(const json& changes) {
     try {
         RuntimeConfig(json::object()).set(changes);
@@ -56,6 +65,9 @@ int main() {
           "a string timeout in config.json is refused, not read as off");
     check(construct_throws({{"max_request_body_mb", 32.5}}),
           "a fractional body limit in config.json is refused");
+    check(construct_error({{"max_connections_per_client", "8"}}) ==
+              "'max_connections_per_client' must be an integer (got string)",
+          "the refusal names the type it got, so a quoted number is obvious");
 
     const RuntimeConfig too_big(json{{"max_request_body_mb", 100000},
                                      {"request_receive_timeout", 7200},

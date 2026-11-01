@@ -15,7 +15,10 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <filesystem>
 #include <iostream>
+#include <memory>
+#include <stdexcept>
 #include <thread>
 
 #if defined(__GLIBC__)
@@ -175,7 +178,14 @@ int main(int argc, char** argv) {
         json config_json = ConfigFile::load(cli_config.cache_dir,
                                             cli_config.config_dir);
 
-        auto config = std::make_shared<RuntimeConfig>(config_json);
+        std::shared_ptr<RuntimeConfig> config;
+        try {
+            config = std::make_shared<RuntimeConfig>(config_json);
+        } catch (const std::invalid_argument& e) {
+            const std::filesystem::path config_path =
+                utils::path_from_utf8(utils::get_config_dir()) / "config.json";
+            throw std::invalid_argument(utils::path_to_utf8(config_path) + ": " + e.what());
+        }
         RuntimeConfig::set_global(config.get());
 
         if (cli_config.port != -1) {

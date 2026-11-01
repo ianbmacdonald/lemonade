@@ -314,7 +314,8 @@ RuntimeConfig::RuntimeConfig(const json& config)
     // These read back as "off" when mistyped, which must not pass silently.
     for (const char* key : {"max_request_body_mb", "request_receive_timeout", "max_connections_per_client"}) {
         if (config_.contains(key) && !config_[key].is_number_integer()) {
-            throw std::invalid_argument(std::string("'") + key + "' must be an integer");
+            throw std::invalid_argument(std::string("'") + key + "' must be an integer (got " +
+                                        config_[key].type_name() + ")");
         }
     }
     // Migrate legacy no_broadcast if present
