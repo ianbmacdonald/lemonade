@@ -1,7 +1,7 @@
 From b078babdca4f6d1795e29504dc81cc67ecb191a0 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:07:54 -0400
-Subject: [PATCH 78/85] fix(backends): refuse a NUL in *_args, and answer 400
+Subject: [PATCH 78/87] fix(backends): refuse a NUL in *_args, and answer 400
  for refused *_args
 
 validate_custom_args compared whole std::string tokens, but execvp reads each

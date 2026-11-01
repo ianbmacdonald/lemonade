@@ -1,7 +1,7 @@
 From 5672e3c9794b335f70a52faeb0edb417e8a2efbd Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:08:19 -0400
-Subject: [PATCH 79/85] fix(classify): count only real crashes, restart an
+Subject: [PATCH 79/87] fix(classify): count only real crashes, restart an
  omitted model, keep routing off a paused model
 
 - The watchdog stops a backend whose /health stays silent for three probes

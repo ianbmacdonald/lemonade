@@ -1,0 +1,38 @@
+From c25d4641a80724478a184660406d0eb441408d99 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 12:18:48 -0500
+Subject: [PATCH 87/87] fix(router): read the watchdog reset kind before
+ releasing the backend
+
+execute_inference read was_reset_unresponsive() after release_inference(),
+when an eviction may already have freed the server.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/router.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/cpp/server/router.cpp b/src/cpp/server/router.cpp
+index 0a220621c..1ae9af54e 100644
+--- a/src/cpp/server/router.cpp
++++ b/src/cpp/server/router.cpp
+@@ -1676,12 +1676,15 @@ auto Router::execute_inference(const json& request, Func&& inference_func,
+                 failed_instance_id = server->get_instance_id();
+             }
+ 
++            // Read before release_inference(): once released, an eviction may free server.
++            const bool reset_unresponsive = watchdog_reset && server->was_reset_unresponsive();
++
+             server->release_inference();
+ 
+             if (watchdog_reset && !retry_after_watchdog_reset) {
+                 // A slow input can outlast the watchdog's health probes without
+                 // crashing anything; only a real crash may count against the model.
+-                if (server->was_reset_unresponsive()) {
++                if (reset_unresponsive) {
+                     return json{{"error", {
+                         {"message", "The backend for model '" + requested_model +
+                                         "' stopped responding while processing this input and was "
+-- 
+2.53.0
+

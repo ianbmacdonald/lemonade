@@ -1,7 +1,7 @@
 From d40e853b229e34425307f11f5423020f62b73cfd Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:52:56 -0400
-Subject: [PATCH 29/85] feat(routing): classify against a registered router in
+Subject: [PATCH 29/87] feat(routing): classify against a registered router in
  /routing/validate
 
 POST /routing/validate now also accepts {"model": <collection.router>, ...}

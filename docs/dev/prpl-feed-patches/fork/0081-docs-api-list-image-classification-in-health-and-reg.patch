@@ -1,7 +1,7 @@
 From e89411d1fc74bd68f78f3110179ae478fd6ae674 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:08:19 -0400
-Subject: [PATCH 81/85] docs(api): list image-classification in /health and
+Subject: [PATCH 81/87] docs(api): list image-classification in /health and
  regenerate the reference
 
 Assisted-by: claude:opus-5.5

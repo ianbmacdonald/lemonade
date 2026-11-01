@@ -1,7 +1,7 @@
 From 3e69321d99dedfc9e3a520791e2cd7589b41362e Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:48:13 -0400
-Subject: [PATCH 33/85] fix(cli): accept every non-default backend mode in
+Subject: [PATCH 33/87] fix(cli): accept every non-default backend mode in
  lemonade pull --label
 
 flm serves transcription and openmoss serves audio-generation beside

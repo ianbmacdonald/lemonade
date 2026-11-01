@@ -1,0 +1,369 @@
+From fe6ab143dda098c0185287e4c5abe53a3288c729 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 12:18:48 -0500
+Subject: [PATCH 86/87] fix(websocket): never log while holding the connection
+ lock, and let one large message through
+
+With the hub log sink installed, every log line is sent to /logs/stream
+subscribers through send_json, which takes connections_mutex_. Three
+warnings were logged while that lock was held: a connection over the
+outbound queue bound, an oversized message, and a refused connection.
+Any of them deadlocked lemond while a log subscriber was connected.
+They are now collected under the lock and logged after it is released.
+
+An empty queue now always accepts the next message, so a large
+logs.snapshot no longer closes a client that is keeping up.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/websocket_server.h |   5 +
+ src/cpp/server/websocket_server.cpp      | 139 ++++++++++++++---------
+ test/cpp/test_websocket_limits.cpp       |  63 ++++++++++
+ 3 files changed, 152 insertions(+), 55 deletions(-)
+
+diff --git a/src/cpp/include/lemon/websocket_server.h b/src/cpp/include/lemon/websocket_server.h
+index d9732a519..4ad896825 100644
+--- a/src/cpp/include/lemon/websocket_server.h
++++ b/src/cpp/include/lemon/websocket_server.h
+@@ -13,6 +13,7 @@
+ #include <thread>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <vector>
+ 
+ #include <libwebsockets.h>
+ #include <nlohmann/json.hpp>
+@@ -157,6 +158,9 @@ private:
+     std::unordered_map<std::string, size_t> queued_bytes_;
+     // Connections over kMaxQueuedBytes, closed on the service thread
+     std::unordered_set<std::string> overflowed_;
++    // Warnings raised under connections_mutex_ and logged once it is released:
++    // a log line is itself sent to /logs/stream subscribers through send_json.
++    std::vector<std::string> deferred_warnings_;
+     // Per-connection inbound reassembly buffers (libwebsockets may fragment frames)
+     std::unordered_map<std::string, std::string> receive_buffers_;
+     std::mutex connections_mutex_;
+@@ -202,6 +206,7 @@ private:
+     void drain_pending_adoptions();
+     bool admits_locked(const std::string& client) const;
+     void note_refusal_locked(const std::string& client);
++    void log_deferred_warnings();
+ 
+     // Service loop run in background thread
+     void service_loop();
+diff --git a/src/cpp/server/websocket_server.cpp b/src/cpp/server/websocket_server.cpp
+index 20e8bcc9f..3f95f4c14 100644
+--- a/src/cpp/server/websocket_server.cpp
++++ b/src/cpp/server/websocket_server.cpp
+@@ -98,13 +98,19 @@ int WebSocketServer::ws_callback(struct lws* wsi,
+             char peer[sizeof(PerSessionData::peer)] = {0};
+             lws_get_peer_simple(wsi, peer, sizeof(peer));
+             const std::string client = ConnectionGuard::normalize_address(peer);
++            bool admitted = false;
+             {
+                 std::lock_guard<std::mutex> lock(server->connections_mutex_);
+-                if (!server->admits_locked(client)) {
++                admitted = server->admits_locked(client);
++                if (admitted) {
++                    server->pending_authenticated_tokens_[wsi] = authenticated_token;
++                } else {
+                     server->note_refusal_locked(client);
+-                    return 1;
+                 }
+-                server->pending_authenticated_tokens_[wsi] = authenticated_token;
++            }
++            if (!admitted) {
++                server->log_deferred_warnings();
++                return 1;
+             }
+             if (pss) {
+                 pss->authenticated = authenticated;
+@@ -190,6 +196,7 @@ int WebSocketServer::ws_callback(struct lws* wsi,
+ 
+             std::string conn_id(pss->connection_id);
+ 
++            bool too_large = false;
+             {
+                 std::lock_guard<std::mutex> lock(server->connections_mutex_);
+                 auto state_it = server->connection_states_.find(conn_id);
+@@ -197,13 +204,16 @@ int WebSocketServer::ws_callback(struct lws* wsi,
+                     break;
+                 }
+                 auto& buffer = server->receive_buffers_[conn_id];
+-                if (buffer.size() + len > kMaxMessageBytes) {
+-                    LOG(WARNING, "WebSocket") << "Closing connection " << conn_id
+-                                              << ": message exceeds " << kMaxMessageBytes
+-                                              << " bytes" << std::endl;
+-                    return -1;
++                too_large = buffer.size() + len > kMaxMessageBytes;
++                if (!too_large) {
++                    buffer.append(static_cast<const char*>(in), len);
+                 }
+-                buffer.append(static_cast<const char*>(in), len);
++            }
++            if (too_large) {
++                LOG(WARNING, "WebSocket") << "Closing connection " << conn_id
++                                          << ": message exceeds " << kMaxMessageBytes
++                                          << " bytes" << std::endl;
++                return -1;
+             }
+ 
+             if (lws_remaining_packet_payload(wsi) == 0 && lws_is_final_fragment(wsi)) {
+@@ -413,11 +423,22 @@ void WebSocketServer::note_refusal_locked(const std::string& client) {
+     // refusal and then every 100th rather than every one.
+     const uint64_t n = ++refused_;
+     if (n == 1 || n % 100 == 0) {
+-        LOG(WARNING, "WebSocket") << "Refused connection from " << client << ": "
+-                                  << open_connections_ << " open, limits "
+-                                  << limits_.max_connections << " total and "
+-                                  << limits_.max_connections_per_client << " per client ("
+-                                  << n << " refused so far)" << std::endl;
++        deferred_warnings_.push_back("Refused connection from " + client + ": " +
++                                     std::to_string(open_connections_) + " open, limits " +
++                                     std::to_string(limits_.max_connections) + " total and " +
++                                     std::to_string(limits_.max_connections_per_client) +
++                                     " per client (" + std::to_string(n) + " refused so far)");
++    }
++}
++
++void WebSocketServer::log_deferred_warnings() {
++    std::vector<std::string> warnings;
++    {
++        std::lock_guard<std::mutex> lock(connections_mutex_);
++        warnings.swap(deferred_warnings_);
++    }
++    for (const auto& warning : warnings) {
++        LOG(WARNING, "WebSocket") << warning << std::endl;
+     }
+ }
+ 
+@@ -911,11 +932,14 @@ void WebSocketServer::send_json(const std::string& connection_id, const json& ms
+     try {
+         payload = msg.dump(-1, ' ', false, json::error_handler_t::replace);
+ 
+-        std::lock_guard<std::mutex> lock(connections_mutex_);
+-        auto it = connection_websockets_.find(connection_id);
+-        if (it != connection_websockets_.end() && it->second != nullptr) {
+-            enqueue_locked(connection_id, std::move(payload));
++        {
++            std::lock_guard<std::mutex> lock(connections_mutex_);
++            auto it = connection_websockets_.find(connection_id);
++            if (it != connection_websockets_.end() && it->second != nullptr) {
++                enqueue_locked(connection_id, std::move(payload));
++            }
+         }
++        log_deferred_warnings();
+     } catch (const std::exception& e) {
+         std::fprintf(stderr, "WebSocket send_json failed for %s: %s\n",
+                      connection_id.c_str(), e.what());
+@@ -934,11 +958,13 @@ void WebSocketServer::enqueue_locked(const std::string& connection_id, std::stri
+         return;
+     }
+     size_t& queued = queued_bytes_[connection_id];
+-    if (queued + payload.size() > kMaxQueuedBytes) {
++    // An empty queue always takes the next message, so one large message (a
++    // logs.snapshot) never closes a client that is keeping up.
++    if (queued > 0 && queued + payload.size() > kMaxQueuedBytes) {
+         // The peer is not reading; drop it rather than buffer without bound.
+-        LOG(WARNING, "WebSocket") << "Closing connection " << connection_id << ": over "
+-                                  << kMaxQueuedBytes << " bytes queued for a client that is not reading"
+-                                  << std::endl;
++        deferred_warnings_.push_back("Closing connection " + connection_id + ": over " +
++                                     std::to_string(kMaxQueuedBytes) +
++                                     " bytes queued for a client that is not reading");
+         overflowed_.insert(connection_id);
+     } else {
+         queued += payload.size();
+@@ -1023,51 +1049,54 @@ void WebSocketServer::broadcast_span(const json& span) {
+         }
+     }
+ 
+-    std::lock_guard<std::mutex> lock(connections_mutex_);
+-    for (const auto& [conn_id, state] : connection_states_) {
+-        if (state.kind == ConnectionKind::spans) {
+-            if (!state.authenticated) {
+-                continue;
+-            }
++    {
++        std::lock_guard<std::mutex> lock(connections_mutex_);
++        for (const auto& [conn_id, state] : connection_states_) {
++            if (state.kind == ConnectionKind::spans) {
++                if (!state.authenticated) {
++                    continue;
++                }
+ 
+-            bool is_admin = !admin_api_key_.empty() && (state.authenticated_token == admin_api_key_);
+-            bool matches_token = !target_token_hash.empty() && (state.authenticated_token_hash == target_token_hash);
+-            bool guest_allowed = target_token_hash.empty() && api_key_.empty();
++                bool is_admin = !admin_api_key_.empty() && (state.authenticated_token == admin_api_key_);
++                bool matches_token = !target_token_hash.empty() && (state.authenticated_token_hash == target_token_hash);
++                bool guest_allowed = target_token_hash.empty() && api_key_.empty();
+ 
+-            if (is_admin || matches_token || guest_allowed) {
+-                bool is_guest = !is_admin && !matches_token;
+-                if (is_guest) {
+-                    if (state.client_session_id.empty() || span_session_id.empty() || state.client_session_id != span_session_id) {
+-                        continue;
++                if (is_admin || matches_token || guest_allowed) {
++                    bool is_guest = !is_admin && !matches_token;
++                    if (is_guest) {
++                        if (state.client_session_id.empty() || span_session_id.empty() || state.client_session_id != span_session_id) {
++                            continue;
++                        }
+                     }
+-                }
+ 
+-                try {
+-                    // Deep clone to strip sensitive auth token hash from broadcast
+-                    json filtered_span = span;
+-                    if (filtered_span.contains("attributes") && filtered_span["attributes"].is_array()) {
+-                        auto& attrs = filtered_span["attributes"];
+-                        for (auto it = attrs.begin(); it != attrs.end(); ) {
+-                            if (it->is_object() && it->value("key", "") == "lemon.auth_token_hash") {
+-                                it = attrs.erase(it);
+-                            } else {
+-                                ++it;
++                    try {
++                        // Deep clone to strip sensitive auth token hash from broadcast
++                        json filtered_span = span;
++                        if (filtered_span.contains("attributes") && filtered_span["attributes"].is_array()) {
++                            auto& attrs = filtered_span["attributes"];
++                            for (auto it = attrs.begin(); it != attrs.end(); ) {
++                                if (it->is_object() && it->value("key", "") == "lemon.auth_token_hash") {
++                                    it = attrs.erase(it);
++                                } else {
++                                    ++it;
++                                }
+                             }
+                         }
+-                    }
+ 
+-                    std::string payload = filtered_span.dump(-1, ' ', false, json::error_handler_t::replace);
+-                    auto it = connection_websockets_.find(conn_id);
+-                    if (it != connection_websockets_.end() && it->second != nullptr) {
+-                        enqueue_locked(conn_id, std::move(payload));
++                        std::string payload = filtered_span.dump(-1, ' ', false, json::error_handler_t::replace);
++                        auto it = connection_websockets_.find(conn_id);
++                        if (it != connection_websockets_.end() && it->second != nullptr) {
++                            enqueue_locked(conn_id, std::move(payload));
++                        }
++                    } catch (const std::exception& e) {
++                        std::fprintf(stderr, "WebSocket broadcast_span failed for %s: %s\n",
++                                     conn_id.c_str(), e.what());
+                     }
+-                } catch (const std::exception& e) {
+-                    std::fprintf(stderr, "WebSocket broadcast_span failed for %s: %s\n",
+-                                 conn_id.c_str(), e.what());
+                 }
+             }
+         }
+     }
++    log_deferred_warnings();
+ 
+     {
+         std::lock_guard<std::mutex> lock(context_mutex_);
+diff --git a/test/cpp/test_websocket_limits.cpp b/test/cpp/test_websocket_limits.cpp
+index 783c3c8ed..f7226d9be 100644
+--- a/test/cpp/test_websocket_limits.cpp
++++ b/test/cpp/test_websocket_limits.cpp
+@@ -1,6 +1,7 @@
+ // Connection, message-size and authentication-deadline limits of the
+ // WebSocket server, driven over real sockets against its own port.
+ 
++#include <atomic>
+ #include <cerrno>
+ #include <chrono>
+ #include <cstdint>
+@@ -8,6 +9,7 @@
+ #include <cstdlib>
+ #include <string>
+ #include <thread>
++#include <utility>
+ 
+ #ifndef _WIN32
+ #include <arpa/inet.h>
+@@ -21,6 +23,7 @@
+ #endif
+ 
+ #include <lemon/log_stream.h>
++#include <lemon/logging_config.h>
+ #include <lemon/websocket_server.h>
+ 
+ #include "test_config_helpers.h"
+@@ -348,6 +351,65 @@ void test_stalled_reader_is_dropped() {
+     server.stop();
+ }
+ 
++// Runs fn on a worker and fails the whole binary if it has not returned within
++// the deadline; a deadlocked worker cannot be joined.
++template <typename Fn>
++void finishes_within(int seconds, const char* label, Fn fn) {
++    std::atomic<bool> done{false};
++    std::thread worker([&] {
++        fn();
++        done = true;
++    });
++    for (int i = 0; i < seconds * 10 && !done; ++i) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    }
++    if (!done) {
++        std::printf("FAIL: %s (no return after %d s)\n", label, seconds);
++        std::fflush(stdout);
++        std::_Exit(1);
++    }
++    worker.join();
++    check(true, label);
++}
++
++// With the hub sink installed, every log line is also sent to /logs/stream
++// subscribers, so the server must not log while it holds its own lock.
++void test_logging_under_load_with_hub_sink() {
++    lemon::LogRotationConfig no_file;
++    no_file.file_mode = "disabled";
++    lemon::configure_application_logging("info", lemon::LoggingMode::direct_server, no_file);
++
++    WebSocketServer server(nullptr, "127.0.0.1", 0);
++    check(server.start(), "hub sink: server starts");
++    Client watcher("127.0.0.1", server.get_port(), "/logs/stream");
++    check(watcher.upgraded() && watcher.send_frame(0x1, true, R"({"type":"logs.subscribe"})") &&
++              watcher.read_text_frame().find("logs.snapshot") != std::string::npos,
++          "hub sink: watcher subscribed");
++
++    Client big("127.0.0.1", server.get_port(), "/logs/stream");
++    check(big.upgraded(), "hub sink: second connection admitted");
++    const std::string chunk(1024 * 1024, 'a');
++    bool sent = big.send_frame(0x1, false, chunk);
++    for (size_t total = chunk.size(); sent && total <= WebSocketServer::kMaxMessageBytes;
++         total += chunk.size()) {
++        sent = big.send_frame(0x0, false, chunk);
++    }
++    check(big.closed_by_server(), "hub sink: an oversized message closes its connection");
++    check(eventually_upgrades("127.0.0.1", server.get_port(), "/logs/stream"),
++          "hub sink: server still accepts connections after logging an oversized message");
++
++    watcher.set_receive_buffer(4096);
++    finishes_within(30, "hub sink: publishing to a stalled subscriber returns", [] {
++        const std::string line(64 * 1024, 'q');
++        for (size_t sent = 0; sent < (40u << 20); sent += line.size()) {
++            lemon::LogStreamHub::instance().publish(AixLog::Metadata(), line);
++        }
++    });
++    watcher.set_timeout(5);
++    check(watcher.reaches_eof(), "hub sink: the stalled subscriber is disconnected");
++    server.stop();
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -361,6 +423,7 @@ int main() {
+     test_wrongly_typed_messages();
+     test_repeated_subscribe();
+     test_stalled_reader_is_dropped();
++    test_logging_under_load_with_hub_sink();
+     return report_results("websocket limits");
+ }
+ 
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From 6bfa9095a49c880233f5a357c2c4210faccefeb7 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:40:11 -0400
-Subject: [PATCH 27/85] docs: use the built-in MobileNetV2 name in image
+Subject: [PATCH 27/87] docs: use the built-in MobileNetV2 name in image
  classify examples
 
 The /v1/images/classify examples now name the registry model

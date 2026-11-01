@@ -7,7 +7,7 @@ on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 85 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0085). |
+| Series: `fork/` | 87 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0087). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -63,6 +63,7 @@ generic build fixes that musl just happens to exercise:
 | 0059-0076 | fixes from the branch's review rounds |
 | 0077 | route spec fixes and the regenerated API reference |
 | 0078-0085 | fixes from the branch's fourth review round (`*_args` NUL refusal and 400, classify crash accounting, close-on-exec beacon socket, WebSocket message handling and queue bound, 416 resume recovery, descriptor hygiene in forked backends, the unsecured-bind warning) |
+| 0086-0087 | WebSocket warnings logged outside the connection lock, and the watchdog reset kind read before the backend is released |
 
 ## Not carried
 

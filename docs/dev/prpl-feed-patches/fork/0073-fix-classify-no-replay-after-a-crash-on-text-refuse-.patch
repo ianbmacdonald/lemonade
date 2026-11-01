@@ -1,7 +1,7 @@
 From ecd4fff3f3e45ccca732314cdc64a4a9198994bb Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 17:55:22 -0400
-Subject: [PATCH 73/85] fix(classify): no replay after a crash on text, refuse
+Subject: [PATCH 73/87] fix(classify): no replay after a crash on text, refuse
  labels, no linked cache
 
 Text classification replayed an input once after it crashed the backend,

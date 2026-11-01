@@ -1,7 +1,7 @@
 From 6578c2157d44111d461f60cc1b4d846f041652db Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Fri, 9 Oct 2026 02:18:39 -0400
-Subject: [PATCH 47/85] feat(server): gateway limits - body limit setting,
+Subject: [PATCH 47/87] feat(server): gateway limits - body limit setting,
  receive deadline, per-client cap, classify text checks
 
 max_request_body_mb (default 100) replaces cpp-httplib's compile-time payload
