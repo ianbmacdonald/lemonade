@@ -1,7 +1,7 @@
 From d4e4b95ac20a98a90967af88ffa87151bda0aba8 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 01:11:20 -0400
-Subject: [PATCH 51/87] feat: pin /pull to an exact Hugging Face revision
+Subject: [PATCH 51/88] feat: pin /pull to an exact Hugging Face revision
 
 Port of the fork's B174 series (c9d7f27b6..4cc581600, 22 commits) onto the
 refactored model manager (models/ingest, artifact_store, update_scan and the

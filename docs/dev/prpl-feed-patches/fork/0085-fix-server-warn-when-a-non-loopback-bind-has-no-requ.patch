@@ -1,7 +1,7 @@
 From c75e99de7d1c97067fabc777ccce00cbb8380edd Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:53:44 -0400
-Subject: [PATCH 85/87] fix(server): warn when a non-loopback bind has no
+Subject: [PATCH 85/88] fix(server): warn when a non-loopback bind has no
  request_receive_timeout
 
 The limits stay off by default; a LAN-facing server without them can be held

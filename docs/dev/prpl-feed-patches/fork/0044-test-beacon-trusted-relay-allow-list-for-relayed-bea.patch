@@ -1,7 +1,7 @@
 From b1e6e2e34e841673a00b0fcef42c64f9e35659dd Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 21:21:33 -0400
-Subject: [PATCH 44/87] test(beacon): trusted relay allow-list for relayed
+Subject: [PATCH 44/88] test(beacon): trusted relay allow-list for relayed
  beacons (RED)
 
 Config validation for beacon_trusted_relays, peer-table accept/refuse

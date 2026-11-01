@@ -1,7 +1,7 @@
 From 41d113264d4def1c40d00c68510c8786d2a88d11 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 18:27:21 -0400
-Subject: [PATCH 38/87] fix(server): make parallel download resume durable and
+Subject: [PATCH 38/88] fix(server): make parallel download resume durable and
  keep progress on local failures
 
 Review follow-ups on the parallel Range download path.

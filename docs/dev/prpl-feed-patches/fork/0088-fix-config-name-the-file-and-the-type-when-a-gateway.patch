@@ -1,0 +1,95 @@
+From 9d44629f86c384e67b0b94aee1048ad2a61f37e9 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 13:29:30 -0500
+Subject: [PATCH 88/88] fix(config): name the file and the type when a gateway
+ limit is mistyped
+
+A quoted limit in config.json stops lemond at startup. The error now
+names the config.json it read and the JSON type it found, so a quoted
+number is obvious.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/server/main.cpp                 | 12 +++++++++++-
+ src/cpp/server/runtime_config.cpp       |  3 ++-
+ test/cpp/test_config_gateway_limits.cpp | 12 ++++++++++++
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/cpp/server/main.cpp b/src/cpp/server/main.cpp
+index 655e6a654..913297b68 100644
+--- a/src/cpp/server/main.cpp
++++ b/src/cpp/server/main.cpp
+@@ -15,7 +15,10 @@
+ #include <cerrno>
+ #include <chrono>
+ #include <csignal>
++#include <filesystem>
+ #include <iostream>
++#include <memory>
++#include <stdexcept>
+ #include <thread>
+ 
+ #if defined(__GLIBC__)
+@@ -175,7 +178,14 @@ int main(int argc, char** argv) {
+         json config_json = ConfigFile::load(cli_config.cache_dir,
+                                             cli_config.config_dir);
+ 
+-        auto config = std::make_shared<RuntimeConfig>(config_json);
++        std::shared_ptr<RuntimeConfig> config;
++        try {
++            config = std::make_shared<RuntimeConfig>(config_json);
++        } catch (const std::invalid_argument& e) {
++            const std::filesystem::path config_path =
++                utils::path_from_utf8(utils::get_config_dir()) / "config.json";
++            throw std::invalid_argument(utils::path_to_utf8(config_path) + ": " + e.what());
++        }
+         RuntimeConfig::set_global(config.get());
+ 
+         if (cli_config.port != -1) {
+diff --git a/src/cpp/server/runtime_config.cpp b/src/cpp/server/runtime_config.cpp
+index be794d2fa..770022698 100644
+--- a/src/cpp/server/runtime_config.cpp
++++ b/src/cpp/server/runtime_config.cpp
+@@ -314,7 +314,8 @@ RuntimeConfig::RuntimeConfig(const json& config)
+     // These read back as "off" when mistyped, which must not pass silently.
+     for (const char* key : {"max_request_body_mb", "request_receive_timeout", "max_connections_per_client"}) {
+         if (config_.contains(key) && !config_[key].is_number_integer()) {
+-            throw std::invalid_argument(std::string("'") + key + "' must be an integer");
++            throw std::invalid_argument(std::string("'") + key + "' must be an integer (got " +
++                                        config_[key].type_name() + ")");
+         }
+     }
+     // Migrate legacy no_broadcast if present
+diff --git a/test/cpp/test_config_gateway_limits.cpp b/test/cpp/test_config_gateway_limits.cpp
+index b683d2ffe..de0bca72a 100644
+--- a/test/cpp/test_config_gateway_limits.cpp
++++ b/test/cpp/test_config_gateway_limits.cpp
+@@ -22,6 +22,15 @@ static bool construct_throws(const json& config) {
+     }
+ }
+ 
++static std::string construct_error(const json& config) {
++    try {
++        RuntimeConfig{config};
++        return "";
++    } catch (const std::invalid_argument& e) {
++        return e.what();
++    }
++}
++
+ static bool set_throws(const json& changes) {
+     try {
+         RuntimeConfig(json::object()).set(changes);
+@@ -56,6 +65,9 @@ int main() {
+           "a string timeout in config.json is refused, not read as off");
+     check(construct_throws({{"max_request_body_mb", 32.5}}),
+           "a fractional body limit in config.json is refused");
++    check(construct_error({{"max_connections_per_client", "8"}}) ==
++              "'max_connections_per_client' must be an integer (got string)",
++          "the refusal names the type it got, so a quoted number is obvious");
+ 
+     const RuntimeConfig too_big(json{{"max_request_body_mb", 100000},
+                                      {"request_receive_timeout", 7200},
+-- 
+2.53.0
+

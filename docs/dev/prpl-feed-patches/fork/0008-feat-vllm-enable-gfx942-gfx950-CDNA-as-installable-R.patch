@@ -1,7 +1,7 @@
 From c104c94f86543140b8db184482e20cb2fc115cfd Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 11 Aug 2026 21:29:08 -0400
-Subject: [PATCH 08/87] feat(vllm): enable gfx942/gfx950 (CDNA) as installable
+Subject: [PATCH 08/88] feat(vllm): enable gfx942/gfx950 (CDNA) as installable
  ROCm targets
 
 pins, device-class launch defaults) behind the support-families list

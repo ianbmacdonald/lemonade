@@ -1,7 +1,7 @@
 From c20f5a61a81f8184dd31894358021e54ea3f9f68 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:53:44 -0400
-Subject: [PATCH 83/87] fix(download): a refused 416 resume restarts, and a
+Subject: [PATCH 83/88] fix(download): a refused 416 resume restarts, and a
  size match alone does not complete
 
 - A 416 whose HEAD check failed set can_resume=false but kept http_code 416,

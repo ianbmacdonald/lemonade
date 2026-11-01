@@ -1,7 +1,7 @@
 From 2105089e01eec27f9b1237ac766994a5d0a59347 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:23:32 -0400
-Subject: [PATCH 21/87] feat(executorch): add an ExecuTorch classification
+Subject: [PATCH 21/88] feat(executorch): add an ExecuTorch classification
  backend (et-server subprocess)
 
 Adds the experimental "executorch" recipe: text classification on

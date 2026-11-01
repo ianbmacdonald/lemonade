@@ -1,7 +1,7 @@
 From b5868956979fb0a797ab0ba06c7d9746aecf0568 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:25:15 -0400
-Subject: [PATCH 16/87] test: /v1/images/classify integration suite, fake
+Subject: [PATCH 16/88] test: /v1/images/classify integration suite, fake
  tflite-server, docs
 
 server_image_classify.py covers the pre-body 411/413 guard, request

@@ -7,7 +7,7 @@ on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 87 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0087). |
+| Series: `fork/` | 88 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0088). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -29,6 +29,22 @@ as it lands; 0052-0054 finish the backend and build API port).
 Upstream PR lemonade-sdk/lemonade#3956 (SystemOne decision models: `/v1/systemone`,
 GGUF zero-shot on `/v1/classify`, the `systemone` router classifier) is not carried;
 it reaches the feed through upstream `main` once it merges.
+
+## Upgrade notes
+
+- `max_connections_per_client`, `request_receive_timeout` and `max_request_body_mb` must
+  be JSON integers in `config.json`. A quoted value such as `"8"` used to read as "off";
+  it now stops lemond at startup with
+  `<path>/config.json: 'max_connections_per_client' must be an integer (got string)`.
+  On OpenWrt/prplOS `config.json` is a conffile, so a hand-edited copy survives the
+  upgrade and the failure appears at the first restart; under procd respawn the service
+  stays down until the file is fixed. Check existing files for quoted limits before
+  upgrading.
+- The engine `*_args` (`tflite_args`, `executorch_args`, `litert_args`, `onnxruntime_args`)
+  refuse the flags lemond manages, including tflite's and executorch's `--weight-cache`
+  and litert's `--cache-dir`. A model whose saved options in `recipe_options.json` carry
+  one of them fails to load with a 400 `invalid_backend_args` naming the flag; remove
+  the flag from the saved options.
 
 ## musl-only patches
 
@@ -64,6 +80,7 @@ generic build fixes that musl just happens to exercise:
 | 0077 | route spec fixes and the regenerated API reference |
 | 0078-0085 | fixes from the branch's fourth review round (`*_args` NUL refusal and 400, classify crash accounting, close-on-exec beacon socket, WebSocket message handling and queue bound, 416 resume recovery, descriptor hygiene in forked backends, the unsecured-bind warning) |
 | 0086-0087 | WebSocket warnings logged outside the connection lock, and the watchdog reset kind read before the backend is released |
+| 0088 | the config.json path and the JSON type in the refusal of a mistyped gateway limit |
 
 ## Not carried
 
