@@ -23,6 +23,9 @@ containing POISON_TEXT, never answers text containing HANG_TEXT and stops
 answering GET /health meanwhile, as a single-threaded engine would, and
 otherwise returns fixed label scores.
 
+A model dir containing FAKE_FAIL_START makes the server exit 3 at startup,
+as an engine that refuses its model does; it also stands in for ort-server.
+
 When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
 starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
 list to args.log.
@@ -190,6 +193,9 @@ def main():
     def has(name):
         return os.path.exists(os.path.join(args.model_path, name))
 
+    if has("FAKE_FAIL_START"):
+        _log("failed-starts.log", str(os.getpid()))
+        sys.exit(3)
     if has("manifest.json"):
         task = "image-classification"
     elif has("tokenizer.json") and has("config.json"):

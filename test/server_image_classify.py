@@ -80,6 +80,7 @@ _opts = argparse.Namespace(
     fake_state_dir=None,
     lemond_pid=None,
     short_watchdog=False,
+    fake_ort=False,
 )
 
 
@@ -95,6 +96,8 @@ def _parse_own_args():
     )
     parser.add_argument("--lemond-pid", type=int)
     parser.add_argument("--short-watchdog", action="store_true")
+    # lemond was started with onnxruntime.cpu_bin pointing at the fake engine.
+    parser.add_argument("--fake-ort", action="store_true")
     args, _ = parser.parse_known_args()
     return args
 
@@ -825,6 +828,55 @@ class ImageClassifyTests(ServerTestBase):
             data={"model": MODEL, "top_k": "1"},
         )
         self._assert_reference(response, 1)
+
+    def test_515_broken_ort_model_keeps_resident_models(self):
+        if not _opts.fake_ort:
+            self.skipTest("needs --fake-ort")
+        self._require_model()
+        failed = os.path.join(_opts.fake_state_dir, "failed-starts.log")
+        self._assert_reference(
+            self._post_form(
+                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+                data={"model": MODEL, "top_k": "1"},
+            ),
+            1,
+        )
+        name = "user.B194-Broken-Ort"
+        dest = os.path.join(_opts.hf_cache, "models--" + name[len("user.") :])
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        os.makedirs(dest)
+        for file_name in (
+            "model.onnx",
+            "tokenizer.json",
+            "config.json",
+            "FAKE_FAIL_START",
+        ):
+            with open(os.path.join(dest, file_name), "w", encoding="utf-8") as f:
+                f.write("{}")
+        response = requests.post(
+            f"{self.base_url}/pull",
+            json={
+                "model_name": name,
+                "recipe": "onnxruntime",
+                "labels": ["classification"],
+                "local_import": True,
+            },
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200, response.text[:500])
+        failed_before = _line_count(failed)
+        response = requests.post(
+            f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_DEFAULT
+        )
+        self.assertGreaterEqual(response.status_code, 400, response.text[:500])
+        # One start and one relaunch to capture its stderr; evicting the other
+        # models and loading again cannot fix a CPU engine that refused its model.
+        self.assertEqual(_line_count(failed) - failed_before, 2)
+        health = requests.get(f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT).json()
+        # /health lists public names, without the user. prefix.
+        loaded = [m["model_name"] for m in health["all_models_loaded"]]
+        self.assertIn(MODEL[len("user.") :], loaded, "the image model was evicted")
 
     def test_513_repeated_text_crashes_pause_the_model(self):
         self._require_model()

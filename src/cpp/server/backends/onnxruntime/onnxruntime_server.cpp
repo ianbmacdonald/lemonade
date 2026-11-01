@@ -7,6 +7,7 @@
 #include "lemon/backends/hf_cache_util.h"
 #include "lemon/backend_manager.h"
 #include "lemon/classify_text_limit.h"
+#include "lemon/error_types.h"
 #include "lemon/utils/path_utils.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
@@ -171,7 +172,7 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     // the resolved path is the only candidate.
     auto candidates = find_complete_model_dirs(path_from_utf8(model_path));
     if (candidates.empty()) {
-        throw std::runtime_error(
+        throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
             "': need model.onnx (or model.ort) + tokenizer.json + config.json "
             "(manifest.json is optional and overrides the output contract)");
@@ -179,7 +180,7 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     if (candidates.size() > 1) {
         std::string listing;
         for (const auto& c : candidates) listing += "\n  " + path_to_utf8(c);
-        throw std::runtime_error(
+        throw NonRetryableLoadException(
             "Ambiguous model layout under '" + model_path + "': " +
             std::to_string(candidates.size()) +
             " complete model directories found — keep exactly one:" + listing);
@@ -218,14 +219,26 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     try {
         start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
                      command);
-    } catch (const std::runtime_error& e) {
-        if (load_cancelled()) throw;
+    } catch (const std::runtime_error&) {
+        // Non-retryable as for tflite-server and et-server: ort-server runs on
+        // the CPU, so evicting other models cannot fix a failed start.
+        if (load_cancelled()) throw NonRetryableLoadException("ort-server load cancelled");
+        const int exit_code = startup_exit_code();
+        if (exit_code < 0) {
+            throw NonRetryableLoadException("ort-server did not become ready");
+        }
+        if (exit_code == 128 + 9) {
+            // SIGKILL during load is the OOM killer's signature; relaunching to
+            // capture stderr would repeat the full load under the same pressure.
+            throw NonRetryableLoadException(
+                "ort-server was killed by signal 9 (likely out of memory)");
+        }
         // The subprocess's stderr is invisible when lemond runs windowless (CI,
         // tray), so a startup failure would otherwise surface only as "not
         // ready". Re-run it briefly to capture the reason it refused the model.
         std::string details = capture_startup_error(executable, args);
-        throw std::runtime_error(std::string(e.what()) +
-                                 (details.empty() ? "" : ": " + details));
+        throw NonRetryableLoadException("ort-server failed to start or become ready" +
+                                        (details.empty() ? "" : ": " + details));
     }
 
     // The pin does not decide the binary: a `cpu_bin` path or tag can run an
