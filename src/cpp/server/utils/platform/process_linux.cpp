@@ -21,6 +21,7 @@
 #include <cctype>
 
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 
 #ifdef HAVE_LIBCAP
 #include <sys/capability.h>
@@ -52,6 +53,24 @@ static void log_process_line(const std::string& line) {
         LOG(ERROR, "Process") << line << std::endl;
     } else {
         LOG(INFO, "Process") << line << std::endl;
+    }
+}
+
+// Runs in the forked child before exec. Sockets lemond holds are not all
+// close-on-exec in time (httplib accepts without SOCK_CLOEXEC), so the backend
+// keeps only stdin, stdout and stderr.
+static void close_inherited_descriptors() {
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0) {
+        return;
+    }
+#endif
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0 || max_fd > 65536) {
+        max_fd = 65536;
+    }
+    for (int fd = 3; fd < max_fd; ++fd) {
+        close(fd);
     }
 }
 
@@ -194,6 +213,7 @@ pid_t LinuxProcessPlatform::spawn_process(
         }
         argv_ptrs.push_back(nullptr);
 
+        close_inherited_descriptors();
         execvp(executable.c_str(), argv_ptrs.data());
 
         // If execvp returns, it failed
@@ -540,6 +560,7 @@ int LinuxProcessPlatform::run_with_output(
         }
         argv_ptrs.push_back(nullptr);
 
+        close_inherited_descriptors();
         execvp(executable.c_str(), argv_ptrs.data());
         _exit(127);
     }

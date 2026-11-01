@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -20,6 +21,7 @@
 #include <lemon/connection_guard.h>
 #include <lemon/upgradable_http_server.h>
 #include <lemon/utils/network_beacon.h>
+#include <lemon/utils/process_manager.h>
 
 #include "test_config_helpers.h"
 
@@ -261,6 +263,55 @@ static void test_beacon_socket_is_close_on_exec() {
           "the beacon's broadcast socket is not inherited by child processes");
     beacon.stopBroadcasting();
 }
+
+static bool listing_has(const std::vector<std::string>& lines, int fd) {
+    for (const auto& line : lines) {
+        if (line == std::to_string(fd)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A socket lemond has not marked close-on-exec yet, such as one still waiting
+// in the worker queue, must not reach a backend.
+static void test_children_get_only_stdio() {
+    int fds[2];
+    check(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "socketpair");
+    const int inheritable = ::fcntl(fds[0], F_DUPFD, 200);
+    check(inheritable >= 200, "an inheritable descriptor at 200 or above");
+
+    std::vector<std::string> lines;
+    lemon::utils::ProcessManager::run_process_with_output(
+        "/bin/sh", {"-c", "ls /proc/self/fd"},
+        [&lines](const std::string& line) {
+            lines.push_back(line);
+            return true;
+        });
+    check(listing_has(lines, 1), "run_process_with_output: the child's descriptors are listed");
+    check(!listing_has(lines, inheritable),
+          "run_process_with_output: the child does not inherit lemond's descriptors");
+
+    char path[] = "/tmp/lemon-fd-listing-XXXXXX";
+    const int out = ::mkstemp(path);
+    ::close(out);
+    auto handle = lemon::utils::ProcessManager::start_process(
+        "/bin/sh", {"-c", std::string("ls /proc/self/fd > ") + path});
+    lemon::utils::ProcessManager::wait_for_exit(handle, 10);
+    lines.clear();
+    std::ifstream listing(path);
+    for (std::string line; std::getline(listing, line);) {
+        lines.push_back(line);
+    }
+    ::unlink(path);
+    check(listing_has(lines, 0), "start_process: the child's descriptors are listed");
+    check(!listing_has(lines, inheritable),
+          "start_process: the child does not inherit lemond's descriptors");
+
+    ::close(inheritable);
+    ::close(fds[0]);
+    ::close(fds[1]);
+}
 #endif
 
 // A peer that connects and sends nothing, or stops mid-headers, must not hold
@@ -308,6 +359,7 @@ int main() {
 #ifdef __linux__
     test_watch_socket_is_close_on_exec();
     test_beacon_socket_is_close_on_exec();
+    test_children_get_only_stdio();
 #endif
 #endif
     return report_results("connection guard");
