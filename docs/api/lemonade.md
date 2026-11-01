@@ -1933,7 +1933,7 @@ This endpoint does not take any parameters.
   - `sockets` - One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each listened interface's subnet broadcast address (worked out from its address and netmask) plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on.
   - `interfaces` - The interfaces being listened on: `name`, `address`, `netmask` and `broadcast`. By default this is every interface with an RFC1918 address. The `beacon_listen_interfaces` setting narrows it; on a gateway whose WAN side is also RFC1918, set it to the LAN bridges or WAN-side hosts are listed too.
   - `interface_allowlist` - The `beacon_listen_interfaces` setting, or `[]` when every RFC1918 interface is heard.
-  - `trusted_relays` - The `beacon_trusted_relays` setting, with each `allow_hosts` entry written as a CIDR (`192.168.79.20` becomes `192.168.79.20/32`).
+  - `trusted_relays` - The `beacon_trusted_relays` setting, with each `allow_hosts` entry written as a CIDR (`10.79.0.20` becomes `10.79.0.20/32`).
   - `unmatched_interfaces` - Entries of `beacon_listen_interfaces` that name no interface with an RFC1918 address. When none match, `listening` is `false` and `error` names them.
   - `self_instance_id` - This server's beacon `instance_id`, used to drop its own beacons.
   - `self_port` - This server's HTTP port, used to drop its own beacons.

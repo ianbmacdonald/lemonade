@@ -317,19 +317,19 @@ int main() {
     {
         RuntimeConfig relay_cfg(base_cfg);
         check(relay_cfg.beacon_trusted_relays() == json::array(), "beacon_trusted_relays defaults to []");
-        json good = json::array({{{"source", "192.168.60.10"},
-                                  {"allow_hosts", json::array({"192.168.79.20", "10.20.0.0/16"})}}});
+        json good = json::array({{{"source", "10.60.0.10"},
+                                  {"allow_hosts", json::array({"10.79.0.20", "10.20.0.0/16"})}}});
         relay_cfg.set({{"beacon_trusted_relays", good}});
         check(relay_cfg.beacon_trusted_relays() == good, "beacon_trusted_relays round-trips");
         check(relay_cfg.snapshot()["beacon_trusted_relays"] == good, "snapshot reflects beacon_trusted_relays");
         auto parsed = lemon::parse_beacon_trusted_relays(good);
-        check(parsed.size() == 1 && parsed[0].source == 0xC0A83C0Au && parsed[0].allow_hosts.size() == 2 &&
+        check(parsed.size() == 1 && parsed[0].source == 0x0A3C000Au && parsed[0].allow_hosts.size() == 2 &&
                   parsed[0].allow_hosts[0].prefix == 32 && parsed[0].allow_hosts[1].network == 0x0A140000u &&
                   parsed[0].allow_hosts[1].prefix == 16,
               "parse_beacon_trusted_relays decodes source, a bare host and a CIDR");
         check(lemon::beacon_trusted_relays_to_json(parsed) ==
-                  json::array({{{"source", "192.168.60.10"},
-                                {"allow_hosts", json::array({"192.168.79.20/32", "10.20.0.0/16"})}}}),
+                  json::array({{{"source", "10.60.0.10"},
+                                {"allow_hosts", json::array({"10.79.0.20/32", "10.20.0.0/16"})}}}),
               "trusted relays serialise with canonical CIDRs");
         relay_cfg.set({{"beacon_trusted_relays", json::array()}});
         check(relay_cfg.beacon_trusted_relays() == json::array(), "beacon_trusted_relays cleared");
@@ -354,13 +354,13 @@ int main() {
                                             {"trust", true}}})},
             {"source not a string", relay(42, json::array({"10.1.0.1"}))},
             {"source hostname", relay("relay.lan", json::array({"10.1.0.1"}))},
-            {"source leading zero", relay("192.168.060.10", json::array({"10.1.0.1"}))},
-            {"source with prefix", relay("192.168.60.10/32", json::array({"10.1.0.1"}))},
+            {"source leading zero", relay("10.060.0.10", json::array({"10.1.0.1"}))},
+            {"source with prefix", relay("10.60.0.10/32", json::array({"10.1.0.1"}))},
             {"source public", relay("8.8.8.8", json::array({"10.1.0.1"}))},
             {"allow_hosts empty", relay("10.0.0.1", json::array())},
             {"allow_hosts not array", relay("10.0.0.1", "10.1.0.1")},
             {"allow_hosts entry not string", relay("10.0.0.1", json::array({1}))},
-            {"allow_hosts garbage", relay("10.0.0.1", json::array({"ai4"}))},
+            {"allow_hosts garbage", relay("10.0.0.1", json::array({"gw2"}))},
             {"allow_hosts public host", relay("10.0.0.1", json::array({"8.8.8.8"}))},
             {"allow_hosts public cidr", relay("10.0.0.1", json::array({"0.0.0.0/0"}))},
             {"allow_hosts cidr wider than rfc1918", relay("10.0.0.1", json::array({"192.168.0.0/15"}))},

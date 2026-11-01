@@ -146,7 +146,7 @@ bool parse_host_range(const std::string& text, BeaconHostRange& range, std::stri
     auto slash = text.find('/');
     uint32_t addr = 0;
     if (!parse_ipv4_literal(text.substr(0, slash), addr)) {
-        why = "is not an IPv4 address or CIDR like 192.168.79.20 or 192.168.79.0/24";
+        why = "is not an IPv4 address or CIDR like 10.79.0.20 or 10.79.0.0/24";
         return false;
     }
     int prefix = 32;
@@ -238,7 +238,7 @@ std::vector<BeaconTrustedRelay> parse_beacon_trusted_relays(const nlohmann::json
         BeaconTrustedRelay relay;
         const std::string src = src_it->get<std::string>();
         if (!parse_ipv4_literal(src, relay.source)) {
-            fail(where + " source '" + src + "' is not an IPv4 address like 192.168.60.10");
+            fail(where + " source '" + src + "' is not an IPv4 address like 10.60.0.10");
         }
         if (!utils::is_rfc1918_ipv4(relay.source)) {
             fail(where + " source '" + src + "' is not an RFC1918 address");

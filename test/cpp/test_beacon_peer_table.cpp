@@ -47,7 +47,7 @@ void test_basic(Clock::time_point t0) {
     BeaconPeerTable t;
     t.set_self("ffffffffffffffff", 13305);
     uint32_t src = ip(192, 168, 1, 40);
-    std::string p = beacon(url_for(src), "ai4", "0a1b2c3d4e5f6071");
+    std::string p = beacon(url_for(src), "gw2", "0a1b2c3d4e5f6071");
     check(feed(t, p, src, t0) == IngestResult::Accepted, "basic: first beacon is Accepted");
     check(feed(t, p, src, t0 + std::chrono::seconds(2)) == IngestResult::Refreshed,
           "basic: repeat 2s later is Refreshed");
@@ -56,7 +56,7 @@ void test_basic(Clock::time_point t0) {
     check(hosts.size() == 1 && hosts[0].last_seen == t0 + std::chrono::seconds(2),
           "basic: last_seen advanced");
     json j = t.to_json(t0 + std::chrono::seconds(2));
-    check(j["hosts"].size() == 1 && j["hosts"][0]["hostname"] == "ai4" &&
+    check(j["hosts"].size() == 1 && j["hosts"][0]["hostname"] == "gw2" &&
               j["hosts"][0]["source_ip"] == "192.168.1.40" &&
               j["hosts"][0]["instance_id"] == "0a1b2c3d4e5f6071",
           "basic: to_json lists the host");
@@ -92,7 +92,7 @@ void test_url_binding(Clock::time_point t0) {
     }
     std::vector<std::string> bad = {
         "https://192.168.1.40:13305/api/v1/",
-        "http://ai4.local:13305/api/v1/",
+        "http://gw2.local:13305/api/v1/",
         "http://192.168.1.40/api/v1/",
         "http://192.168.1.40:0/api/v1/",
         "http://192.168.1.40:70000/api/v1/",
@@ -217,7 +217,7 @@ void test_broadcaster_payload() {
     check(!j.is_discarded() && !j.contains("instance_id"), "broadcaster: no instance_id until set");
 
     nb.setInstanceId("9f3c2a61d04b7e18");
-    json j2 = json::parse(nb.buildStandardPayloadPattern("ai4", "http://192.168.1.40:13305/api/v1/"),
+    json j2 = json::parse(nb.buildStandardPayloadPattern("gw2", "http://192.168.1.40:13305/api/v1/"),
                           nullptr, false);
     check(!j2.is_discarded() && j2.value("instance_id", "") == "9f3c2a61d04b7e18",
           "broadcaster: instance_id included after setInstanceId");
@@ -426,10 +426,10 @@ std::vector<lemon::BeaconTrustedRelay> relays_from(const json& j) {
 }
 
 void test_trusted_relay(Clock::time_point t0) {
-    uint32_t relay = ip(192, 168, 60, 10);
-    uint32_t ai4 = ip(192, 168, 79, 20);
-    std::string p = beacon(url_for(ai4), "ai4-resolute", "0a1b2c3d4e5f6071");
-    json config = json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.20"})}}});
+    uint32_t relay = ip(10, 60, 0, 10);
+    uint32_t gw2 = ip(10, 79, 0, 20);
+    std::string p = beacon(url_for(gw2), "gw2-resolute", "0a1b2c3d4e5f6071");
+    json config = json::array({{{"source", "10.60.0.10"}, {"allow_hosts", json::array({"10.79.0.20"})}}});
 
     {
         BeaconPeerTable t;
@@ -443,14 +443,14 @@ void test_trusted_relay(Clock::time_point t0) {
         check(feed(t, p, relay, t0 + std::chrono::seconds(2)) == IngestResult::RelayedRefreshed,
               "relay: repeat is RelayedRefreshed");
         json j = t.to_json(t0 + std::chrono::seconds(2));
-        check(j["hosts"].size() == 1 && j["hosts"][0]["url"] == url_for(ai4) &&
-                  j["hosts"][0]["via"] == "192.168.60.10" && j["hosts"][0]["source_ip"] == "192.168.60.10",
+        check(j["hosts"].size() == 1 && j["hosts"][0]["url"] == url_for(gw2) &&
+                  j["hosts"][0]["via"] == "10.60.0.10" && j["hosts"][0]["source_ip"] == "10.60.0.10",
               "relay: host listed with via = relay source");
         check(j["stats"]["relayed_accepted"] == 1 && j["stats"]["accepted"] == 0 &&
                   j["stats"]["relayed_refreshed"] == 1 && j["stats"]["refreshed"] == 0,
               "relay: relayed_accepted counted separately from accepted");
 
-        uint32_t direct = ip(192, 168, 60, 11);
+        uint32_t direct = ip(10, 60, 0, 11);
         check(feed(t, beacon(url_for(direct)), direct, t0) == IngestResult::Accepted,
               "relay: a direct peer alongside is Accepted");
         json k = t.to_json(t0 + std::chrono::seconds(2));
@@ -460,19 +460,19 @@ void test_trusted_relay(Clock::time_point t0) {
         }
         check(direct_via_null, "relay: a direct host has via null");
 
-        check(feed(t, p, ai4, t0 + std::chrono::seconds(3)) == IngestResult::Refreshed,
+        check(feed(t, p, gw2, t0 + std::chrono::seconds(3)) == IngestResult::Refreshed,
               "relay: the same URL heard directly refreshes the row");
         json d = t.to_json(t0 + std::chrono::seconds(3));
         bool cleared = false;
         for (const auto& h : d["hosts"]) {
-            if (h["url"] == url_for(ai4)) cleared = h["via"].is_null() && h["source_ip"] == "192.168.79.20";
+            if (h["url"] == url_for(gw2)) cleared = h["via"].is_null() && h["source_ip"] == "10.79.0.20";
         }
         check(cleared, "relay: a direct refresh clears via");
     }
     {
         BeaconPeerTable t;
         t.set_trusted_relays(relays_from(config));
-        uint32_t other = ip(192, 168, 79, 21);
+        uint32_t other = ip(10, 79, 0, 21);
         check(feed(t, beacon(url_for(other)), relay, t0) == IngestResult::RelayHostRefused,
               "relay: URL host outside allow_hosts refused");
         check(t.size() == 0 && t.stat(IngestResult::RelayHostRefused) == 1 &&
@@ -482,7 +482,7 @@ void test_trusted_relay(Clock::time_point t0) {
     {
         BeaconPeerTable t;
         t.set_trusted_relays(relays_from(config));
-        uint32_t stranger = ip(192, 168, 60, 12);
+        uint32_t stranger = ip(10, 60, 0, 12);
         check(feed(t, p, stranger, t0) == IngestResult::UrlMismatch, "relay: unlisted source stays url_mismatch");
         check(t.size() == 0, "relay: unlisted source lists nothing");
     }
@@ -497,20 +497,20 @@ void test_trusted_relay(Clock::time_point t0) {
         check(feed(t, beacon(url_for(ip(100, 64, 0, 1))), relay, t0 + std::chrono::seconds(1)) ==
                   IngestResult::RelayHostRefused,
               "relay: CGNAT URL host refused");
-        check(feed(t, beacon(url_for(ai4)), ip(8, 8, 8, 8), t0) == IngestResult::BadSource,
+        check(feed(t, beacon(url_for(gw2)), ip(8, 8, 8, 8), t0) == IngestResult::BadSource,
               "relay: public datagram source is still BadSource");
     }
     {
         BeaconPeerTable t;
         t.set_self("ffffffffffffffff", 13305);
         t.set_trusted_relays(relays_from(config));
-        check(feed(t, beacon(url_for(ai4), "me", "ffffffffffffffff"), relay, t0) == IngestResult::Self,
+        check(feed(t, beacon(url_for(gw2), "me", "ffffffffffffffff"), relay, t0) == IngestResult::Self,
               "relay: our own beacon relayed back is Self");
         BeaconPeerTable u;
         u.set_self("ffffffffffffffff", 13305);
-        u.set_local_addresses({ai4});
+        u.set_local_addresses({gw2});
         u.set_trusted_relays(relays_from(config));
-        check(feed(u, beacon(url_for(ai4), "me"), relay, t0) == IngestResult::Self,
+        check(feed(u, beacon(url_for(gw2), "me"), relay, t0) == IngestResult::Self,
               "relay: our own id-less beacon relayed back is Self");
     }
     {
@@ -525,7 +525,7 @@ void test_trusted_relay(Clock::time_point t0) {
     {
         BeaconPeerTable t;
         t.set_trusted_relays(relays_from(
-            json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.0/24"})}}})));
+            json::array({{{"source", "10.60.0.10"}, {"allow_hosts", json::array({"10.79.0.0/24"})}}})));
         int admitted = 0;
         for (int i = 0; i < 20; ++i) {
             IngestResult r = feed(t, p, relay, t0);
@@ -537,7 +537,7 @@ void test_trusted_relay(Clock::time_point t0) {
         int accepted = 0;
         for (int h = 1; h <= 40; ++h) {
             auto now = t0 + std::chrono::seconds(10) + std::chrono::milliseconds(h * 200);
-            if (feed(t, beacon(url_for(ip(192, 168, 79, 100 + h))), relay, now) == IngestResult::RelayedAccepted) {
+            if (feed(t, beacon(url_for(ip(10, 79, 0, 100 + h))), relay, now) == IngestResult::RelayedAccepted) {
                 ++accepted;
             }
         }
@@ -547,7 +547,7 @@ void test_trusted_relay(Clock::time_point t0) {
         int burst = 0;
         auto later = t0 + std::chrono::milliseconds(18200);
         for (int i = 0; i < 100; ++i) {
-            uint32_t host = ip(192, 168, 79, 101 + (i % 16));
+            uint32_t host = ip(10, 79, 0, 101 + (i % 16));
             IngestResult r = feed(t, beacon(url_for(host)), relay, later);
             if (r != IngestResult::RateLimited) ++burst;
         }
@@ -556,10 +556,10 @@ void test_trusted_relay(Clock::time_point t0) {
     {
         BeaconPeerTable t;
         t.set_trusted_relays(relays_from(
-            json::array({{{"source", "192.168.60.10"}, {"allow_hosts", json::array({"192.168.79.0/24"})}}})));
+            json::array({{{"source", "10.60.0.10"}, {"allow_hosts", json::array({"10.79.0.0/24"})}}})));
         int admitted = 0;
         for (int i = 0; i < 10; ++i) {
-            for (uint32_t host : {ip(192, 168, 79, 20), ip(192, 168, 79, 21)}) {
+            for (uint32_t host : {ip(10, 79, 0, 20), ip(10, 79, 0, 21)}) {
                 IngestResult r = feed(t, beacon(url_for(host)), relay, t0);
                 if (r == IngestResult::RelayedAccepted || r == IngestResult::RelayedRefreshed) ++admitted;
             }
