@@ -285,6 +285,16 @@ void HttpListener::warn_if_unsecured(const std::string& bound_host, const std::s
                "endpoints (/api, /v0, /v1) are reachable from other machines "
                "unauthenticated. Set LEMONADE_API_KEY to secure them." << std::endl;
     }
+#ifndef _WIN32
+    if (config_->request_receive_timeout() <= 0) {
+        LOG(WARNING, "Server")
+            << "Serving on non-loopback host '" << bound_host
+            << "' with request_receive_timeout off. A client that sends one byte at a time "
+               "can hold a server worker for as long as it likes, and enough of them stop "
+               "every endpoint. Set request_receive_timeout (and max_connections_per_client) "
+               "for a server other machines can reach." << std::endl;
+    }
+#endif
 }
 
 void HttpListener::start_beacon() {
