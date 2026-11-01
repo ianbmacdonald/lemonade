@@ -20,6 +20,7 @@
     #define INVALID_SOCKET_NB INVALID_SOCKET
 #else
     #include <arpa/inet.h>
+    #include <fcntl.h>
     #include <ifaddrs.h>
     #include <net/if.h>
     #include <netinet/in.h>
@@ -66,6 +67,9 @@ void NetworkBeacon::createSocket() {
     if (_socket == INVALID_SOCKET_NB) {
         throw std::runtime_error("Could not create socket");
     }
+#ifndef _WIN32
+    fcntl(_socket, F_SETFD, FD_CLOEXEC);
+#endif
 }
 
 std::string NetworkBeacon::getLocalHostname() {

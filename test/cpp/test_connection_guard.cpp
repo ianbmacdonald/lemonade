@@ -19,6 +19,7 @@
 
 #include <lemon/connection_guard.h>
 #include <lemon/upgradable_http_server.h>
+#include <lemon/utils/network_beacon.h>
 
 #include "test_config_helpers.h"
 
@@ -234,6 +235,32 @@ static void test_watch_socket_is_close_on_exec() {
     ::close(fds[0]);
     ::close(fds[1]);
 }
+
+static int open_descriptors() {
+    int n = 0;
+    for (int fd = 0; fd < 1024; ++fd) {
+        if (::fcntl(fd, F_GETFD) >= 0) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+static void test_beacon_socket_is_close_on_exec() {
+    const int open_before = open_descriptors();
+    const int inheritable_before = inheritable_descriptors();
+    NetworkBeacon beacon;
+    // Port 9 is discard; the beacon sends one datagram per interval.
+    beacon.startBroadcasting(9, 9, 1);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (open_descriptors() == open_before && std::chrono::steady_clock::now() - t0 < 3s) {
+        std::this_thread::sleep_for(10ms);
+    }
+    check(open_descriptors() > open_before, "the beacon opened its broadcast socket");
+    check(inheritable_descriptors() == inheritable_before,
+          "the beacon's broadcast socket is not inherited by child processes");
+    beacon.stopBroadcasting();
+}
 #endif
 
 // A peer that connects and sends nothing, or stops mid-headers, must not hold
@@ -280,6 +307,7 @@ int main() {
     test_peek_is_bounded();
 #ifdef __linux__
     test_watch_socket_is_close_on_exec();
+    test_beacon_socket_is_close_on_exec();
 #endif
 #endif
     return report_results("connection guard");
