@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <libwebsockets.h>
 #include <nlohmann/json.hpp>
@@ -157,6 +158,9 @@ private:
     std::unordered_map<std::string, size_t> queued_bytes_;
     // Connections over kMaxQueuedBytes, closed on the service thread
     std::unordered_set<std::string> overflowed_;
+    // Warnings raised under connections_mutex_ and logged once it is released:
+    // a log line is itself sent to /logs/stream subscribers through send_json.
+    std::vector<std::string> deferred_warnings_;
     // Per-connection inbound reassembly buffers (libwebsockets may fragment frames)
     std::unordered_map<std::string, std::string> receive_buffers_;
     std::mutex connections_mutex_;
@@ -202,6 +206,7 @@ private:
     void drain_pending_adoptions();
     bool admits_locked(const std::string& client) const;
     void note_refusal_locked(const std::string& client);
+    void log_deferred_warnings();
 
     // Service loop run in background thread
     void service_loop();

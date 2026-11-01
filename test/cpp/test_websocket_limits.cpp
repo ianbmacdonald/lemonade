@@ -1,6 +1,7 @@
 // Connection, message-size and authentication-deadline limits of the
 // WebSocket server, driven over real sockets against its own port.
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <utility>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -21,6 +23,7 @@
 #endif
 
 #include <lemon/log_stream.h>
+#include <lemon/logging_config.h>
 #include <lemon/websocket_server.h>
 
 #include "test_config_helpers.h"
@@ -348,6 +351,65 @@ void test_stalled_reader_is_dropped() {
     server.stop();
 }
 
+// Runs fn on a worker and fails the whole binary if it has not returned within
+// the deadline; a deadlocked worker cannot be joined.
+template <typename Fn>
+void finishes_within(int seconds, const char* label, Fn fn) {
+    std::atomic<bool> done{false};
+    std::thread worker([&] {
+        fn();
+        done = true;
+    });
+    for (int i = 0; i < seconds * 10 && !done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!done) {
+        std::printf("FAIL: %s (no return after %d s)\n", label, seconds);
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+    worker.join();
+    check(true, label);
+}
+
+// With the hub sink installed, every log line is also sent to /logs/stream
+// subscribers, so the server must not log while it holds its own lock.
+void test_logging_under_load_with_hub_sink() {
+    lemon::LogRotationConfig no_file;
+    no_file.file_mode = "disabled";
+    lemon::configure_application_logging("info", lemon::LoggingMode::direct_server, no_file);
+
+    WebSocketServer server(nullptr, "127.0.0.1", 0);
+    check(server.start(), "hub sink: server starts");
+    Client watcher("127.0.0.1", server.get_port(), "/logs/stream");
+    check(watcher.upgraded() && watcher.send_frame(0x1, true, R"({"type":"logs.subscribe"})") &&
+              watcher.read_text_frame().find("logs.snapshot") != std::string::npos,
+          "hub sink: watcher subscribed");
+
+    Client big("127.0.0.1", server.get_port(), "/logs/stream");
+    check(big.upgraded(), "hub sink: second connection admitted");
+    const std::string chunk(1024 * 1024, 'a');
+    bool sent = big.send_frame(0x1, false, chunk);
+    for (size_t total = chunk.size(); sent && total <= WebSocketServer::kMaxMessageBytes;
+         total += chunk.size()) {
+        sent = big.send_frame(0x0, false, chunk);
+    }
+    check(big.closed_by_server(), "hub sink: an oversized message closes its connection");
+    check(eventually_upgrades("127.0.0.1", server.get_port(), "/logs/stream"),
+          "hub sink: server still accepts connections after logging an oversized message");
+
+    watcher.set_receive_buffer(4096);
+    finishes_within(30, "hub sink: publishing to a stalled subscriber returns", [] {
+        const std::string line(64 * 1024, 'q');
+        for (size_t sent = 0; sent < (40u << 20); sent += line.size()) {
+            lemon::LogStreamHub::instance().publish(AixLog::Metadata(), line);
+        }
+    });
+    watcher.set_timeout(5);
+    check(watcher.reaches_eof(), "hub sink: the stalled subscriber is disconnected");
+    server.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -361,6 +423,7 @@ int main() {
     test_wrongly_typed_messages();
     test_repeated_subscribe();
     test_stalled_reader_is_dropped();
+    test_logging_under_load_with_hub_sink();
     return report_results("websocket limits");
 }
 
