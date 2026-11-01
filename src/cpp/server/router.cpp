@@ -1676,12 +1676,15 @@ auto Router::execute_inference(const json& request, Func&& inference_func,
                 failed_instance_id = server->get_instance_id();
             }
 
+            // Read before release_inference(): once released, an eviction may free server.
+            const bool reset_unresponsive = watchdog_reset && server->was_reset_unresponsive();
+
             server->release_inference();
 
             if (watchdog_reset && !retry_after_watchdog_reset) {
                 // A slow input can outlast the watchdog's health probes without
                 // crashing anything; only a real crash may count against the model.
-                if (server->was_reset_unresponsive()) {
+                if (reset_unresponsive) {
                     return json{{"error", {
                         {"message", "The backend for model '" + requested_model +
                                         "' stopped responding while processing this input and was "
