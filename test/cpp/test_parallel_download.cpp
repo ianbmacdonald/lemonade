@@ -209,14 +209,25 @@ int main() {
         }
         res.set_content(payload, "application/octet-stream");
     });
-    // Every resume is refused with 416, and HEAD answers 404 with a body the
+    // Every resume past byte 0 is refused with 416, and HEAD answers 404 with a body the
     // size of the partial: an error page whose length happens to match.
     server.Get("/head404.bin", [&](const httplib::Request& req, httplib::Response& res) {
         log.add(req);
         if (req.method == "HEAD") {
             res.status = 404;
             res.set_content(small, "text/plain");
-        } else if (!req.get_header_value("Range").empty()) {
+        } else if (range_start(req.get_header_value("Range")) > 0) {
+            res.status = 416;
+            res.set_content("", "text/plain");
+        } else {
+            res.set_content(small, "application/octet-stream");
+        }
+    });
+    // Every resume past byte 0 is refused with 416 and HEAD answers 200 with the real
+    // length, so a same-length partial looks complete by size alone.
+    server.Get("/head200.bin", [&](const httplib::Request& req, httplib::Response& res) {
+        log.add(req);
+        if (range_start(req.get_header_value("Range")) > 0) {
             res.status = 416;
             res.set_content("", "text/plain");
         } else {
@@ -657,11 +668,25 @@ int main() {
         write_all(partial_of(f), garbage);
         auto options = parallel_options();
         options.allow_parallel = false;
+        options.max_retries = 1;
         auto result = HttpClient::download_file(base + "/head404.bin", f.string(), nullptr, {},
                                                 options, policy);
         log.take();
-        r.check(!(result.success && read_all(f) == garbage),
-                "a 404 HEAD whose length matches the partial does not complete the download");
+        r.check(result.success && read_all(f) == small,
+                "a 404 HEAD whose length matches the partial restarts the download from byte 0");
+    }
+
+    {
+        const fs::path f = dir / "head200.bin";
+        write_all(partial_of(f), std::string(small.size(), 'x'));
+        auto options = parallel_options();
+        options.allow_parallel = false;
+        options.max_retries = 1;
+        auto result = HttpClient::download_file(base + "/head200.bin", f.string(), nullptr, {},
+                                                options, policy);
+        log.take();
+        r.check(result.success && read_all(f) == small,
+                "with no digest, a same-length partial is not taken as complete on a 416");
     }
 
     server.stop();

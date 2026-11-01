@@ -1619,6 +1619,7 @@ DownloadResult HttpClient::download_attempt(const std::string& url,
                                   << (resume_from / (1024.0 * 1024.0)) << " MB, remote: "
                                   << (remote_size / (1024.0 * 1024.0)) << " MB)" << std::endl;
                         result.success = true;
+                        result.size_only_completion = true;
                         result.bytes_downloaded = 0;
                         return result;
                     } else {
@@ -2607,6 +2608,14 @@ DownloadResult HttpClient::download_file(const std::string& url,
             return final_result;
         }
 
+        // Without a digest, a matching length says nothing about the bytes.
+        if (final_result.success && final_result.size_only_completion && !expected_hash.present()) {
+            final_result.success = false;
+            final_result.can_resume = false;
+            final_result.error_message = "A resume of " + output_path +
+                                         " found the partial at full length, with no digest to check it";
+        }
+
         if (final_result.success) {
             if (expected_hash.present()) {
                 auto hash_result = verify_file_hash(partial_path_fs, expected_hash);
@@ -2667,9 +2676,11 @@ DownloadResult HttpClient::download_file(const std::string& url,
         }
 
         // Don't retry permanent HTTP failures (4xx client errors).
-        // 408 Request Timeout and 429 Too Many Requests are transient and still retried.
+        // 408 Request Timeout and 429 Too Many Requests are transient and still retried;
+        // a 416 refuses only the resume, so the fresh retry below handles it.
         bool is_permanent_4xx = (final_result.http_code >= 400 && final_result.http_code < 500
                                  && final_result.http_code != 408
+                                 && final_result.http_code != 416
                                  && final_result.http_code != 429);
         if (is_permanent_4xx) {
             LOG(ERROR, "HttpClient") << "[Download] " << final_result.error_message << std::endl;

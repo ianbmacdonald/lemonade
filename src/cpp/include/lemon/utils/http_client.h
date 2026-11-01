@@ -53,6 +53,7 @@ struct DownloadResult {
     bool can_resume = false;          // Whether partial download can be resumed
     bool disk_full = false;            // True if download failed due to insufficient disk space
     bool permanent = false;            // Non-recoverable failure (e.g. unsupported protocol, malformed URL); do not retry
+    bool size_only_completion = false; // A 416 resume whose partial matched the remote length; content unchecked
 };
 
 class HttpClientException : public std::runtime_error {
