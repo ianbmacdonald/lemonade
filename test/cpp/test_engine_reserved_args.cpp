@@ -32,6 +32,10 @@ void check_engine(const std::string& name, const std::set<std::string>& reserved
                name + " rejects " + flag);
         expect(!lemon::utils::validate_custom_args(std::string(flag) + "=x", reserved).empty(),
                name + " rejects " + flag + "=");
+        // The engine's argv ends this token at the NUL, leaving the bare flag.
+        const std::string nul_spliced = std::string(flag) + std::string(1, '\0') + "y x";
+        expect(!lemon::utils::validate_custom_args(nul_spliced, reserved).empty(),
+               name + " rejects " + flag + " followed by a NUL");
     }
     expect(!lemon::utils::validate_custom_args("--threads 2 --host 0.0.0.0", reserved).empty(),
            name + " rejects --host after an allowed flag");

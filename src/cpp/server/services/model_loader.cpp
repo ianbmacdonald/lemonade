@@ -200,6 +200,18 @@ json ModelLoader::model_error(const std::string& requested_model,
         return error_response;
     }
 
+    // The backends' validate_custom_args refusals: a caller's *_args, not the server, is at fault.
+    if (exception_msg.rfind("Invalid custom ", 0) == 0) {
+        error_response["error"] = {
+            {"message", "Failed to load model '" + requested_model + "': " + exception_msg},
+            {"type", "invalid_request_error"},
+            {"param", "model"},
+            {"code", kInvalidBackendArgs.code},
+            {"requested_model", requested_model}
+        };
+        return error_response;
+    }
+
     std::string message = "Failed to load model '" + requested_model + "': " + exception_msg;
     error_response["error"] = {
         {"message", message},
@@ -224,6 +236,10 @@ const RouteError ModelLoader::kSlotsPinned{
     409, "slots_pinned_error",
     "Every loaded model of the requested model's type is pinned, so none can be unloaded to make "
     "room"};
+const RouteError ModelLoader::kInvalidBackendArgs{
+    400, "invalid_backend_args",
+    "The model's backend arguments (`*_args`) set a flag Lemonade manages, such as the engine's "
+    "port or bind address"};
 const RouteError ModelLoader::kModelLoadError{
     500, "model_load_error",
     "Loading the requested model fails for another reason, such as a failed download or a backend "
@@ -231,12 +247,12 @@ const RouteError ModelLoader::kModelLoadError{
 
 std::vector<RouteError> ModelLoader::errors() {
     return {kModelNotSupported, kModelNotFound, kRouterResidencyConflict, kSlotsPinned,
-            kModelLoadError};
+            kInvalidBackendArgs, kModelLoadError};
 }
 
 const RouteError& ModelLoader::load_error(const std::string& error_code) {
     for (const RouteError* error : {&kModelNotSupported, &kRouterResidencyConflict,
-                                    &kSlotsPinned, &kModelLoadError}) {
+                                    &kSlotsPinned, &kInvalidBackendArgs, &kModelLoadError}) {
         if (error->code == error_code) {
             return *error;
         }

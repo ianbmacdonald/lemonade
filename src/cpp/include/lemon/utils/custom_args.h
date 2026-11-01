@@ -112,6 +112,12 @@ inline CustomArgsMap build_custom_args_map(const std::vector<std::string>& token
 }
 
 inline std::string validate_custom_args(const std::string& custom_args_str, const std::set<std::string>& reserved_flags) {
+    // execvp reads each argument up to its first NUL, so "--host\0x" would
+    // pass the comparison below and still reach the engine as --host.
+    if (custom_args_str.find('\0') != std::string::npos) {
+        return "Arguments must not contain a NUL character.";
+    }
+
     std::vector<std::string> custom_args = parse_custom_args(custom_args_str);
 
     for (const auto& arg : custom_args) {
