@@ -1,14 +1,14 @@
-From 6bf52a636a5536ccf854feddbd3bf697f667d333 Mon Sep 17 00:00:00 2001
+From 0e460e06561a0283c8c914928f7a81746c64c058 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 18:41:37 -0400
-Subject: [PATCH 41/88] fix(beacon): bind the real subnet broadcast and add
+Subject: [PATCH 41/91] fix(beacon): bind the real subnet broadcast and add
  beacon_listen_interfaces
 
 The listener bound NetworkInterfaceInfo::broadcastAddress, which came from
 ifa_broadaddr. When an address has no configured brd (OpenWrt/prplOS LAN
 bridges), glibc and musl report the unicast address there, so the listener
-bound e.g. 192.168.60.1:13305 and never heard beacons sent to
-192.168.60.255, while the kernel still treats ip|~mask as that subnet's
+bound e.g. 10.60.0.1:13305 and never heard beacons sent to
+10.60.0.255, while the kernel still treats ip|~mask as that subnet's
 broadcast. The broadcast is now derived from the netmask on POSIX, as the
 Windows path already did; /31 and /32 fall back to 255.255.255.255. This
 also fixes the sender, which was beaconing to its own unicast address on
@@ -18,7 +18,7 @@ Per-interface broadcast binds are kept rather than one INADDR_ANY socket:
 with SO_REUSEADDR, Linux hands each 127.0.0.1 unicast beacon only to the
 most recently bound wildcard socket, so a wildcard bind in lemond would take
 local discovery beacons from `lemonade scan` and the desktop app whenever it
-bound after them (measured on ai4). Broadcast datagrams reach every
+bound after them (measured on gw2). Broadcast datagrams reach every
 matching socket, so scan keeps working alongside the listener.
 
 New config key beacon_listen_interfaces (default []: every RFC1918

@@ -1,7 +1,7 @@
-From df4481db5f1f9d71d8032522e8c9a896a261d71a Mon Sep 17 00:00:00 2001
+From 5316b009486014819d17498c000303df5b0bf361 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:32:56 -0400
-Subject: [PATCH 69/88] fix(tflite): confine labels_file by its resolved path
+Subject: [PATCH 69/91] fix(tflite): confine labels_file by its resolved path
 
 An image manifest's labels_file was confined lexically: no absolute path
 and no "..". The layout check then followed symlinks, so a model directory

@@ -1,0 +1,187 @@
+From ef9704b00e9254a07485b0eaff31288c82db829b Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 16:42:53 -0500
+Subject: [PATCH 91/91] fix(onnxruntime): a failed ort-server start does not
+ evict other models
+
+ort-server load failures threw a plain runtime_error, so the router
+evicted every resident model and loaded again, and the stderr capture
+relaunched the engine even after a readiness timeout or an OOM kill.
+One broken ort model cost four launches and emptied the gateway.
+
+Start failures now take the same path as tflite-server and et-server:
+non-retryable, no capture relaunch after a timeout, cancellation or
+SIGKILL, and a missing or ambiguous model layout is non-retryable too.
+
+Assisted-by: claude:opus-5.5
+---
+ .../onnxruntime/onnxruntime_server.cpp        | 25 ++++++---
+ test/server_image_classify.py                 | 52 +++++++++++++++++++
+ test/utils/fake_tflite_server.py              |  6 +++
+ 3 files changed, 77 insertions(+), 6 deletions(-)
+
+diff --git a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+index e47f447e4..9a293b38f 100644
+--- a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
++++ b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+@@ -7,6 +7,7 @@
+ #include "lemon/backends/hf_cache_util.h"
+ #include "lemon/backend_manager.h"
+ #include "lemon/classify_text_limit.h"
++#include "lemon/error_types.h"
+ #include "lemon/utils/path_utils.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
+@@ -171,7 +172,7 @@ void OnnxRuntimeServer::load(const std::string& model_name,
+     // the resolved path is the only candidate.
+     auto candidates = find_complete_model_dirs(path_from_utf8(model_path));
+     if (candidates.empty()) {
+-        throw std::runtime_error(
++        throw NonRetryableLoadException(
+             "No servable model directory under '" + model_path +
+             "': need model.onnx (or model.ort) + tokenizer.json + config.json "
+             "(manifest.json is optional and overrides the output contract)");
+@@ -179,7 +180,7 @@ void OnnxRuntimeServer::load(const std::string& model_name,
+     if (candidates.size() > 1) {
+         std::string listing;
+         for (const auto& c : candidates) listing += "\n  " + path_to_utf8(c);
+-        throw std::runtime_error(
++        throw NonRetryableLoadException(
+             "Ambiguous model layout under '" + model_path + "': " +
+             std::to_string(candidates.size()) +
+             " complete model directories found — keep exactly one:" + listing);
+@@ -218,14 +219,26 @@ void OnnxRuntimeServer::load(const std::string& model_name,
+     try {
+         start_server(std::make_unique<NativeProcess>(ProcessOutput{inherit_output, false}),
+                      command);
+-    } catch (const std::runtime_error& e) {
+-        if (load_cancelled()) throw;
++    } catch (const std::runtime_error&) {
++        // Non-retryable as for tflite-server and et-server: ort-server runs on
++        // the CPU, so evicting other models cannot fix a failed start.
++        if (load_cancelled()) throw NonRetryableLoadException("ort-server load cancelled");
++        const int exit_code = startup_exit_code();
++        if (exit_code < 0) {
++            throw NonRetryableLoadException("ort-server did not become ready");
++        }
++        if (exit_code == 128 + 9) {
++            // SIGKILL during load is the OOM killer's signature; relaunching to
++            // capture stderr would repeat the full load under the same pressure.
++            throw NonRetryableLoadException(
++                "ort-server was killed by signal 9 (likely out of memory)");
++        }
+         // The subprocess's stderr is invisible when lemond runs windowless (CI,
+         // tray), so a startup failure would otherwise surface only as "not
+         // ready". Re-run it briefly to capture the reason it refused the model.
+         std::string details = capture_startup_error(executable, args);
+-        throw std::runtime_error(std::string(e.what()) +
+-                                 (details.empty() ? "" : ": " + details));
++        throw NonRetryableLoadException("ort-server failed to start or become ready" +
++                                        (details.empty() ? "" : ": " + details));
+     }
+ 
+     // The pin does not decide the binary: a `cpu_bin` path or tag can run an
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index 6c2871951..5c82e7a7e 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -80,6 +80,7 @@ _opts = argparse.Namespace(
+     fake_state_dir=None,
+     lemond_pid=None,
+     short_watchdog=False,
++    fake_ort=False,
+ )
+ 
+ 
+@@ -95,6 +96,8 @@ def _parse_own_args():
+     )
+     parser.add_argument("--lemond-pid", type=int)
+     parser.add_argument("--short-watchdog", action="store_true")
++    # lemond was started with onnxruntime.cpu_bin pointing at the fake engine.
++    parser.add_argument("--fake-ort", action="store_true")
+     args, _ = parser.parse_known_args()
+     return args
+ 
+@@ -826,6 +829,55 @@ class ImageClassifyTests(ServerTestBase):
+         )
+         self._assert_reference(response, 1)
+ 
++    def test_515_broken_ort_model_keeps_resident_models(self):
++        if not _opts.fake_ort:
++            self.skipTest("needs --fake-ort")
++        self._require_model()
++        failed = os.path.join(_opts.fake_state_dir, "failed-starts.log")
++        self._assert_reference(
++            self._post_form(
++                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
++                data={"model": MODEL, "top_k": "1"},
++            ),
++            1,
++        )
++        name = "user.B194-Broken-Ort"
++        dest = os.path.join(_opts.hf_cache, "models--" + name[len("user.") :])
++        if os.path.isdir(dest):
++            shutil.rmtree(dest)
++        os.makedirs(dest)
++        for file_name in (
++            "model.onnx",
++            "tokenizer.json",
++            "config.json",
++            "FAKE_FAIL_START",
++        ):
++            with open(os.path.join(dest, file_name), "w", encoding="utf-8") as f:
++                f.write("{}")
++        response = requests.post(
++            f"{self.base_url}/pull",
++            json={
++                "model_name": name,
++                "recipe": "onnxruntime",
++                "labels": ["classification"],
++                "local_import": True,
++            },
++            timeout=TIMEOUT_DEFAULT,
++        )
++        self.assertEqual(response.status_code, 200, response.text[:500])
++        failed_before = _line_count(failed)
++        response = requests.post(
++            f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_DEFAULT
++        )
++        self.assertGreaterEqual(response.status_code, 400, response.text[:500])
++        # One start and one relaunch to capture its stderr; evicting the other
++        # models and loading again cannot fix a CPU engine that refused its model.
++        self.assertEqual(_line_count(failed) - failed_before, 2)
++        health = requests.get(f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT).json()
++        # /health lists public names, without the user. prefix.
++        loaded = [m["model_name"] for m in health["all_models_loaded"]]
++        self.assertIn(MODEL[len("user.") :], loaded, "the image model was evicted")
++
+     def test_513_repeated_text_crashes_pause_the_model(self):
+         self._require_model()
+         self._require_text_model()
+diff --git a/test/utils/fake_tflite_server.py b/test/utils/fake_tflite_server.py
+index 9c5e0f9a6..2c84ebd22 100644
+--- a/test/utils/fake_tflite_server.py
++++ b/test/utils/fake_tflite_server.py
+@@ -23,6 +23,9 @@ containing POISON_TEXT, never answers text containing HANG_TEXT and stops
+ answering GET /health meanwhile, as a single-threaded engine would, and
+ otherwise returns fixed label scores.
+ 
++A model dir containing FAKE_FAIL_START makes the server exit 3 at startup,
++as an engine that refuses its model does; it also stands in for ort-server.
++
+ When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
+ starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
+ list to args.log.
+@@ -190,6 +193,9 @@ def main():
+     def has(name):
+         return os.path.exists(os.path.join(args.model_path, name))
+ 
++    if has("FAKE_FAIL_START"):
++        _log("failed-starts.log", str(os.getpid()))
++        sys.exit(3)
+     if has("manifest.json"):
+         task = "image-classification"
+     elif has("tokenizer.json") and has("config.json"):
+-- 
+2.53.0
+

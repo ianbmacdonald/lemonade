@@ -1,7 +1,7 @@
-From 376a09baf18cc24898ee21e21d8195980508d7de Mon Sep 17 00:00:00 2001
+From a11a196a2bbe70fab2bc864a98b143d83c036c3a Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:39:05 -0400
-Subject: [PATCH 18/88] fix(images/classify): close body-size bypasses, cap
+Subject: [PATCH 18/91] fix(images/classify): close body-size bypasses, cap
  in-flight requests, pause crash loops
 
 The pre-body guard read only Content-Length, but httplib reads chunked

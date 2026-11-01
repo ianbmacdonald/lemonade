@@ -1,7 +1,7 @@
-From 7dc5674ff1c3e6edff7b4c63550ddaaff7c87fe0 Mon Sep 17 00:00:00 2001
+From 4f1edf406ae476feccab77179ff24ae45c765a38 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 18:11:29 -0400
-Subject: [PATCH 75/88] fix(server): bound the upgrade peek and keep client
+Subject: [PATCH 75/91] fix(server): bound the upgrade peek and keep client
  sockets out of children
 
 The front server peeks every accepted connection for a WebSocket upgrade
@@ -103,7 +103,7 @@ index 59f213807..6b8879981 100644
  }
  
 diff --git a/src/cpp/server/utils/beacon_listener.cpp b/src/cpp/server/utils/beacon_listener.cpp
-index 74620e0d6..a639182f0 100644
+index 0b72d9e48..a1b493340 100644
 --- a/src/cpp/server/utils/beacon_listener.cpp
 +++ b/src/cpp/server/utils/beacon_listener.cpp
 @@ -13,6 +13,7 @@

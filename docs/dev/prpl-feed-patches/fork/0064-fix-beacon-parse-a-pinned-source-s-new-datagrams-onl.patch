@@ -1,7 +1,7 @@
-From a021effeec42188c525f8311da367d8376de9b9d Mon Sep 17 00:00:00 2001
+From e130ddd50d221dfa44b2a09887a2fd99ca58ab1d Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:00:10 -0400
-Subject: [PATCH 64/88] fix(beacon): parse a pinned source's new datagrams only
+Subject: [PATCH 64/91] fix(beacon): parse a pinned source's new datagrams only
  on a global token
 
 A pinned source skipped the global bucket and spent its own token only on
@@ -44,7 +44,7 @@ index 9e6eabf4c..4d64324f3 100644
      IngestResult record_locked(IngestResult result);
  
 diff --git a/src/cpp/server/utils/beacon_listener.cpp b/src/cpp/server/utils/beacon_listener.cpp
-index e7bc03e6f..74620e0d6 100644
+index adb421b1d..0b72d9e48 100644
 --- a/src/cpp/server/utils/beacon_listener.cpp
 +++ b/src/cpp/server/utils/beacon_listener.cpp
 @@ -328,6 +328,17 @@ bool BeaconPeerTable::is_pinned_locked(uint32_t src_ip) const {
@@ -114,7 +114,7 @@ index e7bc03e6f..74620e0d6 100644
      row.last_seen_wall = wall;
      row.last_seen = now;
 diff --git a/test/cpp/test_beacon_peer_table.cpp b/test/cpp/test_beacon_peer_table.cpp
-index a7723bb20..70244227b 100644
+index cce0a37b7..d99fc8a4a 100644
 --- a/test/cpp/test_beacon_peer_table.cpp
 +++ b/test/cpp/test_beacon_peer_table.cpp
 @@ -395,6 +395,19 @@ void test_pinned_junk_flood(Clock::time_point t0) {

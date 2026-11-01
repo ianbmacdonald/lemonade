@@ -1,7 +1,7 @@
-From 2e62be3b54cc5ff56b52d4b8f3e60cda6e018b82 Mon Sep 17 00:00:00 2001
+From 46e0f7638a6e844c4d932a4b4d6ab08e483c4429 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 17:55:22 -0400
-Subject: [PATCH 74/88] docs(config): WebSocket connections now count against
+Subject: [PATCH 74/91] docs(config): WebSocket connections now count against
  the per-client cap
 
 Assisted-by: claude:opus-5.5
@@ -10,7 +10,7 @@ Assisted-by: claude:opus-5.5
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/docs/guide/configuration/README.md b/docs/guide/configuration/README.md
-index 6ecd8637d..8022401f2 100644
+index ec5122a97..b3740cdf7 100644
 --- a/docs/guide/configuration/README.md
 +++ b/docs/guide/configuration/README.md
 @@ -230,7 +230,7 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin

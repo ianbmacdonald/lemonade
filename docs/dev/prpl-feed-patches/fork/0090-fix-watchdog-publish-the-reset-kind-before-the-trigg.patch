@@ -1,0 +1,86 @@
+From 25067e213daabcffedf6767e96efc51723b60207 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Sun, 1 Nov 2026 15:14:04 -0500
+Subject: [PATCH 90/91] fix(watchdog): publish the reset kind before the
+ trigger, in one step
+
+The reset kind was stored after watchdog_triggered_, so a concurrent
+request could read the trigger with the kind still unset and count a
+hang as a crash. The first reset now claims the kind with one
+compare-and-swap and then publishes the trigger; a later reset cannot
+overwrite it.
+
+Assisted-by: claude:opus-5.5
+---
+ src/cpp/include/lemon/wrapped_server.h | 11 +++++++++--
+ src/cpp/server/wrapped_server.cpp      |  9 ++++++---
+ 2 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/src/cpp/include/lemon/wrapped_server.h b/src/cpp/include/lemon/wrapped_server.h
+index 825d6fa7f..f43c0de47 100644
+--- a/src/cpp/include/lemon/wrapped_server.h
++++ b/src/cpp/include/lemon/wrapped_server.h
+@@ -8,6 +8,7 @@
+ #include <condition_variable>
+ #include <thread>
+ #include <atomic>
++#include <cstdint>
+ #include <stdexcept>
+ #include <nlohmann/json.hpp>
+ #include <httplib.h>
+@@ -427,7 +428,9 @@ public:
+ 
+     // True when that reset stopped a live process whose health endpoint went silent,
+     // not one that had already exited.
+-    bool was_reset_unresponsive() const { return watchdog_reset_unresponsive_.load(std::memory_order_acquire); }
++    bool was_reset_unresponsive() const {
++        return watchdog_reset_kind_.load(std::memory_order_acquire) == kResetUnresponsive;
++    }
+ 
+     // Request backend reset from watchdog (stops process immediately).
+     void request_backend_reset_from_watchdog(const std::string& reason, bool unresponsive = false);
+@@ -706,7 +709,11 @@ private:
+     std::atomic<bool> watchdog_stop_requested_{false};
+     std::atomic<bool> watchdog_running_{false};
+     std::atomic<bool> watchdog_triggered_{false};
+-    std::atomic<bool> watchdog_reset_unresponsive_{false};
++    // Set before watchdog_triggered_, so a reader that sees the trigger also sees the kind.
++    static constexpr uint8_t kResetNone = 0;
++    static constexpr uint8_t kResetCrashed = 1;
++    static constexpr uint8_t kResetUnresponsive = 2;
++    std::atomic<uint8_t> watchdog_reset_kind_{kResetNone};
+     std::atomic<int> active_backend_requests_{0};
+     std::atomic<int> active_streaming_requests_{0};
+     std::atomic<int> active_non_streaming_requests_{0};
+diff --git a/src/cpp/server/wrapped_server.cpp b/src/cpp/server/wrapped_server.cpp
+index 55d6889e8..92c5c060f 100644
+--- a/src/cpp/server/wrapped_server.cpp
++++ b/src/cpp/server/wrapped_server.cpp
+@@ -358,7 +358,7 @@ void WrappedServer::start_backend_watchdog(const BackendWatchdogPolicy& policy)
+     }
+ 
+     watchdog_triggered_.store(false, std::memory_order_release);
+-    watchdog_reset_unresponsive_.store(false, std::memory_order_release);
++    watchdog_reset_kind_.store(kResetNone, std::memory_order_release);
+     watchdog_stop_requested_.store(false, std::memory_order_release);
+     active_backend_requests_.store(0, std::memory_order_release);
+     active_streaming_requests_.store(0, std::memory_order_release);
+@@ -441,10 +441,13 @@ void WrappedServer::stop_server() {
+ }
+ 
+ void WrappedServer::request_backend_reset_from_watchdog(const std::string& reason, bool unresponsive) {
+-    if (watchdog_triggered_.exchange(true, std::memory_order_acq_rel)) {
++    uint8_t no_reset = kResetNone;
++    if (!watchdog_reset_kind_.compare_exchange_strong(no_reset,
++                                                      unresponsive ? kResetUnresponsive : kResetCrashed,
++                                                      std::memory_order_acq_rel)) {
+         return;
+     }
+-    watchdog_reset_unresponsive_.store(unresponsive, std::memory_order_release);
++    watchdog_triggered_.store(true, std::memory_order_release);
+ 
+     {
+         std::lock_guard<std::mutex> lock(watchdog_mutex_);
+-- 
+2.53.0
+

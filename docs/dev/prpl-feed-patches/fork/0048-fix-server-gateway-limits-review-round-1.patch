@@ -1,7 +1,7 @@
-From 53532484d91e0c1af534b9908a5daff8d4212b14 Mon Sep 17 00:00:00 2001
+From 42573f2e78d95ae504316021d24d28e5328a2c2a Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Fri, 9 Oct 2026 02:42:32 -0400
-Subject: [PATCH 48/88] fix(server): gateway limits review round 1
+Subject: [PATCH 48/91] fix(server): gateway limits review round 1
 
 Refuse a connection whose socket cannot be duplicated while the receive
 deadline is on, instead of admitting it with no deadline. Clamp an
@@ -23,7 +23,7 @@ Assisted-by: claude:opus-5.5
  8 files changed, 145 insertions(+), 47 deletions(-)
 
 diff --git a/docs/guide/configuration/README.md b/docs/guide/configuration/README.md
-index c1bbb23fb..59becdef4 100644
+index 8ce3d9528..4e4a05804 100644
 --- a/docs/guide/configuration/README.md
 +++ b/docs/guide/configuration/README.md
 @@ -228,9 +228,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin

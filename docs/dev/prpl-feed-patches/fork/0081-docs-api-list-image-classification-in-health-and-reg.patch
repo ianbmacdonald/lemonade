@@ -1,7 +1,7 @@
-From e89411d1fc74bd68f78f3110179ae478fd6ae674 Mon Sep 17 00:00:00 2001
+From 1bbabd5dbf66c9a08e69092fe3beda8a1750f8f8 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:08:19 -0400
-Subject: [PATCH 81/88] docs(api): list image-classification in /health and
+Subject: [PATCH 81/91] docs(api): list image-classification in /health and
  regenerate the reference
 
 Assisted-by: claude:opus-5.5
@@ -13,7 +13,7 @@ Assisted-by: claude:opus-5.5
  4 files changed, 22 insertions(+), 3 deletions(-)
 
 diff --git a/docs/api/lemonade.md b/docs/api/lemonade.md
-index 34344bbe5..0efea65d7 100644
+index e5348b5fe..42c8bf71f 100644
 --- a/docs/api/lemonade.md
 +++ b/docs/api/lemonade.md
 @@ -133,6 +133,7 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
@@ -178,7 +178,7 @@ index 32fc477a8..c2720e68d 100644
  | `404` | `model_not_found` | The requested model is not in the registry |
  | `409` | `router_residency_conflict` | Loading the requested model would evict a model that a `collection.router` model needs resident on the same NPU |
 diff --git a/src/cpp/server/routes/lemonade/system/health.cpp b/src/cpp/server/routes/lemonade/system/health.cpp
-index 7b9906e0b..ca9849576 100644
+index 6cf9bd055..3ed1f3391 100644
 --- a/src/cpp/server/routes/lemonade/system/health.cpp
 +++ b/src/cpp/server/routes/lemonade/system/health.cpp
 @@ -57,7 +57,7 @@ ordered_json health_schema() {

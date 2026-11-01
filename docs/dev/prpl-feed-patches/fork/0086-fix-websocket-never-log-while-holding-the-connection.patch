@@ -1,7 +1,7 @@
-From fe6ab143dda098c0185287e4c5abe53a3288c729 Mon Sep 17 00:00:00 2001
+From 82ef3e69aacbafe12b5d463b84a5d6e3e9422be2 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 12:18:48 -0500
-Subject: [PATCH 86/88] fix(websocket): never log while holding the connection
+Subject: [PATCH 86/91] fix(websocket): never log while holding the connection
  lock, and let one large message through
 
 With the hub log sink installed, every log line is sent to /logs/stream

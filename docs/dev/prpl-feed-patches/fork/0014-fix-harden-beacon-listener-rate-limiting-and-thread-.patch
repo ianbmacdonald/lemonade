@@ -1,7 +1,7 @@
-From e9a36c6a096e3ab18793957653395f06973d2f45 Mon Sep 17 00:00:00 2001
+From 3884682508e86a937e8aed914c29a26907fec5f6 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:46:28 -0400
-Subject: [PATCH 14/88] fix: harden beacon listener rate limiting and thread
+Subject: [PATCH 14/91] fix: harden beacon listener rate limiting and thread
  start; tighten tests
 
 - Check the per-source bucket before spending a global token, so one noisy
@@ -248,7 +248,7 @@ index 0a2d222d5..1e84094db 100644
  #include "test_config_helpers.h"
  
 diff --git a/test/cpp/test_beacon_peer_table.cpp b/test/cpp/test_beacon_peer_table.cpp
-index 2866dfba5..bb6373055 100644
+index 7cc0c1518..7860140ac 100644
 --- a/test/cpp/test_beacon_peer_table.cpp
 +++ b/test/cpp/test_beacon_peer_table.cpp
 @@ -4,9 +4,9 @@

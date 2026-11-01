@@ -1,7 +1,7 @@
-From 6de1254283aeafb4004727f6ca6ecdfc7d84e431 Mon Sep 17 00:00:00 2001
+From 857d86ad78d50667887554436564a03a0fc152f8 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 21:24:00 -0400
-Subject: [PATCH 45/88] feat(beacon): beacon_trusted_relays lets a named relay
+Subject: [PATCH 45/91] feat(beacon): beacon_trusted_relays lets a named relay
  vouch for hosts
 
 A relay that re-sends another host's beacon from its own address was
@@ -27,7 +27,7 @@ Assisted-by: claude:opus-5.5
  5 files changed, 221 insertions(+), 16 deletions(-)
 
 diff --git a/docs/guide/configuration/README.md b/docs/guide/configuration/README.md
-index 231f87bac..67460f74c 100644
+index 231f87bac..e3f58227b 100644
 --- a/docs/guide/configuration/README.md
 +++ b/docs/guide/configuration/README.md
 @@ -224,6 +224,9 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
@@ -36,7 +36,7 @@ index 231f87bac..67460f74c 100644
  | `auto_evict_threshold_pct` | number | 0.90 | Global VRAM fraction at which pressure eviction is evaluated. Must be greater than 0 and at most 1.0; `0.90` means 90%. |
 +| `beacon_listen` | bool | false | Linux/macOS only. Listen on UDP 13305 for other Lemonade servers' LAN broadcast beacons from on-link RFC1918 senders and list them under `beacon_listener` in `/v1/health`. Heard hosts are never contacted and never used as providers. The list is as readable as `/health`, so set `LEMONADE_API_KEY` when `host` is not localhost. `stats.url_mismatch` counts multi-homed peers whose source IP differs from their advertised URL, and beacons re-sent by a relay that is not listed in `beacon_trusted_relays`. UDP 13305 must be allowed inbound on the LAN side. By default it hears every RFC1918 interface, so on a gateway whose WAN side is also RFC1918 (double NAT), set `beacon_listen_interfaces` to the LAN bridges, or WAN-side hosts are listed too. |
 +| `beacon_listen_interfaces` | list of strings | [] | Interface names the beacon listener hears on, for example `["br-lan"]`. Empty means every interface with an RFC1918 address. Beacons that arrive on any other interface, including ones sent to `255.255.255.255`, are dropped and counted in `stats.wrong_interface`. Names that match no interface with an RFC1918 address are logged and listed in `beacon_listener.unmatched_interfaces`. The interfaces in use are listed under `beacon_listener.interfaces` in `/v1/health`. Only applies when `beacon_listen` is true. |
-+| `beacon_trusted_relays` | list of objects | [] | Relays whose re-sent beacons the listener accepts, for example `[{"source": "192.168.60.10", "allow_hosts": ["192.168.79.20"]}]`. Normally a beacon is dropped (`stats.url_mismatch`) when the host in its advertised URL differs from the address it was sent from; a datagram sent from a listed `source` may instead advertise a URL whose host is in that entry's `allow_hosts` (IPv4 addresses or CIDRs such as `192.168.79.0/24`). `source` must be an RFC1918 address and every `allow_hosts` entry must lie inside 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16, so a relay cannot introduce public addresses. Relayed datagrams still pass the RFC1918 source, `beacon_listen_interfaces` and rate-limit checks; each relay lists at most 16 hosts and each relayed host is rate-limited as if it beaconed directly. Such hosts are listed with `via` set to the relay's address and counted in `stats.relayed_accepted`; beacons from a listed relay advertising any other host are counted in `stats.relay_host_refused`. Listing only: a relayed host is never contacted or trusted for traffic. Up to 16 relays with 32 `allow_hosts` each. Changes apply without restarting the listener. Only applies when `beacon_listen` is true. |
++| `beacon_trusted_relays` | list of objects | [] | Relays whose re-sent beacons the listener accepts, for example `[{"source": "10.60.0.10", "allow_hosts": ["10.79.0.20"]}]`. Normally a beacon is dropped (`stats.url_mismatch`) when the host in its advertised URL differs from the address it was sent from; a datagram sent from a listed `source` may instead advertise a URL whose host is in that entry's `allow_hosts` (IPv4 addresses or CIDRs such as `10.79.0.0/24`). `source` must be an RFC1918 address and every `allow_hosts` entry must lie inside 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16, so a relay cannot introduce public addresses. Relayed datagrams still pass the RFC1918 source, `beacon_listen_interfaces` and rate-limit checks; each relay lists at most 16 hosts and each relayed host is rate-limited as if it beaconed directly. Such hosts are listed with `via` set to the relay's address and counted in `stats.relayed_accepted`; beacons from a listed relay advertising any other host are counted in `stats.relay_host_refused`. Listing only: a relayed host is never contacted or trusted for traffic. Up to 16 relays with 32 `allow_hosts` each. Changes apply without restarting the listener. Only applies when `beacon_listen` is true. |
  | `broadcast` | bool | true | Enable or disable UDP broadcasting for server discovery |
  | `extra_models_dir` | string | "" | Secondary directory recursively scanned for GGUF model files. Empty disables extra discovery; existing paths must be readable by `lemond`. See [Imported models](./custom-models.md#imported-models-extra_models_dir) |
  | `models_dir` | string | "auto" | Directory for cached model files. `"auto"` follows `HF_HUB_CACHE` / `HF_HOME` / platform default |
@@ -77,14 +77,14 @@ index a47205359..77d7eb026 100644
    "cloud_providers": [],
    "config_version": 2,
 diff --git a/src/cpp/server/routes/lemonade/system/health.cpp b/src/cpp/server/routes/lemonade/system/health.cpp
-index 00ec957fc..7b9906e0b 100644
+index 00ec957fc..6cf9bd055 100644
 --- a/src/cpp/server/routes/lemonade/system/health.cpp
 +++ b/src/cpp/server/routes/lemonade/system/health.cpp
 @@ -121,14 +121,15 @@ ordered_json health_schema() {
                      "sockets": {"type": "array", "items": {"type": "object"}, "description": "One entry per bound broadcast address (`address`, `bound`, `error`). The listener binds each listened interface's subnet broadcast address (worked out from its address and netmask) plus `255.255.255.255`, never `0.0.0.0`, so it does not take the `127.0.0.1` beacons that `lemonade scan` relies on."},
                      "interfaces": {"type": "array", "items": {"type": "object"}, "description": "The interfaces being listened on: `name`, `address`, `netmask` and `broadcast`. By default this is every interface with an RFC1918 address. The `beacon_listen_interfaces` setting narrows it; on a gateway whose WAN side is also RFC1918, set it to the LAN bridges or WAN-side hosts are listed too."},
                      "interface_allowlist": {"type": "array", "items": {"type": "string"}, "description": "The `beacon_listen_interfaces` setting, or `[]` when every RFC1918 interface is heard."},
-+                    "trusted_relays": {"type": "array", "items": {"type": "object"}, "description": "The `beacon_trusted_relays` setting, with each `allow_hosts` entry written as a CIDR (`192.168.79.20` becomes `192.168.79.20/32`)."},
++                    "trusted_relays": {"type": "array", "items": {"type": "object"}, "description": "The `beacon_trusted_relays` setting, with each `allow_hosts` entry written as a CIDR (`10.79.0.20` becomes `10.79.0.20/32`)."},
                      "unmatched_interfaces": {"type": "array", "items": {"type": "string"}, "description": "Entries of `beacon_listen_interfaces` that name no interface with an RFC1918 address. When none match, `listening` is `false` and `error` names them."},
                      "self_instance_id": {"type": "string", "description": "This server's beacon `instance_id`, used to drop its own beacons."},
                      "self_port": {"type": "integer", "description": "This server's HTTP port, used to drop its own beacons."},
@@ -99,7 +99,7 @@ index 00ec957fc..7b9906e0b 100644
              },
              "server_process": {
 diff --git a/src/cpp/server/utils/beacon_listener.cpp b/src/cpp/server/utils/beacon_listener.cpp
-index c873917e1..e7bc03e6f 100644
+index c873917e1..adb421b1d 100644
 --- a/src/cpp/server/utils/beacon_listener.cpp
 +++ b/src/cpp/server/utils/beacon_listener.cpp
 @@ -4,6 +4,7 @@
@@ -141,7 +141,7 @@ index c873917e1..e7bc03e6f 100644
 +    auto slash = text.find('/');
 +    uint32_t addr = 0;
 +    if (!parse_ipv4_literal(text.substr(0, slash), addr)) {
-+        why = "is not an IPv4 address or CIDR like 192.168.79.20 or 192.168.79.0/24";
++        why = "is not an IPv4 address or CIDR like 10.79.0.20 or 10.79.0.0/24";
 +        return false;
 +    }
 +    int prefix = 32;
@@ -213,7 +213,7 @@ index c873917e1..e7bc03e6f 100644
 +        BeaconTrustedRelay relay;
 +        const std::string src = src_it->get<std::string>();
 +        if (!parse_ipv4_literal(src, relay.source)) {
-+            fail(where + " source '" + src + "' is not an IPv4 address like 192.168.60.10");
++            fail(where + " source '" + src + "' is not an IPv4 address like 10.60.0.10");
 +        }
 +        if (!utils::is_rfc1918_ipv4(relay.source)) {
 +            fail(where + " source '" + src + "' is not an RFC1918 address");

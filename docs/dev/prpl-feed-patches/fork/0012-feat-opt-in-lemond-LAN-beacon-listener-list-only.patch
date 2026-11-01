@@ -1,7 +1,7 @@
-From fe413bbf6b3b1f3af2ea816975080c2efe034f43 Mon Sep 17 00:00:00 2001
+From c7ce2b2cb9adad2a5d02b35f1e07d573856d0fbe Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:36:32 -0400
-Subject: [PATCH 12/88] feat: opt-in lemond LAN beacon listener, list-only
+Subject: [PATCH 12/91] feat: opt-in lemond LAN beacon listener, list-only
 
 Add a beacon_listen config key (default false). When enabled, lemond binds
 UDP 13305 on each local RFC1918 interface's directed-broadcast address plus
@@ -1524,7 +1524,7 @@ index 000000000..0a2d222d5
 +}
 diff --git a/test/cpp/test_beacon_peer_table.cpp b/test/cpp/test_beacon_peer_table.cpp
 new file mode 100644
-index 000000000..2866dfba5
+index 000000000..7cc0c1518
 --- /dev/null
 +++ b/test/cpp/test_beacon_peer_table.cpp
 @@ -0,0 +1,398 @@
@@ -1577,7 +1577,7 @@ index 000000000..2866dfba5
 +    BeaconPeerTable t;
 +    t.set_self("ffffffffffffffff", 13305);
 +    uint32_t src = ip(192, 168, 1, 40);
-+    std::string p = beacon(url_for(src), "ai4", "0a1b2c3d4e5f6071");
++    std::string p = beacon(url_for(src), "gw2", "0a1b2c3d4e5f6071");
 +    check(feed(t, p, src, t0) == IngestResult::Accepted, "basic: first beacon is Accepted");
 +    check(feed(t, p, src, t0 + std::chrono::seconds(2)) == IngestResult::Refreshed,
 +          "basic: repeat 2s later is Refreshed");
@@ -1586,7 +1586,7 @@ index 000000000..2866dfba5
 +    check(hosts.size() == 1 && hosts[0].last_seen == t0 + std::chrono::seconds(2),
 +          "basic: last_seen advanced");
 +    json j = t.to_json(t0 + std::chrono::seconds(2));
-+    check(j["hosts"].size() == 1 && j["hosts"][0]["hostname"] == "ai4" &&
++    check(j["hosts"].size() == 1 && j["hosts"][0]["hostname"] == "gw2" &&
 +              j["hosts"][0]["source_ip"] == "192.168.1.40" &&
 +              j["hosts"][0]["instance_id"] == "0a1b2c3d4e5f6071",
 +          "basic: to_json lists the host");
@@ -1622,7 +1622,7 @@ index 000000000..2866dfba5
 +    }
 +    std::vector<std::string> bad = {
 +        "https://192.168.1.40:13305/api/v1/",
-+        "http://ai4.local:13305/api/v1/",
++        "http://gw2.local:13305/api/v1/",
 +        "http://192.168.1.40/api/v1/",
 +        "http://192.168.1.40:0/api/v1/",
 +        "http://192.168.1.40:70000/api/v1/",
@@ -1747,7 +1747,7 @@ index 000000000..2866dfba5
 +    check(!j.is_discarded() && !j.contains("instance_id"), "broadcaster: no instance_id until set");
 +
 +    nb.setInstanceId("9f3c2a61d04b7e18");
-+    json j2 = json::parse(nb.buildStandardPayloadPattern("ai4", "http://192.168.1.40:13305/api/v1/"),
++    json j2 = json::parse(nb.buildStandardPayloadPattern("gw2", "http://192.168.1.40:13305/api/v1/"),
 +                          nullptr, false);
 +    check(!j2.is_discarded() && j2.value("instance_id", "") == "9f3c2a61d04b7e18",
 +          "broadcaster: instance_id included after setInstanceId");
