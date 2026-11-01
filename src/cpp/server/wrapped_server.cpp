@@ -358,7 +358,7 @@ void WrappedServer::start_backend_watchdog(const BackendWatchdogPolicy& policy) 
     }
 
     watchdog_triggered_.store(false, std::memory_order_release);
-    watchdog_reset_unresponsive_.store(false, std::memory_order_release);
+    watchdog_reset_kind_.store(kResetNone, std::memory_order_release);
     watchdog_stop_requested_.store(false, std::memory_order_release);
     active_backend_requests_.store(0, std::memory_order_release);
     active_streaming_requests_.store(0, std::memory_order_release);
@@ -441,10 +441,13 @@ void WrappedServer::stop_server() {
 }
 
 void WrappedServer::request_backend_reset_from_watchdog(const std::string& reason, bool unresponsive) {
-    if (watchdog_triggered_.exchange(true, std::memory_order_acq_rel)) {
+    uint8_t no_reset = kResetNone;
+    if (!watchdog_reset_kind_.compare_exchange_strong(no_reset,
+                                                      unresponsive ? kResetUnresponsive : kResetCrashed,
+                                                      std::memory_order_acq_rel)) {
         return;
     }
-    watchdog_reset_unresponsive_.store(unresponsive, std::memory_order_release);
+    watchdog_triggered_.store(true, std::memory_order_release);
 
     {
         std::lock_guard<std::mutex> lock(watchdog_mutex_);

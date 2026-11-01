@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <thread>
 #include <atomic>
+#include <cstdint>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 #include <httplib.h>
@@ -427,7 +428,9 @@ public:
 
     // True when that reset stopped a live process whose health endpoint went silent,
     // not one that had already exited.
-    bool was_reset_unresponsive() const { return watchdog_reset_unresponsive_.load(std::memory_order_acquire); }
+    bool was_reset_unresponsive() const {
+        return watchdog_reset_kind_.load(std::memory_order_acquire) == kResetUnresponsive;
+    }
 
     // Request backend reset from watchdog (stops process immediately).
     void request_backend_reset_from_watchdog(const std::string& reason, bool unresponsive = false);
@@ -706,7 +709,11 @@ private:
     std::atomic<bool> watchdog_stop_requested_{false};
     std::atomic<bool> watchdog_running_{false};
     std::atomic<bool> watchdog_triggered_{false};
-    std::atomic<bool> watchdog_reset_unresponsive_{false};
+    // Set before watchdog_triggered_, so a reader that sees the trigger also sees the kind.
+    static constexpr uint8_t kResetNone = 0;
+    static constexpr uint8_t kResetCrashed = 1;
+    static constexpr uint8_t kResetUnresponsive = 2;
+    std::atomic<uint8_t> watchdog_reset_kind_{kResetNone};
     std::atomic<int> active_backend_requests_{0};
     std::atomic<int> active_streaming_requests_{0};
     std::atomic<int> active_non_streaming_requests_{0};
