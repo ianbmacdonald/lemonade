@@ -20,6 +20,7 @@
 #include <unistd.h>
 #endif
 
+#include <lemon/log_stream.h>
 #include <lemon/websocket_server.h>
 
 #include "test_config_helpers.h"
@@ -70,6 +71,10 @@ public:
 
     bool upgraded() const { return upgraded_; }
 
+    void set_receive_buffer(int bytes) {
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
+    }
+
     void set_timeout(int seconds) {
         timeval tv{seconds, 0};
         ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -109,6 +114,16 @@ public:
             if (n == 0) return true;
             if (n < 0) return errno != EAGAIN && errno != EWOULDBLOCK;
             if ((static_cast<uint8_t>(buf[0]) & 0x0f) == 0x8) return true;
+        }
+    }
+
+    // True only on EOF or a reset; any data is read and discarded.
+    bool reaches_eof() {
+        char buf[65536];
+        while (true) {
+            const auto n = ::recv(fd_, buf, sizeof(buf), 0);
+            if (n == 0) return true;
+            if (n < 0) return errno != EAGAIN && errno != EWOULDBLOCK;
         }
     }
 
@@ -268,6 +283,71 @@ void test_spans_auth_deadline() {
     server.stop();
 }
 
+// Valid JSON of the wrong shape, before authentication.
+void test_wrongly_typed_messages() {
+    ::setenv("LEMONADE_API_KEY", "test-key", 1);
+    WebSocketServer server(nullptr, "127.0.0.1", 0);
+    ::unsetenv("LEMONADE_API_KEY");
+    check(server.start(), "typed messages: server starts");
+    Client c("127.0.0.1", server.get_port(), "/spans/stream");
+    check(c.upgraded(), "typed messages: connection admitted");
+    for (const char* msg : {"[]", "null", "5", R"({"type":0})", R"({"type":"auth","token":123})"}) {
+        check(c.send_frame(0x1, true, msg) &&
+                  c.read_text_frame().find("\"error\"") != std::string::npos,
+              (std::string("typed messages: ") + msg + " is answered with an error").c_str());
+    }
+    check(c.send_frame(0x1, true, R"({"type":"auth","token":"test-key"})") &&
+              c.read_text_frame().find("auth.ok") != std::string::npos,
+          "typed messages: the connection still authenticates afterwards");
+    server.stop();
+}
+
+// Count the logs.entry frames that carry `marker` until the socket goes quiet.
+int entries_with(Client& c, const std::string& marker) {
+    int n = 0;
+    c.set_timeout(1);
+    for (std::string frame = c.read_text_frame(); !frame.empty(); frame = c.read_text_frame()) {
+        if (frame.find("logs.entry") != std::string::npos && frame.find(marker) != std::string::npos) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+void test_repeated_subscribe() {
+    WebSocketServer server(nullptr, "127.0.0.1", 0);
+    check(server.start(), "repeated subscribe: server starts");
+    Client c("127.0.0.1", server.get_port(), "/logs/stream");
+    check(c.upgraded(), "repeated subscribe: connection admitted");
+    for (int i = 0; i < 3; ++i) {
+        check(c.send_frame(0x1, true, R"({"type":"logs.subscribe"})") &&
+                  c.read_text_frame().find("logs.snapshot") != std::string::npos,
+              "repeated subscribe: each subscribe is answered with a snapshot");
+    }
+    lemon::LogStreamHub::instance().publish(AixLog::Metadata(), "repeated-subscribe-marker");
+    check(entries_with(c, "repeated-subscribe-marker") == 1,
+          "repeated subscribe: one log line is delivered once");
+    server.stop();
+}
+
+void test_stalled_reader_is_dropped() {
+    WebSocketServer server(nullptr, "127.0.0.1", 0);
+    check(server.start(), "stalled reader: server starts");
+    Client c("127.0.0.1", server.get_port(), "/logs/stream");
+    c.set_receive_buffer(4096);
+    check(c.upgraded() && c.send_frame(0x1, true, R"({"type":"logs.subscribe"})") &&
+              c.read_text_frame().find("logs.snapshot") != std::string::npos,
+          "stalled reader: subscribed");
+    // The client reads nothing more while 40 MiB is published.
+    const std::string line(64 * 1024, 'q');
+    for (size_t sent = 0; sent < (40u << 20); sent += line.size()) {
+        lemon::LogStreamHub::instance().publish(AixLog::Metadata(), line);
+    }
+    c.set_timeout(5);
+    check(c.reaches_eof(), "stalled reader: a client that stops reading is disconnected");
+    server.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -278,6 +358,9 @@ int main() {
     test_per_client_cap();
     test_message_cap();
     test_spans_auth_deadline();
+    test_wrongly_typed_messages();
+    test_repeated_subscribe();
+    test_stalled_reader_is_dropped();
     return report_results("websocket limits");
 }
 

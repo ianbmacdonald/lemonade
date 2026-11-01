@@ -213,7 +213,17 @@ int WebSocketServer::ws_callback(struct lws* wsi,
                     complete_msg = std::move(server->receive_buffers_[conn_id]);
                     server->receive_buffers_[conn_id].clear();
                 }
-                server->handle_message(conn_id, complete_msg);
+                // A wrongly typed field throws from nlohmann; escaping into
+                // libwebsockets would terminate the process.
+                try {
+                    server->handle_message(conn_id, complete_msg);
+                } catch (const std::exception& e) {
+                    server->send_json(conn_id, {
+                        {"type", "error"},
+                        {"error", {{"message", "Invalid message: " + std::string(e.what())},
+                                   {"type", "invalid_request_error"}}},
+                    });
+                }
             }
             break;
         }
@@ -316,6 +326,8 @@ void WebSocketServer::stop() {
         connection_states_.clear();
         connection_websockets_.clear();
         message_queues_.clear();
+        queued_bytes_.clear();
+        overflowed_.clear();
         receive_buffers_.clear();
         pending_authenticated_tokens_.clear();
         per_client_.clear();
@@ -564,11 +576,18 @@ void WebSocketServer::handle_log_subscribe(const std::string& connection_id,
         after_seq,
         snapshot_entries);
 
+    std::string previous_subscriber_id;
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
         auto& state = connection_states_[connection_id];
         state.kind = ConnectionKind::logs;
+        previous_subscriber_id = std::move(state.log_subscriber_id);
         state.log_subscriber_id = subscriber_id;
+    }
+    // A repeated subscribe replaces the connection's subscription; close and
+    // stop() only know the latest one.
+    if (!previous_subscriber_id.empty()) {
+        LogStreamHub::instance().remove_subscriber(previous_subscriber_id);
     }
 
     json entries_json = json::array();
@@ -605,6 +624,14 @@ void WebSocketServer::handle_message(const std::string& connection_id, const std
         send_json(connection_id, {
             {"type", "error"},
             {"error", {{"message", "Invalid JSON: " + std::string(e.what())}, {"type", "invalid_request_error"}}},
+        });
+        return;
+    }
+
+    if (!request.is_object()) {
+        send_json(connection_id, {
+            {"type", "error"},
+            {"error", {{"message", "Invalid message: expected a JSON object"}, {"type", "invalid_request_error"}}},
         });
         return;
     }
@@ -751,6 +778,8 @@ void WebSocketServer::handle_close(const std::string& connection_id) {
 
         connection_websockets_.erase(connection_id);
         message_queues_.erase(connection_id);
+        queued_bytes_.erase(connection_id);
+        overflowed_.erase(connection_id);
         receive_buffers_.erase(connection_id);
     }
 
@@ -776,6 +805,7 @@ void WebSocketServer::handle_writable(const std::string& connection_id, struct l
         }
         msg = std::move(it->second.front());
         it->second.pop();
+        queued_bytes_[connection_id] -= msg.size();
         has_more = !it->second.empty();
     }
 
@@ -884,8 +914,7 @@ void WebSocketServer::send_json(const std::string& connection_id, const json& ms
         std::lock_guard<std::mutex> lock(connections_mutex_);
         auto it = connection_websockets_.find(connection_id);
         if (it != connection_websockets_.end() && it->second != nullptr) {
-            message_queues_[connection_id].push(std::move(payload));
-            writable_dispatch_pending_.store(true);
+            enqueue_locked(connection_id, std::move(payload));
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "WebSocket send_json failed for %s: %s\n",
@@ -900,12 +929,36 @@ void WebSocketServer::send_json(const std::string& connection_id, const json& ms
     }
 }
 
+void WebSocketServer::enqueue_locked(const std::string& connection_id, std::string payload) {
+    if (overflowed_.count(connection_id)) {
+        return;
+    }
+    size_t& queued = queued_bytes_[connection_id];
+    if (queued + payload.size() > kMaxQueuedBytes) {
+        // The peer is not reading; drop it rather than buffer without bound.
+        LOG(WARNING, "WebSocket") << "Closing connection " << connection_id << ": over "
+                                  << kMaxQueuedBytes << " bytes queued for a client that is not reading"
+                                  << std::endl;
+        overflowed_.insert(connection_id);
+    } else {
+        queued += payload.size();
+        message_queues_[connection_id].push(std::move(payload));
+    }
+    writable_dispatch_pending_.store(true);
+}
+
 void WebSocketServer::schedule_pending_writes() {
     if (!writable_dispatch_pending_.exchange(false)) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(connections_mutex_);
+    for (const auto& connection_id : overflowed_) {
+        auto ws_it = connection_websockets_.find(connection_id);
+        if (ws_it != connection_websockets_.end() && ws_it->second != nullptr) {
+            lws_set_timeout(ws_it->second, PENDING_TIMEOUT_USER_OK, LWS_TO_KILL_ASYNC);
+        }
+    }
     for (const auto& [connection_id, wsi] : connection_websockets_) {
         if (wsi == nullptr) {
             continue;
@@ -1006,8 +1059,7 @@ void WebSocketServer::broadcast_span(const json& span) {
                     std::string payload = filtered_span.dump(-1, ' ', false, json::error_handler_t::replace);
                     auto it = connection_websockets_.find(conn_id);
                     if (it != connection_websockets_.end() && it->second != nullptr) {
-                        message_queues_[conn_id].push(std::move(payload));
-                        writable_dispatch_pending_.store(true);
+                        enqueue_locked(conn_id, std::move(payload));
                     }
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "WebSocket broadcast_span failed for %s: %s\n",

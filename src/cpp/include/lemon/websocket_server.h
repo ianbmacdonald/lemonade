@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <libwebsockets.h>
 #include <nlohmann/json.hpp>
@@ -51,6 +52,8 @@ public:
     };
 
     static constexpr size_t kMaxMessageBytes = 4 * 1024 * 1024;
+    // Outbound bytes held for one connection before it is closed as a stalled reader.
+    static constexpr size_t kMaxQueuedBytes = 16 * 1024 * 1024;
 
     WebSocketServer(Router* router, const std::string& host, int requested_port);
     ~WebSocketServer();
@@ -151,6 +154,9 @@ private:
     std::unordered_map<std::string, struct lws*> connection_websockets_;
     // Per-connection outbound message queues (deferred write pattern)
     std::unordered_map<std::string, std::queue<std::string>> message_queues_;
+    std::unordered_map<std::string, size_t> queued_bytes_;
+    // Connections over kMaxQueuedBytes, closed on the service thread
+    std::unordered_set<std::string> overflowed_;
     // Per-connection inbound reassembly buffers (libwebsockets may fragment frames)
     std::unordered_map<std::string, std::string> receive_buffers_;
     std::mutex connections_mutex_;
@@ -184,6 +190,8 @@ private:
 
     // Send JSON message to WebSocket by connection ID
     void send_json(const std::string& connection_id, const json& msg);
+    // Caller holds connections_mutex_.
+    void enqueue_locked(const std::string& connection_id, std::string payload);
 
     void handle_log_subscribe(const std::string& connection_id,
                               std::optional<uint64_t> after_seq);
