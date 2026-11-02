@@ -65,7 +65,8 @@ public:
             "Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on "
             "a string and returns a score for each label. It serves `onnxruntime` sequence "
             "classifiers (one label set), token classifiers (aggregated span labels) and zero-shot "
-            "models (labels sent with each request), and `tflite` text classifiers; image models "
+            "models (labels sent with each request), and `tflite` and `executorch` text "
+            "classifiers; image models "
             "are served by [`POST /v1/images/classify`](#post-v1imagesclassify). It provides the "
             "classification that the router's `classifier` and `zero_shot` conditions use.";
         s.notes = {
