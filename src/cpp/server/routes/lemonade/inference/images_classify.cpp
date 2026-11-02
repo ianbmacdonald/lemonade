@@ -7,6 +7,8 @@
 
 #include <lemon/utils/aixlog.hpp>
 
+#include "lemon/backends/executorch/executorch.h"
+#include "lemon/backends/onnxruntime/onnxruntime.h"
 #include "lemon/image_classify_request.h"
 #include "lemon/model_types.h"
 #include "lemon/models/model_info.h"
@@ -48,9 +50,11 @@ const RouteError kCrashedOnInput{
     "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
 const RouteError kImageRouteUnsupported{
     502, "image_classification_unsupported",
-    "The engine answered 404 for its image route: it predates image classification "
-    "(tflite-server 0.2.0, et-server 0.2.0 and ort-server 0.2.0-musl are the first releases "
-    "that serve it)"};
+    std::string("The `executorch` or `onnxruntime` engine has no `POST /classify/image` route "
+                "(loading refuses such an engine, so this is the fallback for one replaced "
+                "after the load). For `et-server`: ") +
+        backends::executorch::kImageRouteRequirement + ". For `ort-server`: " +
+        backends::onnxruntime::kImageRouteRequirement};
 const RouteError kUnresponsiveOnInput{
     504, "backend_unresponsive_on_input",
     "The backend stopped answering its health checks while working on this input and was stopped; the "
@@ -142,10 +146,17 @@ public:
             "`\"layout\": \"auto\"` (the same as `\"NHWC\"`) expects an input of `[1, H, W, 3]`; a "
             "PyTorch export (`[1, 3, H, W]`), as `et-server` and `ort-server` usually load, sets "
             "`\"NCHW\"`, and an input that does not match the declared layout is refused at load. A text "
-            "model directory (the graph + `tokenizer.json` + `config.json`) keeps serving "
-            "`/v1/classify`. Loading fails with a message naming both layouts when a model's label "
-            "and its directory disagree, and, for `tflite`, when the installed `tflite-server` is "
-            "too old to report the image-classification task. The per-model `tflite_args`, "
+            "model directory (the graph + `tokenizer.json` + `config.json`, with no `manifest.json` "
+            "declaring the image-classification task) is served by `/v1/classify`.\n\n"
+            "`manifest.json` must resolve inside the model directory (or inside its repository for "
+            "a downloaded snapshot), be a regular file of at most 1 MiB and hold a JSON object; the "
+            "labels file must resolve the same way. A directory whose manifest or labels file "
+            "fails a check is not a model, for text models too: it is left out of the model list "
+            "with a warning in the server log, and loading it fails with the reason. Loading also "
+            "fails with a message naming both layouts when a model's label and its directory "
+            "disagree; for `tflite`, when the installed `tflite-server` is too old to report the "
+            "image-classification task; and for `executorch` and `onnxruntime`, when the engine has "
+            "no `POST /classify/image` route. The per-model `tflite_args`, "
             "`executorch_args` or `onnxruntime_args` option passes flags such as "
             "`--max-image-pixels` through to the engine.",
         };
