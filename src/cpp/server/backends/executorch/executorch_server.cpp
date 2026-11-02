@@ -212,6 +212,7 @@ void ExecutorchServer::load(const std::string& model_name,
 
 void ExecutorchServer::unload() {
     stop_server();
+    layout_ = classifier::Layout::None;
 }
 
 json ExecutorchServer::forward_classify(const std::string& text, const json& params) {

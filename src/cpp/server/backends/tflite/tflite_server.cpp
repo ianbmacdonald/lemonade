@@ -252,6 +252,7 @@ void TfliteServer::load(const std::string& model_name,
 
 void TfliteServer::unload() {
     stop_server();
+    layout_ = classifier::Layout::None;
 }
 
 json TfliteServer::forward_classify(const std::string& text, const json& params) {
