@@ -159,7 +159,13 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     std::string extra_args = options.get_option("onnxruntime_args");
     device_type_ = DEVICE_CPU;
 
-    backend_manager_->install_backend(onnxruntime::spec()->recipe, "cpu");
+    try {
+        backend_manager_->install_backend(onnxruntime::spec()->recipe, "cpu");
+    } catch (const std::exception& e) {
+        // A missing engine stays missing after an eviction, so this must not
+        // unload every other model either.
+        throw NonRetryableLoadException(std::string("ort-server is not installed: ") + e.what());
+    }
 
     std::string model_path = model_info.resolved_path();
     if (model_path.empty() || !fs::exists(model_path)) {

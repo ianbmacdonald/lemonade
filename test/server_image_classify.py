@@ -809,9 +809,16 @@ class ImageClassifyTests(ServerTestBase):
         # must outlast the kill, or a hung engine is never reset.
         if _opts.short_watchdog:
             self.skipTest("needs the default watchdog")
+        if not _opts.fake_backend or not _opts.fake_state_dir:
+            self.skipTest("needs --fake-backend and --fake-state-dir")
+        self._require_model()
         hangs = os.path.join(_opts.fake_state_dir, "hangs.log")
-        self._post_form(
-            {"image": ("g.jpg", self._fixture(), "image/jpeg")}, {"model": MODEL}
+        self._assert_reference(
+            self._post_form(
+                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+                data={"model": MODEL, "top_k": "1"},
+            ),
+            1,
         )
         hangs_before = _line_count(hangs)
         response = self._post_form(
@@ -829,29 +836,15 @@ class ImageClassifyTests(ServerTestBase):
         )
         self._assert_reference(response, 1)
 
-    def test_515_broken_ort_model_keeps_resident_models(self):
-        if not _opts.fake_ort:
-            self.skipTest("needs --fake-ort")
-        self._require_model()
-        failed = os.path.join(_opts.fake_state_dir, "failed-starts.log")
-        self._assert_reference(
-            self._post_form(
-                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
-                data={"model": MODEL, "top_k": "1"},
-            ),
-            1,
-        )
-        name = "user.B194-Broken-Ort"
+    def _register_stub_ort(self, name, fail_start):
         dest = os.path.join(_opts.hf_cache, "models--" + name[len("user.") :])
         if os.path.isdir(dest):
             shutil.rmtree(dest)
         os.makedirs(dest)
-        for file_name in (
-            "model.onnx",
-            "tokenizer.json",
-            "config.json",
-            "FAKE_FAIL_START",
-        ):
+        files = ["model.onnx", "tokenizer.json", "config.json"]
+        if fail_start:
+            files.append("FAKE_FAIL_START")
+        for file_name in files:
             with open(os.path.join(dest, file_name), "w", encoding="utf-8") as f:
                 f.write("{}")
         response = requests.post(
@@ -865,6 +858,27 @@ class ImageClassifyTests(ServerTestBase):
             timeout=TIMEOUT_DEFAULT,
         )
         self.assertEqual(response.status_code, 200, response.text[:500])
+        return name
+
+    def _assert_image_model_resident(self):
+        health = requests.get(f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT).json()
+        # /health lists public names, without the user. prefix.
+        loaded = [m["model_name"] for m in health["all_models_loaded"]]
+        self.assertIn(MODEL[len("user.") :], loaded, "the image model was evicted")
+
+    def test_515_broken_ort_model_keeps_resident_models(self):
+        if not _opts.fake_ort:
+            self.skipTest("needs --fake-ort")
+        self._require_model()
+        failed = os.path.join(_opts.fake_state_dir, "failed-starts.log")
+        self._assert_reference(
+            self._post_form(
+                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+                data={"model": MODEL, "top_k": "1"},
+            ),
+            1,
+        )
+        name = self._register_stub_ort("user.B194-Broken-Ort", fail_start=True)
         failed_before = _line_count(failed)
         response = requests.post(
             f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_DEFAULT
@@ -873,10 +887,27 @@ class ImageClassifyTests(ServerTestBase):
         # One start and one relaunch to capture its stderr; evicting the other
         # models and loading again cannot fix a CPU engine that refused its model.
         self.assertEqual(_line_count(failed) - failed_before, 2)
-        health = requests.get(f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT).json()
-        # /health lists public names, without the user. prefix.
-        loaded = [m["model_name"] for m in health["all_models_loaded"]]
-        self.assertIn(MODEL[len("user.") :], loaded, "the image model was evicted")
+        self._assert_image_model_resident()
+
+    def test_515b_missing_ort_engine_keeps_resident_models(self):
+        # Without --fake-ort the server runs offline with no ort-server
+        # installed, so the load fails at the install step.
+        if _opts.fake_ort or not _opts.fake_backend:
+            self.skipTest("needs --fake-backend without --fake-ort")
+        self._require_model()
+        self._assert_reference(
+            self._post_form(
+                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+                data={"model": MODEL, "top_k": "1"},
+            ),
+            1,
+        )
+        name = self._register_stub_ort("user.B194-Missing-Ort", fail_start=False)
+        response = requests.post(
+            f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_DEFAULT
+        )
+        self.assertGreaterEqual(response.status_code, 400, response.text[:500])
+        self._assert_image_model_resident()
 
     def test_513_repeated_text_crashes_pause_the_model(self):
         self._require_model()
