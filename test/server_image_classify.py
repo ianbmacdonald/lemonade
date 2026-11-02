@@ -92,10 +92,6 @@ ENGINES = {
         "text_model": "user.B204-Text-ONNX",
     },
 }
-RECIPE = "tflite"
-ENGINE = ENGINES[RECIPE]
-MODEL = ENGINE["model"]
-TEXT_MODEL = ENGINE["text_model"]
 POISON_TEXT = "B194-POISON-TEXT"
 HANG_TEXT = "B194-HANG-TEXT"
 FIXTURE = os.path.join(
@@ -107,16 +103,6 @@ REFERENCE_TOL = 0.02
 POISON = b"B169-POISON-IMAGE"
 SLOW = b"B169-SLOW-IMAGE"
 HANG_IMAGE = b"B194-HANG-IMAGE"
-
-_opts = argparse.Namespace(
-    image_model_dir=None,
-    hf_cache=None,
-    fake_backend=False,
-    fake_state_dir=None,
-    lemond_pid=None,
-    short_watchdog=False,
-    fake_ort=False,
-)
 
 
 def _parse_own_args():
@@ -136,6 +122,15 @@ def _parse_own_args():
     parser.add_argument("--wrapped-server", default="tflite", choices=sorted(ENGINES))
     args, _ = parser.parse_known_args()
     return args
+
+
+# Resolved at import, so a runner that imports the module tests the engine it
+# was asked for rather than tflite.
+_opts = _parse_own_args()
+RECIPE = _opts.wrapped_server
+ENGINE = ENGINES[RECIPE]
+MODEL = ENGINE["model"]
+TEXT_MODEL = ENGINE["text_model"]
 
 
 def _png(width, height, truncate=False):
@@ -1156,29 +1151,32 @@ class ImageClassifyTests(ServerTestBase):
             _line_count(starts), starts_before, "paused model was reloaded"
         )
 
-    def test_514_large_multipart_image_is_accepted(self):
+    def _post_large_image(self):
         # 12 MiB is under the 16 MiB image cap and the 23 MiB body cap.
-        self._require_model()
         image = _jpeg_like(b"\x01" * (12 * 1024 * 1024))
-        response = self._post_form(
+        return self._post_form(
             {"image": ("big.jpg", image, "image/jpeg")},
             data={"model": MODEL, "top_k": "1"},
         )
+
+    def test_514_large_multipart_image_is_accepted(self):
+        if not _opts.fake_backend:
+            self.skipTest("needs --fake-backend: the upload is not a decodable JPEG")
+        self._require_model()
+        self._assert_status(self._post_large_image(), 200, "12 MiB multipart image")
+
+    def test_514b_large_multipart_image_reaches_a_real_engine(self):
         if _opts.fake_backend:
-            self._assert_status(response, 200, "12 MiB multipart image")
-            return
-        # A real decoder refuses the synthetic JPEG; its 400 shows the body
-        # passed lemond's cap and reached the engine.
+            self.skipTest("needs a real engine")
+        self._require_model()
+        # The engine's decoder refuses the synthetic JPEG: a 400 from the engine,
+        # not lemond's 413, shows the body passed lemond's cap.
+        response = self._post_large_image()
         self._assert_status(response, 400, "12 MiB multipart image")
-        self.assertIn("JPEG", response.json()["error"]["message"])
+        self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
 
 
 if __name__ == "__main__":
-    _opts = _parse_own_args()
-    RECIPE = _opts.wrapped_server
-    ENGINE = ENGINES[RECIPE]
-    MODEL = ENGINE["model"]
-    TEXT_MODEL = ENGINE["text_model"]
     run_server_tests(
         ImageClassifyTests,
         "IMAGE CLASSIFICATION TESTS",
