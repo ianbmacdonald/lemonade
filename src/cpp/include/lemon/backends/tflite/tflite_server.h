@@ -5,6 +5,7 @@
 #include "lemon/wrapped_server.h"
 #include "lemon/server_capabilities.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/backends/classifier_backend.h"
 #include <string>
 
 namespace lemon {
@@ -39,8 +40,7 @@ public:
     json classify_image(const json& params, std::string image_bytes) override;
 
 private:
-    // The /health "task" the loaded subprocess must report.
-    std::string expected_task_;
+    classifier::Layout layout_ = classifier::Layout::None;
 
     // Forward a classify request to the subprocess and normalize its response.
     json forward_classify(const std::string& text, const json& params);

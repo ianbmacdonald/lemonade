@@ -1197,6 +1197,7 @@ set(LEMON_BACKEND_DESCRIPTOR_SOURCES
 set(LEMON_BACKEND_FACTORY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/backends/backend_registry.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/backends/backend_ops.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/backends/classifier_backend.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/backends/hf_cache_util.cpp)
 foreach(_backend_entry ${LEMON_BACKENDS})
     string(REPLACE "|" ";" _backend_parts "${_backend_entry}")
@@ -2724,23 +2725,23 @@ if(BUILD_TESTING AND EXISTS "${_IMAGE_CLASSIFY_REQUEST_TEST_SRC}")
     add_cpp_ci_test(ImageClassifyRequestTest CI ON COMMAND test_image_classify_request)
 endif()
 
-# tflite model-directory layout detection (text vs image classifier).
-set(_TFLITE_LAYOUT_TEST_SRC
-    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_tflite_layout.cpp"
+# Classifier model-directory layout detection (text vs image classifier).
+set(_CLASSIFIER_LAYOUT_TEST_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_classifier_layout.cpp"
 )
-if(BUILD_TESTING AND EXISTS "${_TFLITE_LAYOUT_TEST_SRC}")
-    add_executable(test_tflite_layout
-        test/cpp/test_tflite_layout.cpp
+if(BUILD_TESTING AND EXISTS "${_CLASSIFIER_LAYOUT_TEST_SRC}")
+    add_executable(test_classifier_layout
+        test/cpp/test_classifier_layout.cpp
     )
-    target_include_directories(test_tflite_layout PRIVATE
+    target_include_directories(test_classifier_layout PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
         ${CMAKE_CURRENT_BINARY_DIR}/include
     )
-    target_link_libraries(test_tflite_layout PRIVATE lemonade-server-core)
-    add_dependencies(test_tflite_layout copy_resources)
+    target_link_libraries(test_classifier_layout PRIVATE lemonade-server-core)
+    add_dependencies(test_classifier_layout copy_resources)
 
     include(CTest)
-    add_cpp_ci_test(TfliteLayoutTest CI ON COMMAND test_tflite_layout)
+    add_cpp_ci_test(ClassifierLayoutTest CI ON COMMAND test_classifier_layout)
 endif()
 
 set(_DOCS_ENDPOINT_TEST_SRC

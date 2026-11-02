@@ -1,22 +1,28 @@
-// Model-directory layout detection for the tflite backend: which directories
-// are a text classifier, an image classifier, or neither.
+// Model-directory layout detection for the classification backends: which
+// directories are a text classifier, an image classifier, or neither.
 
-#include "lemon/backends/tflite/tflite_layout.h"
+#include "lemon/backends/classifier_backend.h"
 
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
-using lemon::backends::tflite::TfliteLayout;
-using lemon::backends::tflite::detect_tflite_layout;
-using lemon::backends::tflite::find_complete_model_dirs;
+namespace classifier = lemon::backends::classifier;
+using classifier::Layout;
 
 namespace {
 
+const std::vector<std::string> kTflite = {"model.tflite"};
+
 int failures = 0;
+
+Layout tflite_layout(const fs::path& dir) {
+    return classifier::detect_layout(dir, kTflite);
+}
 
 void check(const std::string& what, bool ok) {
     std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
@@ -49,48 +55,48 @@ void make_image(const fs::path& dir) {
 int main() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const fs::path root =
-        fs::temp_directory_path() / ("lemon_tflite_layout_" + std::to_string(stamp));
+        fs::temp_directory_path() / ("lemon_classifier_layout_" + std::to_string(stamp));
     fs::create_directories(root);
 
     make_text(root / "text");
-    check("text layout is Text", detect_tflite_layout(root / "text") == TfliteLayout::Text);
+    check("text layout is Text", tflite_layout(root / "text") == Layout::Text);
 
     make_text(root / "text_manifest");
     write(root / "text_manifest" / "manifest.json", R"({"task":"text-classification"})");
     check("text layout with a text manifest is Text",
-          detect_tflite_layout(root / "text_manifest") == TfliteLayout::Text);
+          tflite_layout(root / "text_manifest") == Layout::Text);
 
     make_image(root / "image");
     check("image manifest + labels is Image",
-          detect_tflite_layout(root / "image") == TfliteLayout::Image);
+          tflite_layout(root / "image") == Layout::Image);
 
     write(root / "image_default_labels" / "model.tflite", "x");
     write(root / "image_default_labels" / "manifest.json", R"({"task":"image-classification"})");
     write(root / "image_default_labels" / "labels.txt", "a\n");
     check("labels_file defaults to labels.txt",
-          detect_tflite_layout(root / "image_default_labels") == TfliteLayout::Image);
+          tflite_layout(root / "image_default_labels") == Layout::Image);
 
     write(root / "image_no_labels" / "model.tflite", "x");
     write(root / "image_no_labels" / "manifest.json", kImageManifest);
     check("image manifest with its labels file missing is None",
-          detect_tflite_layout(root / "image_no_labels") == TfliteLayout::None);
+          tflite_layout(root / "image_no_labels") == Layout::None);
 
     write(root / "image_escape" / "model.tflite", "x");
     write(root / "image_escape" / "manifest.json",
           R"({"task":"image-classification","labels_file":"../text/config.json"})");
     check("labels_file outside the model dir is None",
-          detect_tflite_layout(root / "image_escape") == TfliteLayout::None);
+          tflite_layout(root / "image_escape") == Layout::None);
 
     write(root / "text_no_tokenizer" / "model.tflite", "x");
     write(root / "text_no_tokenizer" / "config.json", "{}");
     check("text layout without a tokenizer is None",
-          detect_tflite_layout(root / "text_no_tokenizer") == TfliteLayout::None);
+          tflite_layout(root / "text_no_tokenizer") == Layout::None);
 
     write(root / "corrupt" / "model.tflite", "x");
     write(root / "corrupt" / "manifest.json", "{not json");
     write(root / "corrupt" / "labels.txt", "a\n");
     check("corrupt manifest is None without throwing",
-          detect_tflite_layout(root / "corrupt") == TfliteLayout::None);
+          tflite_layout(root / "corrupt") == Layout::None);
 
     write(root / "huge" / "model.tflite", "x");
     write(root / "huge" / "labels.txt", "a\n");
@@ -98,10 +104,10 @@ int main() {
           std::string(R"({"task":"image-classification","pad":")") +
               std::string(2 * 1024 * 1024, 'a') + "\"}");
     check("2 MiB manifest is None without throwing",
-          detect_tflite_layout(root / "huge") == TfliteLayout::None);
+          tflite_layout(root / "huge") == Layout::None);
 
     check("missing directory is None",
-          detect_tflite_layout(root / "does_not_exist") == TfliteLayout::None);
+          tflite_layout(root / "does_not_exist") == Layout::None);
 
 #ifndef _WIN32
     {
@@ -112,37 +118,37 @@ int main() {
         write(snap / "manifest.json", kImageManifest);
         fs::create_symlink("../../blobs/4f1a", snap / "labels.txt");
         check("labels file linked to its repository's blob is Image",
-              detect_tflite_layout(snap) == TfliteLayout::Image);
+              tflite_layout(snap) == Layout::Image);
 
         const fs::path escape = repo / "snapshots" / "aaaa";
         write(escape / "model.tflite", "x");
         write(escape / "manifest.json", kImageManifest);
         fs::create_symlink(root / "text" / "config.json", escape / "labels.txt");
         check("labels file linked outside its repository is None",
-              detect_tflite_layout(escape) == TfliteLayout::None);
+              tflite_layout(escape) == Layout::None);
 
         const fs::path plain = root / "image_link_escape";
         write(plain / "model.tflite", "x");
         write(plain / "manifest.json", kImageManifest);
         fs::create_symlink(root / "text" / "config.json", plain / "labels.txt");
         check("labels file linked outside a plain model dir is None",
-              detect_tflite_layout(plain) == TfliteLayout::None);
+              tflite_layout(plain) == Layout::None);
     }
 #endif
 
     const fs::path two = root / "two";
     make_text(two / "a");
     make_image(two / "b");
-    check("two complete dirs are both found", find_complete_model_dirs(two).size() == 2);
-    check("one complete dir is found", find_complete_model_dirs(root / "image").size() == 1);
+    check("two complete dirs are both found", classifier::find_model_dirs(two, kTflite).size() == 2);
+    check("one complete dir is found", classifier::find_model_dirs(root / "image", kTflite).size() == 1);
 
     std::error_code ec;
     fs::remove_all(root, ec);
 
     if (failures == 0) {
-        std::printf("\nAll tflite layout checks passed.\n");
+        std::printf("\nAll classifier layout checks passed.\n");
         return 0;
     }
-    std::printf("\n%d tflite layout check(s) failed.\n", failures);
+    std::printf("\n%d classifier layout check(s) failed.\n", failures);
     return 1;
 }

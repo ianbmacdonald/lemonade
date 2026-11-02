@@ -1,14 +1,13 @@
 #include "lemon/backends/tflite/tflite_server.h"
 #include "lemon/backends/tflite/tflite.h"
-#include "lemon/backends/tflite/tflite_layout.h"
 #include "lemon/backends/backend_registry.h"
 #include "lemon/backends/backend_ops.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/backends/classifier_backend.h"
 #include "lemon/backends/hf_cache_util.h"
 #include "lemon/backend_manager.h"
 #include "lemon/classify_text_limit.h"
 #include "lemon/error_types.h"
-#include "lemon/image_classify_request.h"
 #include "lemon/utils/path_utils.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/http_client.h"
@@ -27,6 +26,8 @@ namespace lemon {
 namespace backends {
 
 namespace {
+const std::vector<std::string> kGraphs = {"model.tflite"};
+
 // Relaunch tflite-server just long enough to read the error it prints before
 // exiting. It refuses a model (unsupported architecture, bad manifest, corrupt
 // tokenizer) by writing one "tflite-server: ..." line to stderr and exiting.
@@ -86,41 +87,6 @@ const char* task_for_type(ModelType type) {
     return type == ModelType::IMAGE_CLASSIFICATION ? "image-classification"
                                                    : "text-classification";
 }
-
-// forward_multipart_request nests the backend's status and body under
-// error.details. Lift the backend's own message, code and status to the top so
-// the client sees "image too large" with its 4xx, not a generic 500.
-json normalize_backend_error(json response) {
-    if (!response.contains("error") || !response["error"].is_object()) return response;
-    json& err = response["error"];
-    if (!err.contains("details") || !err["details"].is_object()) return response;
-    const json& details = err["details"];
-    if (!details.contains("status_code") || !details["status_code"].is_number_integer()) {
-        return response;
-    }
-    const int status = details["status_code"].get<int>();
-    err["status_code"] = status;
-    if (status >= 400 && status < 500) err["type"] = "invalid_request_error";
-    if (details.contains("response")) {
-        const json& body = details["response"];
-        if (body.is_object() && body.contains("error")) {
-            const json& backend_error = body["error"];
-            if (backend_error.is_string()) {
-                err["message"] = backend_error;
-            } else if (backend_error.is_object()) {
-                if (backend_error.contains("message") && backend_error["message"].is_string()) {
-                    err["message"] = backend_error["message"];
-                }
-                if (backend_error.contains("code") && backend_error["code"].is_string()) {
-                    err["code"] = backend_error["code"];
-                }
-            }
-        } else if (body.is_string() && !body.get<std::string>().empty()) {
-            err["message"] = body;
-        }
-    }
-    return response;
-}
 }  // namespace
 
 // The tflite-server subprocess speaks ort-server's HTTP contract:
@@ -171,7 +137,7 @@ void TfliteServer::load(const std::string& model_name,
     // to the cache root when resolution is ambiguous, so a complete root that also
     // contains a nested complete model must still be rejected here — never assume
     // the resolved path is the only candidate.
-    auto candidates = tflite::find_complete_model_dirs(path_from_utf8(model_path));
+    auto candidates = classifier::find_model_dirs(path_from_utf8(model_path), kGraphs);
     if (candidates.empty()) {
         throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
@@ -192,16 +158,8 @@ void TfliteServer::load(const std::string& model_name,
     LOG(INFO, "TfliteServer") << "Using model: " << model_path << std::endl;
 
     const bool wants_image = model_info.type == ModelType::IMAGE_CLASSIFICATION;
-    const tflite::TfliteLayout layout = tflite::detect_tflite_layout(candidates.front());
-    const tflite::TfliteLayout wanted =
-        wants_image ? tflite::TfliteLayout::Image : tflite::TfliteLayout::Text;
-    if (layout != wanted) {
-        throw NonRetryableLoadException(
-            "Model '" + model_name + "' is labeled " + model_type_to_string(model_info.type) +
-            " and needs a " + tflite::tflite_layout_name(wanted) + " layout, but '" +
-            model_path + "' is a " + tflite::tflite_layout_name(layout) + " layout");
-    }
-    expected_task_ = task_for_type(model_info.type);
+    layout_ = classifier::require_layout(model_name, model_info.type, candidates.front(), kGraphs);
+    const std::string expected_task = task_for_type(model_info.type);
 
     std::string executable = BackendUtils::get_backend_binary_path(*tflite::spec(), "system");
     LOG(INFO, "TfliteServer") << "Using executable: " << executable << std::endl;
@@ -278,7 +236,7 @@ void TfliteServer::load(const std::string& model_name,
     if (health.is_object() && health.contains("task") && health["task"].is_string()) {
         reported_task = health["task"].get<std::string>();
     }
-    const bool task_ok = reported_task == expected_task_ ||
+    const bool task_ok = reported_task == expected_task ||
                          (!wants_image && reported_task == "token-classification");
     if (!task_ok) {
         unload();
@@ -303,14 +261,8 @@ json TfliteServer::forward_classify(const std::string& text, const json& params)
 }
 
 json TfliteServer::classify(const json& request) {
-    if (expected_task_ == "image-classification") {
-        return json{
-            {"error", {
-                {"message", "This is an image-classification model; POST /v1/images/classify"},
-                {"type", "invalid_request_error"},
-                {"status_code", 400},
-            }}
-        };
+    if (layout_ == classifier::Layout::Image) {
+        return classifier::wrong_route_error(layout_);
     }
     if (request.contains("labels")) {
         return json{
@@ -343,25 +295,12 @@ json TfliteServer::classify(const json& request) {
 }
 
 json TfliteServer::classify_image(const json& params, std::string image_bytes) {
-    if (expected_task_ != "image-classification") {
-        return json{
-            {"error", {
-                {"message", "This is a text-classification model; POST /v1/classify"},
-                {"type", "invalid_request_error"},
-                {"status_code", 400},
-            }}
-        };
+    if (layout_ != classifier::Layout::Image) {
+        return classifier::wrong_route_error(layout_);
     }
-    int top_k = 5;
-    if (params.contains("top_k") && params["top_k"].is_number_integer()) {
-        top_k = params["top_k"].get<int>();
-    }
-    std::vector<utils::MultipartField> fields;
-    std::string mime = image_classify::sniff_image_mime(image_bytes);
-    if (mime.empty()) mime = "application/octet-stream";
-    fields.push_back({"image", std::move(image_bytes), "image", std::move(mime)});
-    fields.push_back({"top_k", std::to_string(top_k), "", ""});
-    return normalize_backend_error(forward_multipart_request("/classify/image", fields, 120));
+    return classifier::normalize_backend_error(forward_multipart_request(
+        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+        classifier::kImageForwardTimeoutSeconds));
 }
 
 }  // namespace backends
@@ -406,7 +345,7 @@ public:
         if (!hf_cache::exists(dir)) {
             return "";
         }
-        auto candidates = tflite::find_complete_model_dirs(dir);
+        auto candidates = classifier::find_model_dirs(dir, kGraphs);
         if (candidates.size() != 1) {
             if (candidates.size() > 1) {
                 LOG(WARNING, "TfliteServer")
