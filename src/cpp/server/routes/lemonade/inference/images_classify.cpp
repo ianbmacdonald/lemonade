@@ -99,10 +99,11 @@ public:
         s.experimental = true;
         s.description =
             "Classifies one image and returns the top-scoring labels. The model must be labeled "
-            "`image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` "
-            "(0.2.0 or newer) subprocess on the CPU. The request is either `multipart/form-data` "
-            "(the same shape as `/v1/images/edits`) or `application/json`, and only JPEG and PNG "
-            "are accepted, with EXIF orientation not applied.";
+            "`image-classification` and use the `tflite`, `executorch` or `onnxruntime` recipe, "
+            "which runs it on the CPU in a `tflite-server` (0.2.0 or newer), `et-server` or "
+            "`ort-server` subprocess; all three return the same response. The request is either "
+            "`multipart/form-data` (the same shape as `/v1/images/edits`) or `application/json`, "
+            "and only JPEG and PNG are accepted, with EXIF orientation not applied.";
         s.notes = {
             "`data` is sorted by descending score and is authoritative. `labels` has the same shape "
             "as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` "
@@ -114,9 +115,10 @@ public:
             "the restarted backend too: this request fails with `backend_crashed_on_input` and the "
             "next request restarts the backend.",
             "### Model Directory\n\n"
-            "An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 "
-            "output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the "
-            "task and preprocessing:\n\n"
+            "An image model directory holds the graph (`model.tflite` for `tflite`, `model.pte` for "
+            "`executorch`, `model.onnx` or `model.ort` for `onnxruntime`; one float32 image input, "
+            "one float32 output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that "
+            "declares the task and preprocessing:\n\n"
             "```json\n"
             "{\n"
             "  \"task\": \"image-classification\",\n"
@@ -132,11 +134,15 @@ public:
             "  \"top_k_default\": 5\n"
             "}\n"
             "```\n\n"
-            "A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps "
-            "serving `/v1/classify`. Loading fails with a message naming both layouts when a "
-            "model's label and its directory disagree, and when the installed `tflite-server` is "
-            "too old to report the image-classification task. The per-model `tflite_args` option "
-            "passes flags such as `--max-image-pixels` through to `tflite-server`.",
+            "`\"layout\": \"auto\"` (the same as `\"NHWC\"`) expects an input of `[1, H, W, 3]`; a "
+            "PyTorch export (`[1, 3, H, W]`), as `et-server` and `ort-server` usually load, sets "
+            "`\"NCHW\"`, and an input that does not match the declared layout is refused at load. A text "
+            "model directory (the graph + `tokenizer.json` + `config.json`) keeps serving "
+            "`/v1/classify`. Loading fails with a message naming both layouts when a model's label "
+            "and its directory disagree, and, for `tflite`, when the installed `tflite-server` is "
+            "too old to report the image-classification task. The per-model `tflite_args`, "
+            "`executorch_args` or `onnxruntime_args` option passes flags such as "
+            "`--max-image-pixels` through to the engine.",
         };
         s.args = {kModel, kImage, kTopK};
 
