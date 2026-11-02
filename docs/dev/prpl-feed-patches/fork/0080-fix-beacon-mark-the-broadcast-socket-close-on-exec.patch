@@ -1,7 +1,7 @@
 From 7b2694ff5ac87ce40817df25dbf9e5c63f888cec Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:08:19 -0400
-Subject: [PATCH 80/97] fix(beacon): mark the broadcast socket close-on-exec
+Subject: [PATCH 80/98] fix(beacon): mark the broadcast socket close-on-exec
 
 The listener's sockets were marked in the previous round; NetworkBeacon's
 broadcast socket was not, so engine processes inherited it.

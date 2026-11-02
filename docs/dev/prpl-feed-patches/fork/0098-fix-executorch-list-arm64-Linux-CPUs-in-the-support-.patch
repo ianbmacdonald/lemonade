@@ -1,0 +1,109 @@
+From 684f44aa5a8c54f9af107192030d4a002c200f13 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 09:36:37 -0500
+Subject: [PATCH 98/98] fix(executorch): list arm64 Linux CPUs in the support
+ row
+
+The executorch support row named x86_64 only, from when et-server had no
+other build. et-server v0.3.1 ships an aarch64 musl build too, and on an
+arm64 host the model store drops every model whose recipe the host does
+not support, so executorch models, image classifiers included, were hidden
+there. The row now names x86_64 and arm64, as tflite's does.
+
+BackendModeContractTest checks that executorch, onnxruntime and tflite
+each list both CPU families for Linux. The support tables in README.md and
+docs/dev/backends-reference.md are regenerated.
+
+Assisted-by: claude:opus-5.5
+---
+ README.md                                     |  2 +-
+ docs/dev/backends-reference.md                |  2 +-
+ .../lemon/backends/executorch/executorch.h    |  8 ++++----
+ test/cpp/test_backend_mode_contract.cpp       | 19 +++++++++++++++++++
+ 4 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/README.md b/README.md
+index bb5995209..20d5bd8af 100644
+--- a/README.md
++++ b/README.md
+@@ -384,7 +384,7 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
+     <tr>
+       <td rowspan="1"><code>executorch</code></td>
+       <td><code>system</code>†</td>
+-      <td><code>x86_64</code> CPU</td>
++      <td><code>x86_64</code>/ARM64 CPU</td>
+       <td>Linux</td>
+     </tr>
+   </tbody>
+diff --git a/docs/dev/backends-reference.md b/docs/dev/backends-reference.md
+index fa47808cd..b5abedff0 100644
+--- a/docs/dev/backends-reference.md
++++ b/docs/dev/backends-reference.md
+@@ -41,7 +41,7 @@ Each backend has a tier and a format; see [Backend Tiers and Formats](../api/lem
+ | `acestep` | vulkan | experimental | native | linux, windows | amd_gpu; cpu (x86_64); nvidia_gpu |
+ | `acestep` | rocm | experimental | native | linux, windows | amd_gpu (gfx103X, gfx110X, gfx1150, gfx1151, gfx1152, gfx120X) |
+ | `ds4` | rocm | guest | native | linux | amd_gpu (gfx1151) |
+-| `executorch` | system | experimental | native | linux | cpu (x86_64) |
++| `executorch` | system | experimental | native | linux | cpu (arm64, x86_64) |
+ | `flm` | npu | core | native | linux, windows | amd_npu (XDNA2) |
+ | `kokoro` | metal | core | native | macos | metal |
+ | `kokoro` | cpu | core | native | linux, windows | cpu (x86_64) |
+diff --git a/src/cpp/include/lemon/backends/executorch/executorch.h b/src/cpp/include/lemon/backends/executorch/executorch.h
+index f000d9fff..b50121666 100644
+--- a/src/cpp/include/lemon/backends/executorch/executorch.h
++++ b/src/cpp/include/lemon/backends/executorch/executorch.h
+@@ -22,9 +22,9 @@ inline const std::set<std::string>& reserved_custom_arg_flags() {
+ // which speaks the same ort-server /classify contract as tflite-server over an
+ // exported ExecuTorch program (model.pte); image models go to
+ // /v1/images/classify with tflite-server's /classify/image contract. The binary
+-// is pre-built and found on PATH; only an x86_64 (musl) ExecuTorch build
+-// exists, hence the support list. "classification" stays first: it is the
+-// default mode the generated docs describe.
++// is pre-built and found on PATH; et-server ships x86_64 and aarch64 musl
++// builds. "classification" stays first: it is the default mode the generated
++// docs describe.
+ inline const BackendDescriptor descriptor = {
+     /*recipe*/          "executorch",
+     /*display_name*/    "ExecuTorch",
+@@ -40,7 +40,7 @@ inline const BackendDescriptor descriptor = {
+          "Custom arguments to pass to et-server", "ExecuTorch Options"},
+     },
+     /*support*/ {
+-        {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64"}}}, "x86_64 CPU"},
++        {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/ARM64 CPU"},
+     },
+     /*supported_modes*/ {"classification", "image-classification"},
+     /*required_checkpoints*/ {"main"},
+diff --git a/test/cpp/test_backend_mode_contract.cpp b/test/cpp/test_backend_mode_contract.cpp
+index 720fdd022..4a33299c3 100644
+--- a/test/cpp/test_backend_mode_contract.cpp
++++ b/test/cpp/test_backend_mode_contract.cpp
+@@ -314,6 +314,25 @@ int main() {
+               restamped == labels);
+     }
+ 
++    // The classifier engines all ship x86_64 and arm64 Linux builds. A recipe
++    // whose support rows miss the host's CPU family is filtered out of the model
++    // list there, so a missing arm64 hides its models on an arm64 gateway.
++    for (const std::string recipe : {"executorch", "onnxruntime", "tflite"}) {
++        const lemon::BackendDescriptor* desc = lemon::backends::descriptor_for(recipe);
++        bool x86_64 = false;
++        bool arm64 = false;
++        for (const auto& row : desc != nullptr ? desc->support
++                                               : std::vector<lemon::BackendSupport>{}) {
++            if (row.supported_os.count("linux") == 0) continue;
++            const auto cpu = row.devices.find("cpu");
++            if (cpu == row.devices.end()) continue;
++            x86_64 = x86_64 || cpu->second.empty() || cpu->second.count("x86_64") != 0;
++            arm64 = arm64 || cpu->second.empty() || cpu->second.count("arm64") != 0;
++        }
++        check(recipe + ": supported on linux x86_64 CPUs", x86_64);
++        check(recipe + ": supported on linux arm64 CPUs", arm64);
++    }
++
+     // Every backend that serves the Realtime API declares it, so the desktop and
+     // web apps can offer the microphone without probing the backend.
+     for (const auto& entry : entries) {
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From b2fcee1583ca8c26062b89a92a9a8a94791101a7 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 26 Sep 2026 23:06:02 -0400
-Subject: [PATCH 07/97] feat(tflite): add a TFLite classification backend
+Subject: [PATCH 07/98] feat(tflite): add a TFLite classification backend
  (tflite-server subprocess)
 
 Serves /v1/classify through tflite-server, which speaks ort-server's /classify

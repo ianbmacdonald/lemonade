@@ -1,7 +1,7 @@
 From d950c3e310eeb3789b52d53af61d274b5c552763 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:32:56 -0400
-Subject: [PATCH 70/97] fix(router): let a crashed model stand in only when no
+Subject: [PATCH 70/98] fix(router): let a crashed model stand in only when no
  live one is loaded
 
 The image route counts dead backends when it picks the sole loaded model,

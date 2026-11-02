@@ -8,7 +8,7 @@ with `git am --keep-cr` on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 97 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0097). |
+| Series: `fork/` | 98 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0098). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -92,6 +92,7 @@ generic build fixes that musl just happens to exercise:
 | 0089-0091 | the image forward outlasts the watchdog kill, the watchdog reset kind is published in one step, and a failed ort-server start no longer evicts other models |
 | 0092 | a missing ort-server engine no longer evicts other models either |
 | 0093-0097 | image classification on the executorch (`et-server`) and onnxruntime (`ort-server`) backends: the layout detection and image forward shared with tflite, both descriptors gain `image-classification`, tests and the route spec (B204) |
+| 0098 | executorch lists arm64 Linux CPUs, so its models are not hidden on an arm64 host |
 
 ## Test values
 

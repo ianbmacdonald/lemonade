@@ -1,7 +1,7 @@
 From f79c825bda61caec7abfb9aff56d28af3bf91454 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 13:29:30 -0500
-Subject: [PATCH 88/97] fix(config): name the file and the type when a gateway
+Subject: [PATCH 88/98] fix(config): name the file and the type when a gateway
  limit is mistyped
 
 A quoted limit in config.json stops lemond at startup. The error now

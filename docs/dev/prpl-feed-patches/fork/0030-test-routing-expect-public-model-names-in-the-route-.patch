@@ -1,7 +1,7 @@
 From 51972e1cdbf0a885e8f550d515df50760e4a35ad Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:46:38 -0400
-Subject: [PATCH 30/97] test(routing): expect public model names in the route
+Subject: [PATCH 30/98] test(routing): expect public model names in the route
  decision (RED)
 
 Assisted-by: claude:opus-5.5

@@ -1,7 +1,7 @@
 From 1526cad4fb5945459d1d2feb2658c390898f0b30 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 14:59:52 -0400
-Subject: [PATCH 63/97] fix(server): close connections at accept when the
+Subject: [PATCH 63/98] fix(server): close connections at accept when the
  worker queue is full
 
 Accepted sockets queued without bound ahead of the connection guard,
