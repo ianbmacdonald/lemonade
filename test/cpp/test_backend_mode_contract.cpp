@@ -252,7 +252,7 @@ int main() {
         {"tflite + image-classification", "tflite", {"image-classification"}, true,
          {"image-classification"}, ModelType::IMAGE_CLASSIFICATION},
         {"onnxruntime + image-classification", "onnxruntime", {"image-classification"},
-         false, {}, {}},
+         true, {"image-classification"}, ModelType::IMAGE_CLASSIFICATION},
         {"tflite + classification", "tflite", {"classification"}, true,
          {"classification"}, ModelType::CLASSIFICATION},
         {"tflite + chat", "tflite", {"chat"}, false, {}, {}},

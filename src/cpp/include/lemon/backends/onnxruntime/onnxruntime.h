@@ -19,8 +19,11 @@ inline const std::set<std::string>& reserved_custom_arg_flags() {
 
 // The ONNX Runtime backend descriptor (plain data). A generic ORT model server
 // (see lemonade-sdk/ort-server); v1 serves text classification for the router's
-// `classifier` condition type (issue #2592) on the CPU EP. The subprocess is a
-// self-contained ort-server bundle, like moonshine-server.
+// `classifier` condition type (issue #2592) on the CPU EP, and image models on
+// /v1/images/classify with tflite-server's /classify/image contract. The
+// subprocess is a self-contained ort-server bundle, like moonshine-server.
+// "classification" stays first: it is the default mode the generated docs
+// describe.
 inline const BackendDescriptor descriptor = {
     /*recipe*/          "onnxruntime",
     /*display_name*/    "ONNX Runtime",
@@ -40,7 +43,7 @@ inline const BackendDescriptor descriptor = {
         {"cpu", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64", "arm64"}}}, "x86_64/arm64 CPU"},
         {"cpu", BackendTier::Experimental, BackendFormat::Native, {"macos"}, {{"cpu", {"arm64"}}}, "arm64 CPU"},
     },
-    /*supported_modes*/ {"classification"},
+    /*supported_modes*/ {"classification", "image-classification"},
     /*required_checkpoints*/ {"main"},
     /*default_capabilities*/ {},
     /*web_display_name*/ "",

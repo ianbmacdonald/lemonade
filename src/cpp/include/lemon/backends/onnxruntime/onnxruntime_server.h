@@ -5,16 +5,19 @@
 #include "lemon/wrapped_server.h"
 #include "lemon/server_capabilities.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/backends/classifier_backend.h"
 #include <string>
 
 namespace lemon {
 namespace backends {
 
-// Runs an exported ONNX model as an ort-server subprocess. v1 serves text
-// classification (/v1/classify): input text -> {label: score}, CPU EP. The
-// server is generic; embeddings/reranking are future capabilities on the same
-// backend (issue #2592).
-class OnnxRuntimeServer : public WrappedServer, public IClassificationServer {
+// Runs an exported ONNX model as an ort-server subprocess on the CPU EP. A text
+// model serves /v1/classify (text -> {label: score}); an image model serves
+// /v1/images/classify (image -> ranked labels). The server is generic;
+// embeddings/reranking are future capabilities on the same backend (issue #2592).
+class OnnxRuntimeServer : public WrappedServer,
+                          public IClassificationServer,
+                          public IImageClassificationServer {
 public:
     static InstallParams get_install_params(const std::string& backend, const std::string& version);
 
@@ -30,7 +33,12 @@ public:
     // IClassificationServer
     json classify(const json& request) override;
 
+    // IImageClassificationServer
+    json classify_image(const json& params, std::string image_bytes) override;
+
 private:
+    classifier::Layout layout_ = classifier::Layout::None;
+
     // Forward a classify request to the subprocess and normalize its response.
     json forward_classify(const std::string& text, const json& params);
 };

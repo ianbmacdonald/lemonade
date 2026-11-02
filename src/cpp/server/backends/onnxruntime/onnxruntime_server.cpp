@@ -4,6 +4,7 @@
 #include "lemon/backends/backend_registry.h"
 #include "lemon/backends/backend_ops.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/backends/classifier_backend.h"
 #include "lemon/backends/hf_cache_util.h"
 #include "lemon/backend_manager.h"
 #include "lemon/classify_text_limit.h"
@@ -26,22 +27,9 @@ namespace lemon {
 namespace backends {
 
 namespace {
-// A directory ort-server can actually serve: the graph, the HF tokenizer, and
-// config.json. The config is mandatory even when a manifest is present — the
-// manifest describes the output contract only, so the backend still needs the
-// config to check the architecture against its supported input convention.
-// The graph is model.onnx, or model.ort (the ONNX Runtime format that a
-// --minimal_build ort-server requires; ort-server prefers it when both exist).
-bool has_model_graph(const fs::path& dir) {
-    std::error_code ec;
-    return fs::exists(dir / "model.onnx", ec) || fs::exists(dir / "model.ort", ec);
-}
-
-bool is_complete_model_dir(const fs::path& dir) {
-    std::error_code ec;
-    return has_model_graph(dir) && fs::exists(dir / "tokenizer.json", ec) &&
-           fs::exists(dir / "config.json", ec);
-}
+// model.ort is the ONNX Runtime format that a --minimal_build ort-server
+// requires; ort-server prefers it when both exist.
+const std::vector<std::string> kGraphs = {"model.onnx", "model.ort"};
 
 // Relaunch ort-server just long enough to read the error it prints before
 // exiting. It refuses a model (unsupported architecture, bad manifest, corrupt
@@ -97,31 +85,13 @@ std::string capture_startup_error(const std::string& executable,
     if (captured.size() > 400) captured = captured.substr(0, 400) + "...";
     return captured;
 }
-
-std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
-    std::vector<fs::path> dirs;
-    std::error_code ec;
-    fs::recursive_directory_iterator it(root, hf_cache::dir_options(), ec);
-    if (ec) return dirs;
-    for (auto end = fs::recursive_directory_iterator(); it != end; it.increment(ec)) {
-        if (ec) break;
-        const fs::path name = it->path().filename();
-        if (it->is_regular_file(ec) && !ec && (name == "model.onnx" || name == "model.ort") &&
-            is_complete_model_dir(it->path().parent_path())) {
-            dirs.push_back(it->path().parent_path());
-        }
-    }
-    std::sort(dirs.begin(), dirs.end());
-    // A directory holding both model.onnx and model.ort is one model, not two.
-    dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
-    return dirs;
-}
 }  // namespace
 
 // The ort-server subprocess speaks a tiny HTTP contract:
 //   GET  /health                     -> 200 when the model is loaded and ready
 //   POST /classify {text[, labels]}  -> 200 {"labels": {"<label>": <score in [0,1]>, ...}}
-// It runs one exported ONNX model (seq-, token-, or zero-shot classification) on the CPU EP.
+//   POST /classify/image             -> 200 {"predictions": [{index, label, score}], ...}
+// It runs one exported ONNX model (seq-, token-, zero-shot or image classification) on the CPU EP.
 // Distributed as a self-contained bundle by lemonade-sdk/ort-server.
 InstallParams OnnxRuntimeServer::get_install_params(const std::string& backend,
                                                     const std::string& version) {
@@ -176,12 +146,14 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     // to the cache root when resolution is ambiguous, so a complete root that also
     // contains a nested complete model must still be rejected here — never assume
     // the resolved path is the only candidate.
-    auto candidates = find_complete_model_dirs(path_from_utf8(model_path));
+    auto candidates = classifier::find_model_dirs(path_from_utf8(model_path), kGraphs);
     if (candidates.empty()) {
         throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
-            "': need model.onnx (or model.ort) + tokenizer.json + config.json "
-            "(manifest.json is optional and overrides the output contract)");
+            "': need model.onnx (or model.ort) + tokenizer.json + config.json for a text "
+            "classifier (manifest.json is optional and overrides the output contract), or "
+            "model.onnx (or model.ort) + manifest.json {\"task\": \"image-classification\"} + "
+            "its labels file for an image classifier");
     }
     if (candidates.size() > 1) {
         std::string listing;
@@ -193,6 +165,7 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     }
     model_path = path_to_utf8(candidates.front());
     LOG(INFO, "OnnxRuntimeServer") << "Using model: " << model_path << std::endl;
+    layout_ = classifier::require_layout(model_name, model_info.type, candidates.front(), kGraphs);
 
     std::string executable = BackendUtils::get_backend_binary_path(*onnxruntime::spec(), "cpu");
     LOG(INFO, "OnnxRuntimeServer") << "Using executable: " << executable << std::endl;
@@ -247,6 +220,8 @@ void OnnxRuntimeServer::load(const std::string& model_name,
                                         (details.empty() ? "" : ": " + details));
     }
 
+    if (layout_ != classifier::Layout::Text) return;
+
     // The pin does not decide the binary: a `cpu_bin` path or tag can run an
     // older ort-server, which cuts input without saying so. Ask the binary.
     const json health = forward_get_request("/health", 5);
@@ -277,6 +252,9 @@ json OnnxRuntimeServer::forward_classify(const std::string& text, const json& pa
 }
 
 json OnnxRuntimeServer::classify(const json& request) {
+    if (layout_ == classifier::Layout::Image) {
+        return classifier::wrong_route_error(layout_);
+    }
     // Accept either OpenAI-style "input" or plain "text".
     std::string text;
     if (request.contains("text") && request["text"].is_string()) {
@@ -298,6 +276,15 @@ json OnnxRuntimeServer::classify(const json& request) {
     return forward_classify(text, request);
 }
 
+json OnnxRuntimeServer::classify_image(const json& params, std::string image_bytes) {
+    if (layout_ != classifier::Layout::Image) {
+        return classifier::wrong_route_error(layout_);
+    }
+    return classifier::normalize_backend_error(forward_multipart_request(
+        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+        classifier::kImageForwardTimeoutSeconds));
+}
+
 }  // namespace backends
 }  // namespace lemon
 
@@ -310,9 +297,10 @@ std::unique_ptr<WrappedServer> create(const BackendContext& ctx) {
 }
 
 namespace {
-// ort-server models are a directory (model.onnx + tokenizer.json + config.json).
+// ort-server models are a directory: model.onnx (or model.ort) plus either
+// tokenizer.json + config.json (text) or manifest.json + labels (image).
 // The whole repo downloads by default; resolve to the directory that holds
-// model.onnx so the subprocess is launched with --model-path <dir>.
+// the graph so the subprocess is launched with --model-path <dir>.
 class OnnxRuntimeOps : public BackendOps {
 public:
     // For a Hugging Face cache, `refs/main` names the active revision — an older
@@ -339,7 +327,7 @@ public:
         if (!hf_cache::exists(dir)) {
             return "";
         }
-        auto candidates = find_complete_model_dirs(dir);
+        auto candidates = classifier::find_model_dirs(dir, kGraphs);
         if (candidates.size() != 1) {
             if (candidates.size() > 1) {
                 LOG(WARNING, "OnnxRuntimeServer")
