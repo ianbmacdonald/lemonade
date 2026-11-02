@@ -1,7 +1,7 @@
 From 53a41251f67f27d537fd9845f538fcff0e4c0e75 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 14:27:46 -0400
-Subject: [PATCH 59/91] fix(backends): refuse --host and --weight-cache in
+Subject: [PATCH 59/92] fix(backends): refuse --host and --weight-cache in
  tflite/executorch args
 
 tflite_args and executorch_args come from the /load request body. Both

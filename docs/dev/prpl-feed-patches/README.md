@@ -7,7 +7,7 @@ on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 91 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0091). |
+| Series: `fork/` | 92 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0092). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -82,6 +82,7 @@ generic build fixes that musl just happens to exercise:
 | 0086-0087 | WebSocket warnings logged outside the connection lock, and the watchdog reset kind read before the backend is released |
 | 0088 | the config.json path and the JSON type in the refusal of a mistyped gateway limit |
 | 0089-0091 | the image forward outlasts the watchdog kill, the watchdog reset kind is published in one step, and a failed ort-server start no longer evicts other models |
+| 0092 | a missing ort-server engine no longer evicts other models either |
 
 ## Test values
 

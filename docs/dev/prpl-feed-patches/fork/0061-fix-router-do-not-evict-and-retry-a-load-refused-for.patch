@@ -1,7 +1,7 @@
 From 0c3b6999ea848217b4aaafcc3b12253108365efa Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 14:44:17 -0400
-Subject: [PATCH 61/91] fix(router): do not evict-and-retry a load refused for
+Subject: [PATCH 61/92] fix(router): do not evict-and-retry a load refused for
  its arguments
 
 A /load with a reserved *_args flag threw std::invalid_argument, which

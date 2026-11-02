@@ -1,7 +1,7 @@
 From b1030256c3dcd8cc1625ab916aa7293f7c52cc64 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 18:02:13 -0400
-Subject: [PATCH 37/91] feat(server): download large model files over parallel
+Subject: [PATCH 37/92] feat(server): download large model files over parallel
  Range requests
 
 A model file is fetched as one sequential HTTP stream. Measured on

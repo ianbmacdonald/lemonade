@@ -1,7 +1,7 @@
 From 4915219c71dec12458de61c9817a4ba8626eabf3 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 26 Sep 2026 21:21:01 -0400
-Subject: [PATCH 04/91] docs: regenerate backend boilerplate for the litert
+Subject: [PATCH 04/92] docs: regenerate backend boilerplate for the litert
  recipe
 
 Assisted-by: claude:opus-5.5
