@@ -41,6 +41,8 @@ public:
 private:
     classifier::Layout layout_ = classifier::Layout::None;
 
+    void require_image_route_at_load();
+
     // Forward a classify request to the subprocess and normalize its response.
     json forward_classify(const std::string& text, const json& params);
 };

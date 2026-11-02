@@ -36,6 +36,8 @@ public:
 private:
     classifier::Layout layout_ = classifier::Layout::None;
 
+    void require_image_route_at_load();
+
     json forward_classify(const std::string& text, const json& params);
 };
 

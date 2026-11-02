@@ -111,6 +111,53 @@ void check_unservable(const std::string& what, const fs::path& dir,
               layout_refused("m", ModelType::IMAGE_CLASSIFICATION, dir, graphs));
 }
 
+// Every way a manifest makes a dir not a model gives its own reason in the load
+// error, so a model that disappears from the list can be diagnosed.
+void check_reasons(const fs::path& base, const std::string& recipe, const std::string& graph,
+                   const std::vector<std::string>& graphs,
+                   const lemon::backends::BackendOps* ops) {
+    using lemon::ModelType;
+    auto reason = [&](const std::string& what, const fs::path& dir, const std::string& text) {
+        const std::string error = load_error("m", ModelType::CLASSIFICATION, dir, graphs);
+        check(recipe + ": " + what + " gives the reason '" + text + "'",
+              error.find(text) != std::string::npos);
+    };
+    reason("a climbing labels_file", base / "bad_labels_0", "climbs out of the model directory");
+    reason("a non-string labels_file", base / "bad_labels_3", "labels_file is not a string");
+    reason("a missing labels file", base / "bad_labels_4", "the labels file 'absent.txt'");
+    reason("an oversized manifest", base / "huge_text", "manifest.json is larger than 1 MiB");
+
+    make_text_with_manifest(base / "array_manifest", graph, "[1, 2]");
+    check_unservable(recipe + ": a manifest that is a JSON array, with text files",
+                     base / "array_manifest", graphs, ops);
+    reason("a JSON array manifest", base / "array_manifest", "manifest.json is not a JSON object");
+
+    make_text_with(base / "manifest_dir", graph);
+    fs::create_directories(base / "manifest_dir" / "manifest.json");
+    check_unservable(recipe + ": a manifest.json directory, with text files",
+                     base / "manifest_dir", graphs, ops);
+    reason("a manifest.json directory", base / "manifest_dir",
+           "manifest.json is not a regular file");
+
+#ifndef _WIN32
+    reason("a manifest linked outside", base / "manifest_link_escape",
+           "manifest.json resolves outside the model directory");
+
+    make_text_with(base / "manifest_link_dir", graph);
+    fs::create_directories(base / "manifest_link_dir" / "sub");
+    fs::create_symlink("sub", base / "manifest_link_dir" / "manifest.json");
+    check_unservable(recipe + ": a manifest.json linked to a directory, with text files",
+                     base / "manifest_link_dir", graphs, ops);
+
+    make_text_with(base / "manifest_dangling", graph);
+    fs::create_symlink("gone.json", base / "manifest_dangling" / "manifest.json");
+    check_unservable(recipe + ": a dangling manifest.json link, with text files",
+                     base / "manifest_dangling", graphs, ops);
+    reason("a dangling manifest link", base / "manifest_dangling",
+           "manifest.json cannot be resolved");
+#endif
+}
+
 // Manifest and labels confinement, and image declarations that fail a check
 // with tokenizer.json and config.json present, for one engine's graph names.
 void check_declarations(const fs::path& root, const std::string& recipe, const std::string& graph,
@@ -208,6 +255,8 @@ void check_declarations(const fs::path& root, const std::string& recipe, const s
         load_error("m", ModelType::CLASSIFICATION, base / "bad_labels_0", graphs);
     check(recipe + ": a dir with no layout is named as such",
           to_none.find("has no servable classifier layout") != std::string::npos);
+
+    check_reasons(base, recipe, graph, graphs, ops);
 }
 
 void check_engine(const fs::path& root, const std::string& recipe, const std::string& graph,
@@ -384,8 +433,28 @@ int main() {
 
     {
         const std::string none = classifier::wrong_route_error(Layout::None)["error"]["message"];
-        check("a backend with nothing loaded says so on either route",
+        check("wrong_route_error(None) says nothing is loaded",
               none.find("No classification model is loaded") != std::string::npos);
+
+        auto refuses_both_routes = [](lemon::IClassificationServer& text,
+                                      lemon::IImageClassificationServer& image) {
+            auto said = [](const nlohmann::json& r) {
+                return r.contains("error") && r["error"].value("message", "").find(
+                                                  "No classification model is loaded") !=
+                                                  std::string::npos;
+            };
+            return said(text.classify({{"input", "hello"}})) &&
+                   said(image.classify_image(nlohmann::json::object(), "x"));
+        };
+        lemon::backends::TfliteServer tflite("info", nullptr, nullptr);
+        lemon::backends::ExecutorchServer executorch("info", nullptr, nullptr);
+        lemon::backends::OnnxRuntimeServer onnxruntime("info", nullptr, nullptr);
+        check("tflite with nothing loaded refuses both routes",
+              refuses_both_routes(tflite, tflite));
+        check("executorch with nothing loaded refuses both routes",
+              refuses_both_routes(executorch, executorch));
+        check("onnxruntime with nothing loaded refuses both routes",
+              refuses_both_routes(onnxruntime, onnxruntime));
     }
 
     check_engine(root, "executorch", "model.pte", kExecutorch, lemon::backends::executorch::ops());

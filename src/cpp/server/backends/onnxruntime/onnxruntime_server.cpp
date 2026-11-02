@@ -148,6 +148,12 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     // the resolved path is the only candidate.
     auto candidates = classifier::find_model_dirs(path_from_utf8(model_path), kGraphs);
     if (candidates.empty()) {
+        const std::string refused =
+            classifier::refused_model_dirs(path_from_utf8(model_path), kGraphs);
+        if (!refused.empty()) {
+            throw NonRetryableLoadException("The model directory under '" + model_path +
+                                            "' is not servable:" + refused);
+        }
         throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
             "': need model.onnx (or model.ort) + tokenizer.json + config.json for a text "
@@ -220,6 +226,10 @@ void OnnxRuntimeServer::load(const std::string& model_name,
                                         (details.empty() ? "" : ": " + details));
     }
 
+    if (layout_ == classifier::Layout::Image) {
+        require_image_route_at_load();
+    }
+
     if (layout_ == classifier::Layout::Text) {
         // The pin does not decide the binary: a `cpu_bin` path or tag can run an
         // older ort-server, which cuts input without saying so. Ask the binary.
@@ -244,6 +254,17 @@ void OnnxRuntimeServer::load(const std::string& model_name,
     }
 }
 
+// /health carries no task, so an engine without the image route would load and
+// then fail every request. An image request without an image is refused with a
+// 400 by an engine that has the route and with an empty 404 by one that does not.
+void OnnxRuntimeServer::require_image_route_at_load() {
+    if (classifier::is_missing_image_route(forward_request("/classify/image", json::object(), 10))) {
+        stop_server();
+        throw NonRetryableLoadException(classifier::missing_image_route_message(
+            "ort-server", onnxruntime::kImageRouteRequirement));
+    }
+}
+
 void OnnxRuntimeServer::unload() {
     stop_server();
     layout_ = classifier::Layout::None;
@@ -257,7 +278,7 @@ json OnnxRuntimeServer::forward_classify(const std::string& text, const json& pa
 }
 
 json OnnxRuntimeServer::classify(const json& request) {
-    if (layout_ == classifier::Layout::Image) {
+    if (layout_ != classifier::Layout::Text) {
         return classifier::wrong_route_error(layout_);
     }
     // Accept either OpenAI-style "input" or plain "text".
@@ -285,11 +306,13 @@ json OnnxRuntimeServer::classify_image(const json& params, std::string image_byt
     if (layout_ != classifier::Layout::Image) {
         return classifier::wrong_route_error(layout_);
     }
-    return classifier::require_image_route(
-        classifier::normalize_backend_error(forward_multipart_request(
-            "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
-            classifier::kImageForwardTimeoutSeconds)),
-        "ort-server 0.2.0-musl");
+    json response = forward_multipart_request(
+        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+        classifier::kImageForwardTimeoutSeconds);
+    if (classifier::is_missing_image_route(response)) {
+        return classifier::missing_image_route_error("ort-server", onnxruntime::kImageRouteRequirement);
+    }
+    return classifier::normalize_backend_error(std::move(response));
 }
 
 }  // namespace backends

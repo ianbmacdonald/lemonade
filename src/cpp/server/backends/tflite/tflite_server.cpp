@@ -139,6 +139,12 @@ void TfliteServer::load(const std::string& model_name,
     // the resolved path is the only candidate.
     auto candidates = classifier::find_model_dirs(path_from_utf8(model_path), kGraphs);
     if (candidates.empty()) {
+        const std::string refused =
+            classifier::refused_model_dirs(path_from_utf8(model_path), kGraphs);
+        if (!refused.empty()) {
+            throw NonRetryableLoadException("The model directory under '" + model_path +
+                                            "' is not servable:" + refused);
+        }
         throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
             "': need model.tflite + tokenizer.json + config.json for a text classifier "
@@ -262,7 +268,7 @@ json TfliteServer::forward_classify(const std::string& text, const json& params)
 }
 
 json TfliteServer::classify(const json& request) {
-    if (layout_ == classifier::Layout::Image) {
+    if (layout_ != classifier::Layout::Text) {
         return classifier::wrong_route_error(layout_);
     }
     if (request.contains("labels")) {
@@ -299,11 +305,9 @@ json TfliteServer::classify_image(const json& params, std::string image_bytes) {
     if (layout_ != classifier::Layout::Image) {
         return classifier::wrong_route_error(layout_);
     }
-    return classifier::require_image_route(
-        classifier::normalize_backend_error(forward_multipart_request(
-            "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
-            classifier::kImageForwardTimeoutSeconds)),
-        "tflite-server 0.2.0");
+    return classifier::normalize_backend_error(forward_multipart_request(
+        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+        classifier::kImageForwardTimeoutSeconds));
 }
 
 }  // namespace backends

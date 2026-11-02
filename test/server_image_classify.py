@@ -71,7 +71,8 @@ ENGINES = {
         "graph": "model.tflite",
         "binary": "tflite-server",
         "args": "tflite_args",
-        "image_release": "tflite-server 0.2.0",
+        "server": "tflite-server",
+        "route_requirement": None,
         "model": "user.MobileNetV2-1.0-224-TFLite",
         "text_model": "user.B194-Text-TFLite",
     },
@@ -79,7 +80,8 @@ ENGINES = {
         "graph": "model.pte",
         "binary": "et-server",
         "args": "executorch_args",
-        "image_release": "et-server 0.2.0",
+        "server": "et-server",
+        "route_requirement": "et-server v0.2.0 or later",
         "model": "user.MobileNetV2-1.0-224-ExecuTorch",
         "text_model": "user.B204-Text-ExecuTorch",
     },
@@ -87,7 +89,8 @@ ENGINES = {
         "graph": "model.onnx",
         "binary": None,
         "args": "onnxruntime_args",
-        "image_release": "ort-server 0.2.0-musl",
+        "server": "ort-server",
+        "route_requirement": "lemonade-sdk/ort-server, including the default 0.4.0",
         "model": "user.MobileNetV2-1.0-224-ONNX",
         "text_model": "user.B204-Text-ONNX",
     },
@@ -1006,28 +1009,71 @@ class ImageClassifyTests(ServerTestBase):
             timeout=TIMEOUT_DEFAULT,
         )
 
-    def test_517_engine_without_image_route_is_a_502(self):
-        # An engine release older than its first image release answers 404 on
-        # /classify/image; the client must learn which release it needs.
-        if not _opts.fake_backend or not _opts.hf_cache:
-            self.skipTest("needs --fake-backend and --hf-cache")
-        name = "user.B204-Old-Engine-Image"
-
+    def _stub_image_with_marker(self, name, marker):
         def writer(dest):
             _write_stub_model_dir(dest)
-            with open(os.path.join(dest, "FAKE_NO_IMAGE_ROUTE"), "w", encoding="utf-8"):
+            with open(os.path.join(dest, marker), "w", encoding="utf-8"):
                 pass
 
         response = self._register_stub(name, "image-classification", writer)
         self.assertEqual(response.status_code, 200, response.text[:500])
+        self.addCleanup(self._remove_stub, name)
+
+    def _remove_stub(self, name):
+        requests.post(
+            f"{self.base_url}/delete",
+            json={"model_name": name},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        shutil.rmtree(
+            os.path.join(_opts.hf_cache, "models--" + name[len("user.") :]),
+            ignore_errors=True,
+        )
+
+    def test_517_engine_without_image_route(self):
+        # A release without POST /classify/image answers it with an empty 404.
+        # et-server and ort-server report no task on /health, so the load probes
+        # the route and refuses the engine; tflite-server's task check covers it,
+        # so its 404 reaches the client unchanged.
+        if not _opts.fake_backend or not _opts.hf_cache:
+            self.skipTest("needs --fake-backend and --hf-cache")
+        name = "user.B204-Old-Engine-Image"
+        self._stub_image_with_marker(name, "FAKE_NO_IMAGE_ROUTE")
+        if ENGINE["route_requirement"] is None:
+            response = self._post_form(
+                {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+                data={"model": name},
+            )
+            self._assert_status(response, 404, "tflite engine 404 passes through")
+            return
+        response = requests.post(
+            f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_DEFAULT
+        )
+        self.assertGreaterEqual(response.status_code, 400, response.text[:500])
+        self.assertIn(
+            f"{ENGINE['server']} has no POST /classify/image route", response.text
+        )
+        self.assertIn(ENGINE["route_requirement"], response.text)
+        print(f"[OK] load refused: {response.status_code}")
+
+    def test_517b_image_route_lost_after_load_is_a_502(self):
+        if ENGINE["route_requirement"] is None:
+            self.skipTest("tflite-server has no runtime fallback")
+        if not _opts.fake_backend or not _opts.hf_cache:
+            self.skipTest("needs --fake-backend and --hf-cache")
+        name = "user.B204-Image-Route-Gone"
+        self._stub_image_with_marker(name, "FAKE_IMAGE_ROUTE_GONE")
         response = self._post_form(
             {"image": ("g.jpg", self._fixture(), "image/jpeg")},
             data={"model": name},
         )
-        self._assert_status(response, 502, "engine without /classify/image")
+        self._assert_status(response, 502, "engine lost /classify/image")
         error = response.json()["error"]
         self.assertEqual(error["code"], "image_classification_unsupported")
-        self.assertIn(ENGINE["image_release"], error["message"])
+        self.assertIn(
+            f"{ENGINE['server']} has no POST /classify/image route", error["message"]
+        )
+        self.assertIn(ENGINE["route_requirement"], error["message"])
 
     def test_518_invalid_image_declarations_never_load(self):
         if not _opts.hf_cache:
@@ -1038,6 +1084,7 @@ class ImageClassifyTests(ServerTestBase):
             os.path.join(_opts.hf_cache, "..", f"b204-outside-{RECIPE}")
         )
         os.makedirs(outside, exist_ok=True)
+        self.addCleanup(shutil.rmtree, outside, True)
         with open(os.path.join(outside, "labels.txt"), "w", encoding="utf-8") as f:
             f.write("background\nmilitary uniform\n")
         with open(os.path.join(outside, "manifest.json"), "w", encoding="utf-8") as f:
@@ -1059,23 +1106,39 @@ class ImageClassifyTests(ServerTestBase):
                 os.path.join(dest, "manifest.json"),
             )
 
+        climbs = "climbs out of the model directory"
+        escapes = "manifest.json resolves outside the model directory"
         cases = (
-            ("user.B204-Bad-Labels-Text-Files", "classification", bad_labels),
-            ("user.B204-Bad-Labels-Text-Files-Img", "image-classification", bad_labels),
-            ("user.B204-Linked-Manifest", "image-classification", linked_manifest),
+            ("user.B204-Bad-Labels-Text-Files", "classification", bad_labels, climbs),
+            (
+                "user.B204-Bad-Labels-Text-Files-Img",
+                "image-classification",
+                bad_labels,
+                climbs,
+            ),
+            (
+                "user.B204-Linked-Manifest",
+                "image-classification",
+                linked_manifest,
+                escapes,
+            ),
         )
-        for name, label, writer in cases:
+        for name, label, writer, reason in cases:
             response = self._register_stub(name, label, writer)
-            if response.status_code == 200:
-                response = requests.post(
-                    f"{self.base_url}/load",
-                    json={"model_name": name},
-                    timeout=TIMEOUT_DEFAULT,
-                )
+            self.addCleanup(self._remove_stub, name)
+            self.assertEqual(
+                response.status_code, 200, f"{name}: {response.text[:500]}"
+            )
+            response = requests.post(
+                f"{self.base_url}/load",
+                json={"model_name": name},
+                timeout=TIMEOUT_DEFAULT,
+            )
             self.assertGreaterEqual(
                 response.status_code, 400, f"{name}: {response.text[:500]}"
             )
-            print(f"[OK] {name} ({label}) refused: {response.status_code}")
+            self.assertIn(reason, response.text, name)
+            print(f"[OK] {name} ({label}) refused: {response.status_code}: {reason}")
 
     def test_513_repeated_text_crashes_pause_the_model(self):
         self._require_model()

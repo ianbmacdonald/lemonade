@@ -27,8 +27,10 @@ otherwise returns fixed label scores.
 
 A model dir containing FAKE_FAIL_START makes the server exit 3 at startup,
 as an engine that refuses its model does. One containing FAKE_NO_IMAGE_ROUTE
-answers 404 on POST /classify/image, as a release older than its image
-support does.
+answers POST /classify/image with cpp-httplib's default 404 (an empty body), as
+a release without the image route does. FAKE_IMAGE_ROUTE_GONE does that only
+after its first /classify/image request, which it answers like an engine that
+has the route: a load probe passes and later requests do not.
 
 When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
 starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
@@ -107,6 +109,7 @@ def _health(engine, task):
 
 def make_handler(args, task):
     busy = threading.Lock()
+    image_calls = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -119,6 +122,11 @@ def make_handler(args, task):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+
+        def _send_empty(self, status):
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def do_GET(self):
             if self.path == "/health":
@@ -161,9 +169,13 @@ def make_handler(args, task):
                     },
                 )
                 return
-            if self.path != "/classify/image" or args.no_image_route:
+            if self.path != "/classify/image":
                 self._send(404, {"error": "not found"})
                 return
+            if args.no_image_route or (args.image_route_gone and image_calls):
+                self._send_empty(404)
+                return
+            image_calls.append(self.path)
             image, top_k = _image_part(self, body)
             if image is None:
                 self._send(400, {"error": "exactly one image part required"})
@@ -227,6 +239,7 @@ def main():
         print(f"{args.engine}: fake found no image or text model", file=sys.stderr)
         sys.exit(1)
     args.no_image_route = has("FAKE_NO_IMAGE_ROUTE")
+    args.image_route_gone = has("FAKE_IMAGE_ROUTE_GONE")
     _log("starts.log", str(os.getpid()))
     _log("args.log", json.dumps(sys.argv[1:]))
     ThreadingHTTPServer(

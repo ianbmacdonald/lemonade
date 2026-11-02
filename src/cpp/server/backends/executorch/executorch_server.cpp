@@ -130,6 +130,12 @@ void ExecutorchServer::load(const std::string& model_name,
     // the resolved path is the only candidate.
     auto candidates = classifier::find_model_dirs(path_from_utf8(model_path), kGraphs);
     if (candidates.empty()) {
+        const std::string refused =
+            classifier::refused_model_dirs(path_from_utf8(model_path), kGraphs);
+        if (!refused.empty()) {
+            throw NonRetryableLoadException("The model directory under '" + model_path +
+                                            "' is not servable:" + refused);
+        }
         throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
             "': need model.pte + tokenizer.json + config.json for a text classifier "
@@ -207,12 +213,26 @@ void ExecutorchServer::load(const std::string& model_name,
         throw NonRetryableLoadException("et-server " + status + " during startup" +
                                         (details.empty() ? "" : ": " + details));
     }
+    if (layout_ == classifier::Layout::Image) {
+        require_image_route_at_load();
+    }
     LOG(INFO, "ExecutorchServer") << "Server is ready!" << std::endl;
 }
 
 void ExecutorchServer::unload() {
     stop_server();
     layout_ = classifier::Layout::None;
+}
+
+// /health carries no task, so an engine without the image route would load and
+// then fail every request. An image request without an image is refused with a
+// 400 by an engine that has the route and with an empty 404 by one that does not.
+void ExecutorchServer::require_image_route_at_load() {
+    if (classifier::is_missing_image_route(forward_request("/classify/image", json::object(), 10))) {
+        stop_server();
+        throw NonRetryableLoadException(classifier::missing_image_route_message(
+            "et-server", executorch::kImageRouteRequirement));
+    }
 }
 
 json ExecutorchServer::forward_classify(const std::string& text, const json& params) {
@@ -222,7 +242,7 @@ json ExecutorchServer::forward_classify(const std::string& text, const json& par
 }
 
 json ExecutorchServer::classify(const json& request) {
-    if (layout_ == classifier::Layout::Image) {
+    if (layout_ != classifier::Layout::Text) {
         return classifier::wrong_route_error(layout_);
     }
     if (request.contains("labels")) {
@@ -259,11 +279,13 @@ json ExecutorchServer::classify_image(const json& params, std::string image_byte
     if (layout_ != classifier::Layout::Image) {
         return classifier::wrong_route_error(layout_);
     }
-    return classifier::require_image_route(
-        classifier::normalize_backend_error(forward_multipart_request(
-            "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
-            classifier::kImageForwardTimeoutSeconds)),
-        "et-server 0.2.0");
+    json response = forward_multipart_request(
+        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+        classifier::kImageForwardTimeoutSeconds);
+    if (classifier::is_missing_image_route(response)) {
+        return classifier::missing_image_route_error("et-server", executorch::kImageRouteRequirement);
+    }
+    return classifier::normalize_backend_error(std::move(response));
 }
 
 }  // namespace backends

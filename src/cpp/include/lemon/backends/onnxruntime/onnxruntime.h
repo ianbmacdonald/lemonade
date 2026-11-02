@@ -17,6 +17,14 @@ inline const std::set<std::string>& reserved_custom_arg_flags() {
     return flags;
 }
 
+// What an image model needs from ort-server. POST /classify/image exists only in
+// the ianbmacdonald/ort-server line, from v0.2.0-musl; lemonade-sdk/ort-server,
+// whose 0.4.0 is the default download, has no such route.
+inline constexpr const char* kImageRouteRequirement =
+    "lemonade-sdk/ort-server, including the default 0.4.0 download, has no image route; set "
+    "onnxruntime.cpu_bin to an ort-server that has one (ianbmacdonald/ort-server v0.2.0-musl or "
+    "later)";
+
 // The ONNX Runtime backend descriptor (plain data). A generic ORT model server
 // (see lemonade-sdk/ort-server); v1 serves text classification for the router's
 // `classifier` condition type (issue #2592) on the CPU EP, and image models on
