@@ -1,8 +1,8 @@
 From ae78c89e3808843cd73dcd9eaf42c53652f019dd Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:00:34 -0400
-Subject: [PATCH 66/98] fix(models): serialize writes to repository provenance
- files
+Subject: [PATCH 066/102] fix(models): serialize writes to repository
+ provenance files
 
 Pulls of different models hold different repository locks but can record
 into the same shared auxiliary repository. Each write loads the file,

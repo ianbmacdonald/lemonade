@@ -1,7 +1,7 @@
 From 1c5b6cf5d4c806f3c62fe2541412dfd4e03059f6 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 18:28:02 -0400
-Subject: [PATCH 77/98] docs(api): fix route spec lint and regenerate the API
+Subject: [PATCH 077/102] docs(api): fix route spec lint and regenerate the API
  reference
 
 gen_api_boilerplate.py --check failed on this branch: the API pages had

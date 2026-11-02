@@ -1,8 +1,8 @@
 From bffaff1d7da348a56888cad7506e038c8d4fdc06 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 14:59:52 -0400
-Subject: [PATCH 62/98] fix(websocket): bound connections, message size and the
- spans auth wait
+Subject: [PATCH 062/102] fix(websocket): bound connections, message size and
+ the spans auth wait
 
 An upgrade hands its socket to the WebSocket server, which released the
 connection guard's ticket, so held WebSocket connections escaped

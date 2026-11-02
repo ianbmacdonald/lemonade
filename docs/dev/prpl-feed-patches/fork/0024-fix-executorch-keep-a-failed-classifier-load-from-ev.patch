@@ -1,7 +1,7 @@
 From 6da5daec2843a900bd00d4fed44259a2687a83d9 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:35:51 -0400
-Subject: [PATCH 24/98] fix(executorch): keep a failed classifier load from
+Subject: [PATCH 024/102] fix(executorch): keep a failed classifier load from
  evicting resident models
 
 A failed et-server load used to fall into the Router's nuclear path: evict

@@ -1,0 +1,120 @@
+From 455e92a27e0270fa25981052a0fb87b0abe6d12e Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 16:24:09 -0500
+Subject: [PATCH 100/102] refactor(classifier): reset the layout on unload and
+ scope ort's text probe
+
+The three backends now clear the loaded layout in unload(), so the
+wrong-route checks never act on a model that is gone; onnxruntime gains an
+unload() to do it. ort's /health version and truncation warning is wrapped
+in a text-only block instead of an early return, so code added after it
+runs for image models too.
+
+Assisted-by: claude:opus-5.5
+---
+ .../backends/onnxruntime/onnxruntime_server.h |  2 +
+ .../backends/executorch/executorch_server.cpp |  1 +
+ .../onnxruntime/onnxruntime_server.cpp        | 45 ++++++++++---------
+ .../server/backends/tflite/tflite_server.cpp  |  1 +
+ 4 files changed, 29 insertions(+), 20 deletions(-)
+
+diff --git a/src/cpp/include/lemon/backends/onnxruntime/onnxruntime_server.h b/src/cpp/include/lemon/backends/onnxruntime/onnxruntime_server.h
+index e18768ff7..c472f9dcd 100644
+--- a/src/cpp/include/lemon/backends/onnxruntime/onnxruntime_server.h
++++ b/src/cpp/include/lemon/backends/onnxruntime/onnxruntime_server.h
+@@ -30,6 +30,8 @@ public:
+               const RecipeOptions& options,
+               bool do_not_upgrade = false) override;
+ 
++    void unload() override;
++
+     // IClassificationServer
+     json classify(const json& request) override;
+ 
+diff --git a/src/cpp/server/backends/executorch/executorch_server.cpp b/src/cpp/server/backends/executorch/executorch_server.cpp
+index 62a3826a0..3462430f8 100644
+--- a/src/cpp/server/backends/executorch/executorch_server.cpp
++++ b/src/cpp/server/backends/executorch/executorch_server.cpp
+@@ -212,6 +212,7 @@ void ExecutorchServer::load(const std::string& model_name,
+ 
+ void ExecutorchServer::unload() {
+     stop_server();
++    layout_ = classifier::Layout::None;
+ }
+ 
+ json ExecutorchServer::forward_classify(const std::string& text, const json& params) {
+diff --git a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+index 7310fb888..68d357d17 100644
+--- a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
++++ b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+@@ -220,30 +220,35 @@ void OnnxRuntimeServer::load(const std::string& model_name,
+                                         (details.empty() ? "" : ": " + details));
+     }
+ 
+-    if (layout_ != classifier::Layout::Text) return;
+-
+-    // The pin does not decide the binary: a `cpu_bin` path or tag can run an
+-    // older ort-server, which cuts input without saying so. Ask the binary.
+-    const json health = forward_get_request("/health", 5);
+-    if (onnxruntime::reports_truncation(health)) {
+-        LOG(INFO, "OnnxRuntimeServer")
+-            << "ort-server version " << health["version"].get<std::string>() << std::endl;
+-    } else {
+-        std::string why = "did not answer /health, so its version is unknown";
+-        if (health.is_object() && !health.contains("error")) {
+-            why = health.contains("version") && health["version"].is_string()
+-                      ? "reports version " + health["version"].get<std::string>() +
+-                            ", which predates 0.4.0"
+-                      : "reports no version, so it predates 0.4.0";
++    if (layout_ == classifier::Layout::Text) {
++        // The pin does not decide the binary: a `cpu_bin` path or tag can run an
++        // older ort-server, which cuts input without saying so. Ask the binary.
++        const json health = forward_get_request("/health", 5);
++        if (onnxruntime::reports_truncation(health)) {
++            LOG(INFO, "OnnxRuntimeServer")
++                << "ort-server version " << health["version"].get<std::string>() << std::endl;
++        } else {
++            std::string why = "did not answer /health, so its version is unknown";
++            if (health.is_object() && !health.contains("error")) {
++                why = health.contains("version") && health["version"].is_string()
++                          ? "reports version " + health["version"].get<std::string>() +
++                                ", which predates 0.4.0"
++                          : "reports no version, so it predates 0.4.0";
++            }
++            LOG(WARNING, "OnnxRuntimeServer")
++                << "ort-server at " << executable << " " << why
++                << ". It does not report input cuts, so a classifier with "
++                   "on_truncation=fail on this model fails every evaluation."
++                << std::endl;
+         }
+-        LOG(WARNING, "OnnxRuntimeServer")
+-            << "ort-server at " << executable << " " << why
+-            << ". It does not report input cuts, so a classifier with "
+-               "on_truncation=fail on this model fails every evaluation."
+-            << std::endl;
+     }
+ }
+ 
++void OnnxRuntimeServer::unload() {
++    stop_server();
++    layout_ = classifier::Layout::None;
++}
++
+ json OnnxRuntimeServer::forward_classify(const std::string& text, const json& params) {
+     json body = {{"text", text}};
+     if (params.contains("top_k")) body["top_k"] = params["top_k"];
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index b1e53e83b..608dcf712 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -252,6 +252,7 @@ void TfliteServer::load(const std::string& model_name,
+ 
+ void TfliteServer::unload() {
+     stop_server();
++    layout_ = classifier::Layout::None;
+ }
+ 
+ json TfliteServer::forward_classify(const std::string& text, const json& params) {
+-- 
+2.53.0
+

@@ -1,0 +1,725 @@
+From 969d63038ce90df4efd38ea307b07f96e0b6e00c Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 16:23:58 -0500
+Subject: [PATCH 099/102] fix(classifier): confine manifest.json and keep
+ failed image declarations out of the text layout
+
+Review round 1 of B204 found three ways the shared layout detector could
+misread a model directory, on all three engines:
+
+- manifest.json was opened, through any symlink, before any confinement
+  check. It now has to resolve inside the model dir (or its registry
+  repository) before it is read, and the read is bounded to 1 MiB.
+- A manifest declaring "task": "image-classification" whose labels_file
+  failed a check (absolute, "..", empty, not a string) fell through to the
+  text layout when tokenizer.json and config.json were present, so et and ort
+  loaded an explicit image model as a text classifier. The declaration is now
+  tri-state: absent, valid, or invalid, and invalid is no layout. A manifest
+  that cannot be read safely (escaping link, oversized, not a JSON object)
+  is no layout either, because what it declares is unknown.
+- The confinement root widened to the parent of any ancestor named
+  "snapshots". It now widens only for a snapshots dir directly under a
+  registry repository (models--*, modelscope--models--*).
+
+An engine that predates image classification answers 404 on
+/classify/image; that 404 is now a 502 image_classification_unsupported
+naming the first release that serves the route (tflite-server 0.2.0,
+et-server 0.2.0, ort-server 0.2.0-musl). The load mismatch error reads
+"needs the <layout> layout, but '<dir>' has the <layout> layout" (or "has no
+servable classifier layout"), and a backend with nothing loaded says so on
+either route.
+
+test_classifier_layout covers every case above for tflite, executorch and
+onnxruntime through the detector, each recipe's resolver and the load
+check. server_image_classify.py adds test_517 (an engine without the image
+route, through the fake's FAKE_NO_IMAGE_ROUTE) and test_518 (invalid image
+declarations and an escaping manifest link never load).
+
+Assisted-by: claude:opus-5.5
+---
+ .../lemon/backends/classifier_backend.h       |  16 +-
+ .../server/backends/classifier_backend.cpp    | 156 ++++++++++++------
+ .../backends/executorch/executorch_server.cpp |   8 +-
+ .../onnxruntime/onnxruntime_server.cpp        |   8 +-
+ .../server/backends/tflite/tflite_server.cpp  |   8 +-
+ .../lemonade/inference/images_classify.cpp    |   8 +-
+ test/cpp/test_classifier_layout.cpp           | 142 ++++++++++++++++
+ test/server_image_classify.py                 |  94 ++++++++++-
+ test/utils/fake_tflite_server.py              |   7 +-
+ 9 files changed, 382 insertions(+), 65 deletions(-)
+
+diff --git a/src/cpp/include/lemon/backends/classifier_backend.h b/src/cpp/include/lemon/backends/classifier_backend.h
+index 8b55d7e87..fcef75eb8 100644
+--- a/src/cpp/include/lemon/backends/classifier_backend.h
++++ b/src/cpp/include/lemon/backends/classifier_backend.h
+@@ -17,9 +17,13 @@ namespace classifier {
+ // engine loads (model.tflite; model.pte; model.onnx or model.ort); any one of
+ // them counts.
+ //
+-// Text:  a graph + tokenizer.json + config.json (manifest.json optional).
++// Text:  a graph + tokenizer.json + config.json (manifest.json optional, and
++//        not declaring the image task).
+ // Image: a graph + manifest.json {"task": "image-classification"} + the
+-//        labels file the manifest names.
++//        labels file the manifest names. The manifest and the labels file
++//        must resolve inside the model dir, or inside its registry repository
++//        for a snapshot. A manifest that declares the image task but fails a
++//        check makes the dir None, never Text.
+ enum class Layout { None, Text, Image };
+ 
+ // Runs during bulk model listing, so it never throws.
+@@ -34,7 +38,7 @@ std::vector<std::filesystem::path> find_model_dirs(const std::filesystem::path&
+                                                    const std::vector<std::string>& graphs);
+ 
+ // The layout `type` needs. Throws NonRetryableLoadException naming both
+-// layouts when dir holds the other one.
++// layouts when dir holds the other one or none.
+ Layout require_layout(const std::string& model_name, ModelType type,
+                       const std::filesystem::path& dir,
+                       const std::vector<std::string>& graphs);
+@@ -52,6 +56,12 @@ std::vector<utils::MultipartField> image_classify_fields(const nlohmann::json& p
+ // the client sees "image too large" with its 4xx, not a generic 500.
+ nlohmann::json normalize_backend_error(nlohmann::json response);
+ 
++// An engine older than its first image release answers 404 on /classify/image,
++// which would reach the client as a bare 404 on every request. Turns that 404
++// (in a normalized response) into a 502 naming the release image models need,
++// such as "et-server 0.2.0".
++nlohmann::json require_image_route(nlohmann::json response, const std::string& engine_release);
++
+ // Longer than the backend watchdog takes to kill a hung engine (about 105 s
+ // with the defaults), so a hang ends in a reset rather than a network error.
+ constexpr long kImageForwardTimeoutSeconds = 120;
+diff --git a/src/cpp/server/backends/classifier_backend.cpp b/src/cpp/server/backends/classifier_backend.cpp
+index 687194fe7..7f3d38f82 100644
+--- a/src/cpp/server/backends/classifier_backend.cpp
++++ b/src/cpp/server/backends/classifier_backend.cpp
+@@ -8,7 +8,6 @@
+ #include <algorithm>
+ #include <cstdint>
+ #include <fstream>
+-#include <iterator>
+ #include <system_error>
+ #include <utility>
+ 
+@@ -23,61 +22,94 @@ namespace {
+ 
+ constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
+ 
+-// True only for a readable manifest declaring the image-classification task. A
+-// text model's optional manifest carries no task, so it falls through to Text.
+-bool read_image_manifest(const fs::path& dir, std::string& labels_file) {
++// The registry cache names a repository <prefix><org>--<name>, the prefix being
++// "models--" (Hugging Face) or "modelscope--models--" (ModelScope).
++bool is_registry_repo_dir(const fs::path& dir) {
++    const std::string name = utils::path_to_utf8(dir.filename());
++    return name.rfind("models--", 0) == 0 || name.rfind("modelscope--models--", 0) == 0;
++}
++
++// A registry snapshot links each file into its repository's blobs/, so a model
++// file may resolve anywhere in that repository; anywhere else it must resolve
++// inside the model dir. A directory that is merely named "snapshots" does not
++// widen the root.
++fs::path confinement_root(const fs::path& abs_dir) {
++    for (fs::path p = abs_dir; p.has_relative_path(); p = p.parent_path()) {
++        if (p.filename() == "snapshots" && is_registry_repo_dir(p.parent_path())) {
++            return p.parent_path();
++        }
++    }
++    return abs_dir;
++}
++
++// The canonical target of dir/rel when it resolves inside dir's confinement
++// root, else empty. Checked on the resolved target, since a lexical check does
++// not see through symlinks.
++fs::path confined_target(const fs::path& dir, const fs::path& rel) {
++    std::error_code ec;
++    const fs::path abs_dir = fs::absolute(dir, ec);
++    if (ec) return {};
++    const fs::path base = fs::canonical(confinement_root(abs_dir), ec);
++    if (ec) return {};
++    fs::path target = fs::canonical(abs_dir / rel, ec);
++    if (ec) return {};
++    if (std::mismatch(base.begin(), base.end(), target.begin(), target.end()).first != base.end()) {
++        return {};
++    }
++    return target;
++}
++
++enum class ImageDeclaration { Absent, Valid, Invalid };
++
++// Valid only for a confined, readable manifest declaring the image-classification
++// task with a lexically in-dir labels file. A manifest that declares the task but
++// fails any check is Invalid, never Absent: falling through to the text layout
++// would load an explicit image model as a text classifier. A manifest that cannot
++// be read safely (escaping link, oversized, not JSON) is Invalid too, since what
++// it declares is unknown. Only a manifest without the image task is Absent.
++ImageDeclaration read_image_manifest(const fs::path& dir, std::string& labels_file) {
+     std::error_code ec;
+     const fs::path manifest = dir / "manifest.json";
+-    if (!fs::is_regular_file(manifest, ec) || ec) return false;
+-    const auto size = fs::file_size(manifest, ec);
+-    if (ec || size > kMaxManifestBytes) return false;
++    const fs::file_type type = fs::symlink_status(manifest, ec).type();
++    if (type == fs::file_type::not_found) return ImageDeclaration::Absent;
++    if (ec) return ImageDeclaration::Invalid;
++
++    const fs::path target = confined_target(dir, "manifest.json");
++    if (target.empty()) return ImageDeclaration::Invalid;
++    if (!fs::is_regular_file(target, ec) || ec) return ImageDeclaration::Absent;
++
++    std::ifstream in(target, std::ios::binary);
++    if (!in) return ImageDeclaration::Invalid;
++    std::string text(kMaxManifestBytes + 1, '\0');
++    in.read(&text[0], static_cast<std::streamsize>(text.size()));
++    if (static_cast<std::uintmax_t>(in.gcount()) > kMaxManifestBytes) {
++        return ImageDeclaration::Invalid;
++    }
++    text.resize(static_cast<size_t>(in.gcount()));
+ 
+-    std::ifstream in(manifest, std::ios::binary);
+-    if (!in) return false;
+-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+     const json doc = json::parse(text, nullptr, false);
+-    if (!doc.is_object()) return false;
++    if (!doc.is_object()) return ImageDeclaration::Invalid;
+     const auto task = doc.find("task");
+     if (task == doc.end() || !task->is_string() ||
+         task->get<std::string>() != "image-classification") {
+-        return false;
++        return ImageDeclaration::Absent;
+     }
+     labels_file = "labels.txt";
+     const auto labels = doc.find("labels_file");
+     if (labels != doc.end()) {
+-        if (!labels->is_string()) return false;
++        if (!labels->is_string()) return ImageDeclaration::Invalid;
+         labels_file = labels->get<std::string>();
+     }
+     // The labels file must sit in the model dir; a path that climbs out of it
+     // would let a manifest point the backend anywhere on disk.
+     const fs::path rel(labels_file);
+-    if (labels_file.empty() || rel.is_absolute() || rel.has_root_path()) return false;
+-    for (const auto& part : rel) {
+-        if (part == "..") return false;
++    if (labels_file.empty() || rel.is_absolute() || rel.has_root_path()) {
++        return ImageDeclaration::Invalid;
+     }
+-    return true;
+-}
+-
+-// A Hugging Face snapshot links each file into its repository's blobs/, so a
+-// labels file may resolve anywhere in that repository; outside a snapshot it
+-// must resolve inside the model dir. Checked on the resolved target, since the
+-// lexical check in read_image_manifest does not see through symlinks.
+-bool labels_file_confined(const fs::path& dir, const std::string& labels_file) {
+-    std::error_code ec;
+-    const fs::path abs_dir = fs::absolute(dir, ec);
+-    if (ec) return false;
+-    fs::path root = abs_dir;
+-    for (fs::path p = abs_dir; p.has_relative_path(); p = p.parent_path()) {
+-        if (p.filename() == "snapshots") {
+-            root = p.parent_path();
+-            break;
+-        }
++    for (const auto& part : rel) {
++        if (part == "..") return ImageDeclaration::Invalid;
+     }
+-    const fs::path base = fs::canonical(root, ec);
+-    if (ec) return false;
+-    const fs::path target = fs::canonical(abs_dir / fs::path(labels_file), ec);
+-    if (ec) return false;
+-    return std::mismatch(base.begin(), base.end(), target.begin(), target.end()).first == base.end();
++    return ImageDeclaration::Valid;
+ }
+ 
+ bool has_graph(const fs::path& dir, const std::vector<std::string>& graphs) {
+@@ -106,11 +138,17 @@ Layout detect_layout(const fs::path& dir, const std::vector<std::string>& graphs
+         if (!has_graph(dir, graphs)) return Layout::None;
+ 
+         std::string labels_file;
+-        if (read_image_manifest(dir, labels_file)) {
+-            return fs::is_regular_file(dir / fs::path(labels_file), ec) && !ec &&
+-                           labels_file_confined(dir, labels_file)
+-                       ? Layout::Image
+-                       : Layout::None;
++        switch (read_image_manifest(dir, labels_file)) {
++            case ImageDeclaration::Valid: {
++                const fs::path labels = confined_target(dir, fs::path(labels_file));
++                return !labels.empty() && fs::is_regular_file(labels, ec) && !ec
++                           ? Layout::Image
++                           : Layout::None;
++            }
++            case ImageDeclaration::Invalid:
++                return Layout::None;
++            case ImageDeclaration::Absent:
++                break;
+         }
+         // The config is mandatory even when a manifest is present: the manifest
+         // describes the output contract only, and the engine checks the
+@@ -156,18 +194,40 @@ Layout require_layout(const std::string& model_name, ModelType type, const fs::p
+     const Layout wanted = type == ModelType::IMAGE_CLASSIFICATION ? Layout::Image : Layout::Text;
+     const Layout layout = detect_layout(dir, graphs);
+     if (layout != wanted) {
++        const std::string found = layout == Layout::None
++                                      ? "has no servable classifier layout"
++                                      : std::string("has the ") + layout_name(layout) + " layout";
+         throw NonRetryableLoadException(
+             "Model '" + model_name + "' is labeled " + model_type_to_string(type) +
+-            " and needs a " + layout_name(wanted) + " layout, but '" +
+-            utils::path_to_utf8(dir) + "' is a " + layout_name(layout) + " layout");
++            " and needs the " + layout_name(wanted) + " layout, but '" +
++            utils::path_to_utf8(dir) + "' " + found);
+     }
+     return layout;
+ }
+ 
+ json wrong_route_error(Layout loaded) {
+-    return loaded == Layout::Image
+-               ? invalid_request("This is an image-classification model; POST /v1/images/classify")
+-               : invalid_request("This is a text-classification model; POST /v1/classify");
++    switch (loaded) {
++        case Layout::Image:
++            return invalid_request("This is an image-classification model; POST /v1/images/classify");
++        case Layout::Text:
++            return invalid_request("This is a text-classification model; POST /v1/classify");
++        default:
++            return invalid_request("No classification model is loaded on this backend");
++    }
++}
++
++json require_image_route(json response, const std::string& engine_release) {
++    if (!response.contains("error") || !response["error"].is_object()) return response;
++    const json& err = response["error"];
++    if (!err.contains("status_code") || err["status_code"] != 404) return response;
++    response["error"] = {
++        {"message", engine_release + " or newer is required to serve image-classification "
++                    "models: the engine answered 404 for POST /classify/image"},
++        {"type", ErrorType::BACKEND_ERROR},
++        {"code", "image_classification_unsupported"},
++        {"status_code", 502},
++    };
++    return response;
+ }
+ 
+ std::vector<utils::MultipartField> image_classify_fields(const json& params,
+diff --git a/src/cpp/server/backends/executorch/executorch_server.cpp b/src/cpp/server/backends/executorch/executorch_server.cpp
+index c3512a2bf..62a3826a0 100644
+--- a/src/cpp/server/backends/executorch/executorch_server.cpp
++++ b/src/cpp/server/backends/executorch/executorch_server.cpp
+@@ -258,9 +258,11 @@ json ExecutorchServer::classify_image(const json& params, std::string image_byte
+     if (layout_ != classifier::Layout::Image) {
+         return classifier::wrong_route_error(layout_);
+     }
+-    return classifier::normalize_backend_error(forward_multipart_request(
+-        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+-        classifier::kImageForwardTimeoutSeconds));
++    return classifier::require_image_route(
++        classifier::normalize_backend_error(forward_multipart_request(
++            "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
++            classifier::kImageForwardTimeoutSeconds)),
++        "et-server 0.2.0");
+ }
+ 
+ }  // namespace backends
+diff --git a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+index 81015d42a..7310fb888 100644
+--- a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
++++ b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+@@ -280,9 +280,11 @@ json OnnxRuntimeServer::classify_image(const json& params, std::string image_byt
+     if (layout_ != classifier::Layout::Image) {
+         return classifier::wrong_route_error(layout_);
+     }
+-    return classifier::normalize_backend_error(forward_multipart_request(
+-        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+-        classifier::kImageForwardTimeoutSeconds));
++    return classifier::require_image_route(
++        classifier::normalize_backend_error(forward_multipart_request(
++            "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
++            classifier::kImageForwardTimeoutSeconds)),
++        "ort-server 0.2.0-musl");
+ }
+ 
+ }  // namespace backends
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index 40108cdea..b1e53e83b 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -298,9 +298,11 @@ json TfliteServer::classify_image(const json& params, std::string image_bytes) {
+     if (layout_ != classifier::Layout::Image) {
+         return classifier::wrong_route_error(layout_);
+     }
+-    return classifier::normalize_backend_error(forward_multipart_request(
+-        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+-        classifier::kImageForwardTimeoutSeconds));
++    return classifier::require_image_route(
++        classifier::normalize_backend_error(forward_multipart_request(
++            "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
++            classifier::kImageForwardTimeoutSeconds)),
++        "tflite-server 0.2.0");
+ }
+ 
+ }  // namespace backends
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index cfdd845cb..7efbbb7d2 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -46,6 +46,11 @@ const RouteError kNoSoleImageClassifier{
+ const RouteError kCrashedOnInput{
+     502, "backend_crashed_on_input",
+     "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
++const RouteError kImageRouteUnsupported{
++    502, "image_classification_unsupported",
++    "The engine answered 404 for its image route: it predates image classification "
++    "(tflite-server 0.2.0, et-server 0.2.0 and ort-server 0.2.0-musl are the first releases "
++    "that serve it)"};
+ const RouteError kUnresponsiveOnInput{
+     504, "backend_unresponsive_on_input",
+     "The backend stopped answering its health checks while working on this input and was stopped; the "
+@@ -183,7 +188,8 @@ public:
+         s.examples = {example};
+         s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired, kContentEncoding,
+                                  kServerBusy, kCrashCooldown,
+-                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput, kUnresponsiveOnInput,
++                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput, kImageRouteUnsupported,
++                                 kUnresponsiveOnInput,
+                                  kModelUnloaded, kBackendError, kMalformedBackendResponse,
+                                  kUnexpectedException},
+                                 ModelLoader::errors()});
+diff --git a/test/cpp/test_classifier_layout.cpp b/test/cpp/test_classifier_layout.cpp
+index c0bad991f..11377bf5e 100644
+--- a/test/cpp/test_classifier_layout.cpp
++++ b/test/cpp/test_classifier_layout.cpp
+@@ -7,6 +7,7 @@
+ #include "lemon/backends/backend_ops.h"
+ #include "lemon/backends/executorch/executorch_server.h"
+ #include "lemon/backends/onnxruntime/onnxruntime_server.h"
++#include "lemon/backends/tflite/tflite_server.h"
+ #include "lemon/error_types.h"
+ 
+ #include <chrono>
+@@ -14,6 +15,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ namespace fs = std::filesystem;
+@@ -80,6 +82,134 @@ bool layout_refused(const std::string& model, lemon::ModelType type, const fs::p
+     return false;
+ }
+ 
++std::string load_error(const std::string& model, lemon::ModelType type, const fs::path& dir,
++                       const std::vector<std::string>& graphs) {
++    try {
++        classifier::require_layout(model, type, dir, graphs);
++    } catch (const lemon::NonRetryableLoadException& e) {
++        return e.what();
++    }
++    return "";
++}
++
++void make_text_with_manifest(const fs::path& dir, const std::string& graph,
++                             const std::string& manifest) {
++    make_text_with(dir, graph);
++    write(dir / "manifest.json", manifest);
++}
++
++// Not a layout: the dir must be None, resolve to nothing, and load under
++// neither label, so an explicit image declaration never becomes a text model.
++void check_unservable(const std::string& what, const fs::path& dir,
++                      const std::vector<std::string>& graphs,
++                      const lemon::backends::BackendOps* ops) {
++    using lemon::ModelType;
++    check(what + " is None", classifier::detect_layout(dir, graphs) == Layout::None);
++    check(what + " does not resolve", resolved(ops, dir).empty());
++    check(what + " loads under neither label",
++          layout_refused("m", ModelType::CLASSIFICATION, dir, graphs) &&
++              layout_refused("m", ModelType::IMAGE_CLASSIFICATION, dir, graphs));
++}
++
++// Manifest and labels confinement, and image declarations that fail a check
++// with tokenizer.json and config.json present, for one engine's graph names.
++void check_declarations(const fs::path& root, const std::string& recipe, const std::string& graph,
++                        const std::vector<std::string>& graphs,
++                        const lemon::backends::BackendOps* ops) {
++    const fs::path base = root / ("decl-" + recipe);
++    write(base / "outside.txt", "background\ncat\n");
++
++    const std::pair<const char*, std::string> bad_labels[] = {
++        {"a parent-traversing labels_file", R"({"task":"image-classification","labels_file":"../outside.txt"})"},
++        {"an absolute labels_file",
++         R"({"task":"image-classification","labels_file":")" + (base / "outside.txt").generic_string() + R"("})"},
++        {"an empty labels_file", R"({"task":"image-classification","labels_file":""})"},
++        {"a non-string labels_file", R"({"task":"image-classification","labels_file":5})"},
++        {"a missing labels file", R"({"task":"image-classification","labels_file":"absent.txt"})"},
++    };
++    int n = 0;
++    for (const auto& [name, manifest] : bad_labels) {
++        const fs::path dir = base / ("bad_labels_" + std::to_string(n++));
++        make_text_with_manifest(dir, graph, manifest);
++        check_unservable(recipe + ": image manifest with " + name + " and text files", dir,
++                         graphs, ops);
++    }
++
++    make_text_with_manifest(base / "huge_text", graph,
++                            std::string(R"({"task":"image-classification","pad":")") +
++                                std::string(2 * 1024 * 1024, 'a') + "\"}");
++    check_unservable(recipe + ": 2 MiB image manifest with text files", base / "huge_text",
++                     graphs, ops);
++
++    make_text_with_manifest(base / "text_manifest", graph, R"({"task":"text-classification"})");
++    check(recipe + ": a text manifest with text files is still Text",
++          classifier::detect_layout(base / "text_manifest", graphs) == Layout::Text);
++
++#ifndef _WIN32
++    write(base / "elsewhere" / "manifest.json", kImageManifest);
++    const fs::path linked = base / "manifest_link_escape";
++    write(linked / graph, "x");
++    write(linked / "labels.txt", "background\ncat\n");
++    fs::create_symlink(base / "elsewhere" / "manifest.json", linked / "manifest.json");
++    check_unservable(recipe + ": manifest linked outside a plain model dir", linked, graphs, ops);
++
++    const fs::path linked_text = base / "manifest_link_escape_text";
++    make_text_with(linked_text, graph);
++    fs::create_symlink(base / "elsewhere" / "manifest.json", linked_text / "manifest.json");
++    check_unservable(recipe + ": manifest linked outside a text model dir", linked_text, graphs,
++                     ops);
++
++    const fs::path repo = base / "hub" / "models--org--img";
++    write(repo / "blobs" / "m1", kImageManifest);
++    write(repo / "blobs" / "l1", "background\ncat\n");
++    const fs::path snap = repo / "snapshots" / "6e091d820cbe8f22eeb604d136403eca290b8c1e";
++    write(snap / graph, "x");
++    fs::create_symlink("../../blobs/m1", snap / "manifest.json");
++    fs::create_symlink("../../blobs/l1", snap / "labels.txt");
++    check(recipe + ": manifest and labels linked to their repository's blobs is Image",
++          classifier::detect_layout(snap, graphs) == Layout::Image);
++    check(recipe + ": a snapshot with blob links resolves", resolved(ops, snap) == snap);
++
++    const fs::path snap_out = repo / "snapshots" / "aaaa";
++    write(snap_out / graph, "x");
++    fs::create_symlink("../../blobs/l1", snap_out / "labels.txt");
++    fs::create_symlink(base / "elsewhere" / "manifest.json", snap_out / "manifest.json");
++    check_unservable(recipe + ": manifest linked outside its repository", snap_out, graphs, ops);
++
++    const fs::path ms = base / "hub" / "modelscope--models--org--img" / "snapshots" / "bbbb";
++    write(ms.parent_path().parent_path() / "blobs" / "l1", "a\n");
++    make_image(ms, graph);
++    fs::remove(ms / "labels.txt");
++    fs::create_symlink("../../blobs/l1", ms / "labels.txt");
++    check(recipe + ": a ModelScope snapshot linking its labels to a blob is Image",
++          classifier::detect_layout(ms, graphs) == Layout::Image);
++
++    const fs::path fake_snap = base / "plain" / "snapshots" / "m";
++    write(base / "plain" / "other.txt", "a\n");
++    make_image(fake_snap, graph);
++    fs::remove(fake_snap / "labels.txt");
++    fs::create_symlink(base / "plain" / "other.txt", fake_snap / "labels.txt");
++    check_unservable(recipe + ": labels linked beside a dir that is only named snapshots",
++                     fake_snap, graphs, ops);
++#endif
++
++    using lemon::ModelType;
++    make_text_with(base / "text", graph);
++    make_image(base / "image", graph);
++    const std::string to_image = load_error("m", ModelType::IMAGE_CLASSIFICATION, base / "text", graphs);
++    check(recipe + ": the mismatch error reads 'needs the image-classifier layout'",
++          to_image.find("needs the image-classifier layout") != std::string::npos &&
++              to_image.find("has the text-classifier layout") != std::string::npos);
++    const std::string to_text = load_error("m", ModelType::CLASSIFICATION, base / "image", graphs);
++    check(recipe + ": the mismatch error reads 'needs the text-classifier layout'",
++          to_text.find("needs the text-classifier layout") != std::string::npos &&
++              to_text.find("has the image-classifier layout") != std::string::npos);
++    const std::string to_none =
++        load_error("m", ModelType::CLASSIFICATION, base / "bad_labels_0", graphs);
++    check(recipe + ": a dir with no layout is named as such",
++          to_none.find("has no servable classifier layout") != std::string::npos);
++}
++
+ void check_engine(const fs::path& root, const std::string& recipe, const std::string& graph,
+                   const std::vector<std::string>& graphs, const lemon::backends::BackendOps* ops) {
+     const fs::path base = root / recipe;
+@@ -246,6 +376,18 @@ int main() {
+     check("two complete dirs are both found", classifier::find_model_dirs(two, kTflite).size() == 2);
+     check("one complete dir is found", classifier::find_model_dirs(root / "image", kTflite).size() == 1);
+ 
++    check_declarations(root, "tflite", "model.tflite", kTflite, lemon::backends::tflite::ops());
++    check_declarations(root, "executorch", "model.pte", kExecutorch,
++                       lemon::backends::executorch::ops());
++    check_declarations(root, "onnxruntime", "model.ort", kOnnxRuntime,
++                       lemon::backends::onnxruntime::ops());
++
++    {
++        const std::string none = classifier::wrong_route_error(Layout::None)["error"]["message"];
++        check("a backend with nothing loaded says so on either route",
++              none.find("No classification model is loaded") != std::string::npos);
++    }
++
+     check_engine(root, "executorch", "model.pte", kExecutorch, lemon::backends::executorch::ops());
+     check_engine(root, "onnxruntime", "model.ort", kOnnxRuntime, lemon::backends::onnxruntime::ops());
+ 
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index cbe8c7a31..6ca2db4a4 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -71,6 +71,7 @@ ENGINES = {
+         "graph": "model.tflite",
+         "binary": "tflite-server",
+         "args": "tflite_args",
++        "image_release": "tflite-server 0.2.0",
+         "model": "user.MobileNetV2-1.0-224-TFLite",
+         "text_model": "user.B194-Text-TFLite",
+     },
+@@ -78,6 +79,7 @@ ENGINES = {
+         "graph": "model.pte",
+         "binary": "et-server",
+         "args": "executorch_args",
++        "image_release": "et-server 0.2.0",
+         "model": "user.MobileNetV2-1.0-224-ExecuTorch",
+         "text_model": "user.B204-Text-ExecuTorch",
+     },
+@@ -85,6 +87,7 @@ ENGINES = {
+         "graph": "model.onnx",
+         "binary": None,
+         "args": "onnxruntime_args",
++        "image_release": "ort-server 0.2.0-musl",
+         "model": "user.MobileNetV2-1.0-224-ONNX",
+         "text_model": "user.B204-Text-ONNX",
+     },
+@@ -988,10 +991,97 @@ class ImageClassifyTests(ServerTestBase):
+             self.assertGreaterEqual(response.status_code, 400, response.text[:500])
+             wanted = "image-classifier" if text_dir else "text-classifier"
+             found = "text-classifier" if text_dir else "image-classifier"
+-            self.assertIn(f"needs a {wanted} layout", response.text)
+-            self.assertIn(f"is a {found} layout", response.text)
++            self.assertIn(f"needs the {wanted} layout", response.text)
++            self.assertIn(f"has the {found} layout", response.text)
+             print(f"[OK] {label} on a {found} dir refused: {response.status_code}")
+ 
++    def _register_stub(self, name, label, writer):
++        dest = os.path.join(_opts.hf_cache, "models--" + name[len("user.") :])
++        if os.path.lexists(dest):
++            shutil.rmtree(dest)
++        writer(dest)
++        return requests.post(
++            f"{self.base_url}/pull",
++            json={
++                "model_name": name,
++                "recipe": RECIPE,
++                "labels": [label],
++                "local_import": True,
++            },
++            timeout=TIMEOUT_DEFAULT,
++        )
++
++    def test_517_engine_without_image_route_is_a_502(self):
++        # An engine release older than its first image release answers 404 on
++        # /classify/image; the client must learn which release it needs.
++        if not _opts.fake_backend or not _opts.hf_cache:
++            self.skipTest("needs --fake-backend and --hf-cache")
++        name = "user.B204-Old-Engine-Image"
++
++        def writer(dest):
++            _write_stub_model_dir(dest)
++            with open(os.path.join(dest, "FAKE_NO_IMAGE_ROUTE"), "w", encoding="utf-8"):
++                pass
++
++        response = self._register_stub(name, "image-classification", writer)
++        self.assertEqual(response.status_code, 200, response.text[:500])
++        response = self._post_form(
++            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
++            data={"model": name},
++        )
++        self._assert_status(response, 502, "engine without /classify/image")
++        error = response.json()["error"]
++        self.assertEqual(error["code"], "image_classification_unsupported")
++        self.assertIn(ENGINE["image_release"], error["message"])
++
++    def test_518_invalid_image_declarations_never_load(self):
++        if not _opts.hf_cache:
++            self.skipTest("no --hf-cache (or LEMONADE_TEST_HF_CACHE)")
++        if os.name == "nt":
++            self.skipTest("needs symlinks")
++        outside = os.path.abspath(
++            os.path.join(_opts.hf_cache, "..", f"b204-outside-{RECIPE}")
++        )
++        os.makedirs(outside, exist_ok=True)
++        with open(os.path.join(outside, "labels.txt"), "w", encoding="utf-8") as f:
++            f.write("background\nmilitary uniform\n")
++        with open(os.path.join(outside, "manifest.json"), "w", encoding="utf-8") as f:
++            json.dump({"task": "image-classification", "labels_file": "labels.txt"}, f)
++
++        def bad_labels(dest):
++            _write_stub_text_model_dir(dest)
++            with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
++                json.dump(
++                    {"task": "image-classification", "labels_file": "../outside.txt"},
++                    f,
++                )
++
++        def linked_manifest(dest):
++            _write_stub_model_dir(dest)
++            os.remove(os.path.join(dest, "manifest.json"))
++            os.symlink(
++                os.path.join(outside, "manifest.json"),
++                os.path.join(dest, "manifest.json"),
++            )
++
++        cases = (
++            ("user.B204-Bad-Labels-Text-Files", "classification", bad_labels),
++            ("user.B204-Bad-Labels-Text-Files-Img", "image-classification", bad_labels),
++            ("user.B204-Linked-Manifest", "image-classification", linked_manifest),
++        )
++        for name, label, writer in cases:
++            response = self._register_stub(name, label, writer)
++            if response.status_code == 200:
++                response = requests.post(
++                    f"{self.base_url}/load",
++                    json={"model_name": name},
++                    timeout=TIMEOUT_DEFAULT,
++                )
++            self.assertGreaterEqual(
++                response.status_code, 400, f"{name}: {response.text[:500]}"
++            )
++            print(f"[OK] {name} ({label}) refused: {response.status_code}")
++
+     def test_513_repeated_text_crashes_pause_the_model(self):
+         self._require_model()
+         self._require_text_model()
+diff --git a/test/utils/fake_tflite_server.py b/test/utils/fake_tflite_server.py
+index 8cc8df1c0..170bc3dc0 100644
+--- a/test/utils/fake_tflite_server.py
++++ b/test/utils/fake_tflite_server.py
+@@ -26,7 +26,9 @@ answering GET /health meanwhile, as a single-threaded engine would, and
+ otherwise returns fixed label scores.
+ 
+ A model dir containing FAKE_FAIL_START makes the server exit 3 at startup,
+-as an engine that refuses its model does.
++as an engine that refuses its model does. One containing FAKE_NO_IMAGE_ROUTE
++answers 404 on POST /classify/image, as a release older than its image
++support does.
+ 
+ When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
+ starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
+@@ -159,7 +161,7 @@ def make_handler(args, task):
+                     },
+                 )
+                 return
+-            if self.path != "/classify/image":
++            if self.path != "/classify/image" or args.no_image_route:
+                 self._send(404, {"error": "not found"})
+                 return
+             image, top_k = _image_part(self, body)
+@@ -224,6 +226,7 @@ def main():
+     else:
+         print(f"{args.engine}: fake found no image or text model", file=sys.stderr)
+         sys.exit(1)
++    args.no_image_route = has("FAKE_NO_IMAGE_ROUTE")
+     _log("starts.log", str(os.getpid()))
+     _log("args.log", json.dumps(sys.argv[1:]))
+     ThreadingHTTPServer(
+-- 
+2.53.0
+

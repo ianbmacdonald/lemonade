@@ -1,7 +1,7 @@
 From 42573f2e78d95ae504316021d24d28e5328a2c2a Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Fri, 9 Oct 2026 02:42:32 -0400
-Subject: [PATCH 48/98] fix(server): gateway limits review round 1
+Subject: [PATCH 048/102] fix(server): gateway limits review round 1
 
 Refuse a connection whose socket cannot be duplicated while the receive
 deadline is on, instead of admitting it with no deadline. Clamp an

@@ -1,8 +1,8 @@
-From d47a59e99bbfb7722c2404c36506d9a0bf360c63 Mon Sep 17 00:00:00 2001
+From 0b5501768dedae327c90d2504b5e34de4105ee67 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 08:45:22 -0500
-Subject: [PATCH 95/98] feat(onnxruntime): serve image-classification models on
- /v1/images/classify
+Subject: [PATCH 095/102] feat(onnxruntime): serve image-classification models
+ on /v1/images/classify
 
 ort-server serves POST /classify/image with tflite-server's contract for a
 model.onnx or model.ort directory whose manifest.json declares the

@@ -1,7 +1,7 @@
 From 53bf7c5272a6678c59234ef73782c940ac1868d7 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:19:59 -0400
-Subject: [PATCH 15/98] feat(tflite): POST /v1/images/classify served by
+Subject: [PATCH 015/102] feat(tflite): POST /v1/images/classify served by
  tflite-server image models
 
 Adds an image-classification deployment mode: ModelType::IMAGE_CLASSIFICATION,

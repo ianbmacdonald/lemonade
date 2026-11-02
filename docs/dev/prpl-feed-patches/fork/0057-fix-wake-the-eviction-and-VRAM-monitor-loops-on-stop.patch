@@ -1,7 +1,7 @@
 From c2bf329d743668fed6c35ba72cad1ded84881620 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 03:05:43 -0400
-Subject: [PATCH 57/98] fix: wake the eviction and VRAM monitor loops on stop
+Subject: [PATCH 057/102] fix: wake the eviction and VRAM monitor loops on stop
 
 Both loops slept their whole interval (5 s and 2 s) before seeing a stop, so
 lemond took about 6 s to exit on SIGTERM with nothing loaded. A condition

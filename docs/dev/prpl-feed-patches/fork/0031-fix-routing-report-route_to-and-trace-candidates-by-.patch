@@ -1,7 +1,7 @@
 From a9c62a04e7589d23dfbe2aa1d55b45f31b4194cd Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:48:39 -0400
-Subject: [PATCH 31/98] fix(routing): report route_to and trace candidates by
+Subject: [PATCH 031/102] fix(routing): report route_to and trace candidates by
  public model name
 
 The route decision (x_lemonade_route and /routing/validate) emitted

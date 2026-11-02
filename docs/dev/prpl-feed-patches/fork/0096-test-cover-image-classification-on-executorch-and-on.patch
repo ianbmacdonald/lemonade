@@ -1,7 +1,7 @@
-From 92da2215e05f66fafbb257f016c506005533cff5 Mon Sep 17 00:00:00 2001
+From bd82887b7475e23cdb37d8c68e85a67b9c26a714 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 08:45:22 -0500
-Subject: [PATCH 96/98] test: cover image classification on executorch and
+Subject: [PATCH 096/102] test: cover image classification on executorch and
  onnxruntime
 
 test_classifier_layout checks the et and ort graph names for the text,

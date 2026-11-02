@@ -1,0 +1,117 @@
+From fd7f64873559d073eb411417761dab89a09440c9 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 16:24:09 -0500
+Subject: [PATCH 101/102] test: resolve the image suite's engine at import and
+ split test_514
+
+The recipe, engine and model names were set to tflite at import and rebound
+only under __main__, so a runner importing the module tested tflite whatever
+it was asked for. They are now resolved from the arguments at import.
+
+test_514 asserted 200 on the fake and 400 on a real engine under one name.
+test_514 now runs on the fake only (the upload is not a decodable JPEG), and
+test_514b checks that a real engine, not lemond's cap, refuses it, by status
+and error type rather than the engine's wording.
+
+Assisted-by: claude:opus-5.5
+---
+ test/server_image_classify.py | 52 +++++++++++++++++------------------
+ 1 file changed, 25 insertions(+), 27 deletions(-)
+
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index 6ca2db4a4..5babe7a17 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -92,10 +92,6 @@ ENGINES = {
+         "text_model": "user.B204-Text-ONNX",
+     },
+ }
+-RECIPE = "tflite"
+-ENGINE = ENGINES[RECIPE]
+-MODEL = ENGINE["model"]
+-TEXT_MODEL = ENGINE["text_model"]
+ POISON_TEXT = "B194-POISON-TEXT"
+ HANG_TEXT = "B194-HANG-TEXT"
+ FIXTURE = os.path.join(
+@@ -108,16 +104,6 @@ POISON = b"B169-POISON-IMAGE"
+ SLOW = b"B169-SLOW-IMAGE"
+ HANG_IMAGE = b"B194-HANG-IMAGE"
+ 
+-_opts = argparse.Namespace(
+-    image_model_dir=None,
+-    hf_cache=None,
+-    fake_backend=False,
+-    fake_state_dir=None,
+-    lemond_pid=None,
+-    short_watchdog=False,
+-    fake_ort=False,
+-)
+-
+ 
+ def _parse_own_args():
+     parser = argparse.ArgumentParser(add_help=False)
+@@ -138,6 +124,15 @@ def _parse_own_args():
+     return args
+ 
+ 
++# Resolved at import, so a runner that imports the module tests the engine it
++# was asked for rather than tflite.
++_opts = _parse_own_args()
++RECIPE = _opts.wrapped_server
++ENGINE = ENGINES[RECIPE]
++MODEL = ENGINE["model"]
++TEXT_MODEL = ENGINE["text_model"]
++
++
+ def _png(width, height, truncate=False):
+     def chunk(kind, data):
+         body = kind + data
+@@ -1156,29 +1151,32 @@ class ImageClassifyTests(ServerTestBase):
+             _line_count(starts), starts_before, "paused model was reloaded"
+         )
+ 
+-    def test_514_large_multipart_image_is_accepted(self):
++    def _post_large_image(self):
+         # 12 MiB is under the 16 MiB image cap and the 23 MiB body cap.
+-        self._require_model()
+         image = _jpeg_like(b"\x01" * (12 * 1024 * 1024))
+-        response = self._post_form(
++        return self._post_form(
+             {"image": ("big.jpg", image, "image/jpeg")},
+             data={"model": MODEL, "top_k": "1"},
+         )
++
++    def test_514_large_multipart_image_is_accepted(self):
++        if not _opts.fake_backend:
++            self.skipTest("needs --fake-backend: the upload is not a decodable JPEG")
++        self._require_model()
++        self._assert_status(self._post_large_image(), 200, "12 MiB multipart image")
++
++    def test_514b_large_multipart_image_reaches_a_real_engine(self):
+         if _opts.fake_backend:
+-            self._assert_status(response, 200, "12 MiB multipart image")
+-            return
+-        # A real decoder refuses the synthetic JPEG; its 400 shows the body
+-        # passed lemond's cap and reached the engine.
++            self.skipTest("needs a real engine")
++        self._require_model()
++        # The engine's decoder refuses the synthetic JPEG: a 400 from the engine,
++        # not lemond's 413, shows the body passed lemond's cap.
++        response = self._post_large_image()
+         self._assert_status(response, 400, "12 MiB multipart image")
+-        self.assertIn("JPEG", response.json()["error"]["message"])
++        self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+ 
+ 
+ if __name__ == "__main__":
+-    _opts = _parse_own_args()
+-    RECIPE = _opts.wrapped_server
+-    ENGINE = ENGINES[RECIPE]
+-    MODEL = ENGINE["model"]
+-    TEXT_MODEL = ENGINE["text_model"]
+     run_server_tests(
+         ImageClassifyTests,
+         "IMAGE CLASSIFICATION TESTS",
+-- 
+2.53.0
+

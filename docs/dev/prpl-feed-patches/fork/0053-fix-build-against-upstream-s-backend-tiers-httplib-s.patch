@@ -1,7 +1,7 @@
 From 47f967cfdcbf4ed212528f1e2abd7f5608fc3b6e Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 01:13:37 -0400
-Subject: [PATCH 53/98] fix: build against upstream's backend tiers, httplib
+Subject: [PATCH 053/102] fix: build against upstream's backend tiers, httplib
  split header and beacon port
 
 Assisted-by: claude:opus-5.5

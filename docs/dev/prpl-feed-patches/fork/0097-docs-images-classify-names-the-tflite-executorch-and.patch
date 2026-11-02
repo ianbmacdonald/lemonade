@@ -1,8 +1,8 @@
-From d349ea7d9902f1915f3134db58b9a6e24aaa838f Mon Sep 17 00:00:00 2001
+From 7f2a75ad4d2d57ab21b2e75f69158ccfaff19a23 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 08:56:49 -0500
-Subject: [PATCH 97/98] docs: images/classify names the tflite, executorch and
- onnxruntime recipes
+Subject: [PATCH 097/102] docs: images/classify names the tflite, executorch
+ and onnxruntime recipes
 
 The route spec, and the API reference regenerated from it, said the model
 must use the tflite recipe. It now names all three engines, the graph file

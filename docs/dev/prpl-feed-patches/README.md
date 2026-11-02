@@ -8,7 +8,7 @@ with `git am --keep-cr` on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 98 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0098). |
+| Series: `fork/` | 102 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0102). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -53,6 +53,21 @@ it reaches the feed through upstream `main` once it merges.
   `config.json`) whose manifest declares that task used to load as a text classifier;
   it now fails to load with a message naming both layouts (or, without its labels
   file, is not found as a model). Remove the `task` from a text model's manifest.
+- All three classifier recipes (tflite, executorch, onnxruntime) are stricter about a
+  model directory's `manifest.json`, so a directory that loaded before can disappear
+  from the model list:
+  - A manifest that declares `"task": "image-classification"` but whose `labels_file` is
+    absolute, climbs out with `..`, is empty or is not a string no longer falls back to
+    a text classifier when `tokenizer.json` and `config.json` are present; the directory
+    is not a model. Fix the labels path, or remove the `task` from a text model's
+    manifest.
+  - `manifest.json` must resolve inside the model directory, or inside its registry
+    repository for a downloaded snapshot. A symlink to a file elsewhere makes the
+    directory not a model, and so does a manifest over 1 MiB or one that is not a JSON
+    object, for text models too.
+  - A directory below a folder that is only named `snapshots` (not a
+    `models--<org>--<name>/snapshots` repository) no longer lets its labels file
+    resolve outside the model directory.
 
 ## musl-only patches
 
@@ -93,6 +108,7 @@ generic build fixes that musl just happens to exercise:
 | 0092 | a missing ort-server engine no longer evicts other models either |
 | 0093-0097 | image classification on the executorch (`et-server`) and onnxruntime (`ort-server`) backends: the layout detection and image forward shared with tflite, both descriptors gain `image-classification`, tests and the route spec (B204) |
 | 0098 | executorch lists arm64 Linux CPUs, so its models are not hidden on an arm64 host |
+| 0099-0102 | fixes from the B204 review: `manifest.json` confinement, a failed image declaration is never a text model, the `snapshots` root only for registry repositories, a 502 naming the first image release for an engine without `/classify/image`, wording and test cleanups, and `/v1/classify` naming executorch |
 
 ## Test values
 

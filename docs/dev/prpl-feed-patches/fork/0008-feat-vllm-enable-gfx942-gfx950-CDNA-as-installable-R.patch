@@ -1,8 +1,8 @@
 From 75f91db60efa771bc070ea614942361f6596ef40 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 11 Aug 2026 21:29:08 -0400
-Subject: [PATCH 08/98] feat(vllm): enable gfx942/gfx950 (CDNA) as installable
- ROCm targets
+Subject: [PATCH 008/102] feat(vllm): enable gfx942/gfx950 (CDNA) as
+ installable ROCm targets
 
 pins, device-class launch defaults) behind the support-families list
 pending a release asset. lemonade-sdk/vllm-rocm now publishes gfx942 and

@@ -1,0 +1,55 @@
+From a38cf3926d11ac254d5553a5c8b3574a29b30ca7 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 16:24:09 -0500
+Subject: [PATCH 102/102] docs: /v1/classify names executorch, and regenerate
+ the API reference
+
+The /v1/classify route spec listed onnxruntime and tflite text classifiers
+only; it now names executorch too, as the label reference does. The
+regenerated reference also carries the new 502
+image_classification_unsupported on /v1/images/classify.
+
+Assisted-by: claude:opus-5.5
+---
+ docs/api/lemonade.md                                  | 3 ++-
+ src/cpp/server/routes/lemonade/inference/classify.cpp | 3 ++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/docs/api/lemonade.md b/docs/api/lemonade.md
+index 0257bda62..c240120dd 100644
+--- a/docs/api/lemonade.md
++++ b/docs/api/lemonade.md
+@@ -53,7 +53,7 @@ Some Lemonade endpoints live on other pages: the per-model [`/v1/models/{id}/fil
+ ## `POST /v1/classify`
+ <sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
+ 
+-Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on a string and returns a score for each label. It serves `onnxruntime` sequence classifiers (one label set), token classifiers (aggregated span labels) and zero-shot models (labels sent with each request), and `tflite` text classifiers; image models are served by [`POST /v1/images/classify`](#post-v1imagesclassify). It provides the classification that the router's `classifier` and `zero_shot` conditions use.
++Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on a string and returns a score for each label. It serves `onnxruntime` sequence classifiers (one label set), token classifiers (aggregated span labels) and zero-shot models (labels sent with each request), and `tflite` and `executorch` text classifiers; image models are served by [`POST /v1/images/classify`](#post-v1imagesclassify). It provides the classification that the router's `classifier` and `zero_shot` conditions use.
+ 
+ Requires `LEMONADE_API_KEY` when it is set.
+ 
+@@ -258,6 +258,7 @@ An image model directory holds the graph (`model.tflite` for `tflite`, `model.pt
+ | `500` |  | The request fails unexpectedly |
+ | `500` | `model_load_error` | Loading the requested model fails for another reason, such as a failed download or a backend that does not start |
+ | `502` | `backend_crashed_on_input` | The backend crashed on this input; the request is not retried, and the next request restarts the backend |
++| `502` | `image_classification_unsupported` | The engine answered 404 for its image route: it predates image classification (tflite-server 0.2.0, et-server 0.2.0 and ort-server 0.2.0-musl are the first releases that serve it) |
+ | `503` | `server_busy` | Two image-classification requests are already in progress (`Retry-After: 1`) |
+ | `503` | `backend_crash_cooldown` | The model's backend crashed on 3 inputs within 60 seconds, which pauses classification for that model for 60 seconds (with `Retry-After`) |
+ | `504` | `backend_unresponsive_on_input` | The backend stopped answering its health checks while working on this input and was stopped; the request is not retried and does not count toward the crash pause |
+diff --git a/src/cpp/server/routes/lemonade/inference/classify.cpp b/src/cpp/server/routes/lemonade/inference/classify.cpp
+index b031a5483..69b9a252a 100644
+--- a/src/cpp/server/routes/lemonade/inference/classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/classify.cpp
+@@ -65,7 +65,8 @@ public:
+             "Runs an encoder text classifier, such as a PII, prompt-safety or domain classifier, on "
+             "a string and returns a score for each label. It serves `onnxruntime` sequence "
+             "classifiers (one label set), token classifiers (aggregated span labels) and zero-shot "
+-            "models (labels sent with each request), and `tflite` text classifiers; image models "
++            "models (labels sent with each request), and `tflite` and `executorch` text "
++            "classifiers; image models "
+             "are served by [`POST /v1/images/classify`](#post-v1imagesclassify). It provides the "
+             "classification that the router's `classifier` and `zero_shot` conditions use.";
+         s.notes = {
+-- 
+2.53.0
+
