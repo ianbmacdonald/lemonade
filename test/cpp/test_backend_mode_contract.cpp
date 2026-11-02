@@ -258,6 +258,8 @@ int main() {
         {"tflite + chat", "tflite", {"chat"}, false, {}, {}},
         {"executorch + classification", "executorch", {"classification"}, true,
          {"classification"}, ModelType::CLASSIFICATION},
+        {"executorch + image-classification", "executorch", {"image-classification"}, true,
+         {"image-classification"}, ModelType::IMAGE_CLASSIFICATION},
         {"executorch + chat", "executorch", {"chat"}, false, {}, {}},
         // Aliases of one mode are one claim, not two.
         {"llamacpp + embedding alias", "llamacpp", {"embedding", "embeddings"}, true,

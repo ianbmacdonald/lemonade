@@ -4,6 +4,7 @@
 #include "lemon/backends/backend_ops.h"
 #include "lemon/backends/backend_registry.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/backends/classifier_backend.h"
 #include "lemon/backends/executorch/executorch.h"
 #include "lemon/backends/hf_cache_util.h"
 #include "lemon/classify_text_limit.h"
@@ -26,14 +27,7 @@ namespace lemon {
 namespace backends {
 
 namespace {
-// The config is mandatory even when a manifest is present: the manifest
-// describes the output contract only, and et-server still needs the config to
-// check the architecture against its supported input convention.
-bool is_complete_model_dir(const fs::path& dir) {
-    std::error_code ec;
-    return fs::exists(dir / "model.pte", ec) && fs::exists(dir / "tokenizer.json", ec) &&
-           fs::exists(dir / "config.json", ec);
-}
+const std::vector<std::string> kGraphs = {"model.pte"};
 
 // The subprocess's stderr is invisible when lemond runs windowless (CI, tray),
 // so relaunch et-server just long enough to read the one "et-server: ..." line
@@ -84,27 +78,12 @@ std::string capture_startup_error(const std::string& executable,
     if (captured.size() > 400) captured = captured.substr(0, 400) + "...";
     return captured;
 }
-
-std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
-    std::vector<fs::path> dirs;
-    std::error_code ec;
-    fs::recursive_directory_iterator it(root, hf_cache::dir_options(), ec);
-    if (ec) return dirs;
-    for (auto end = fs::recursive_directory_iterator(); it != end; it.increment(ec)) {
-        if (ec) break;
-        if (it->is_regular_file(ec) && !ec && it->path().filename() == "model.pte" &&
-            is_complete_model_dir(it->path().parent_path())) {
-            dirs.push_back(it->path().parent_path());
-        }
-    }
-    std::sort(dirs.begin(), dirs.end());
-    return dirs;
-}
 }  // namespace
 
-// Subprocess contract (ort-server's):
+// Subprocess contract (ort-server's, and tflite-server's for images):
 //   GET  /health             -> 200 once every method in the .pte is loaded
 //   POST /classify {text}    -> 200 {"labels": {"<label>": <score in [0,1]>, ...}}
+//   POST /classify/image     -> 200 {"predictions": [{index, label, score}], ...}
 //   refusing a model         -> one "et-server: ..." stderr line, then exit(1)
 // Exit statuses above 128 are read as signal deaths, so a launcher wrapper must
 // exec et-server rather than propagate its status from a shell.
@@ -149,12 +128,14 @@ void ExecutorchServer::load(const std::string& model_name,
     // to the cache root when resolution is ambiguous, so a complete root that also
     // contains a nested complete model must still be rejected here — never assume
     // the resolved path is the only candidate.
-    auto candidates = find_complete_model_dirs(path_from_utf8(model_path));
+    auto candidates = classifier::find_model_dirs(path_from_utf8(model_path), kGraphs);
     if (candidates.empty()) {
         throw NonRetryableLoadException(
             "No servable model directory under '" + model_path +
-            "': need model.pte + tokenizer.json + config.json "
-            "(manifest.json is optional and overrides the output contract)");
+            "': need model.pte + tokenizer.json + config.json for a text classifier "
+            "(manifest.json is optional and overrides the output contract), or "
+            "model.pte + manifest.json {\"task\": \"image-classification\"} + its "
+            "labels file for an image classifier");
     }
     if (candidates.size() > 1) {
         std::string listing;
@@ -166,6 +147,7 @@ void ExecutorchServer::load(const std::string& model_name,
     }
     model_path = path_to_utf8(candidates.front());
     LOG(INFO, "ExecutorchServer") << "Using model: " << model_path << std::endl;
+    layout_ = classifier::require_layout(model_name, model_info.type, candidates.front(), kGraphs);
 
     std::string executable = BackendUtils::get_backend_binary_path(*executorch::spec(), "system");
     LOG(INFO, "ExecutorchServer") << "Using executable: " << executable << std::endl;
@@ -239,6 +221,9 @@ json ExecutorchServer::forward_classify(const std::string& text, const json& par
 }
 
 json ExecutorchServer::classify(const json& request) {
+    if (layout_ == classifier::Layout::Image) {
+        return classifier::wrong_route_error(layout_);
+    }
     if (request.contains("labels")) {
         return json{
             {"error", {
@@ -269,6 +254,15 @@ json ExecutorchServer::classify(const json& request) {
     return forward_classify(text, request);
 }
 
+json ExecutorchServer::classify_image(const json& params, std::string image_bytes) {
+    if (layout_ != classifier::Layout::Image) {
+        return classifier::wrong_route_error(layout_);
+    }
+    return classifier::normalize_backend_error(forward_multipart_request(
+        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+        classifier::kImageForwardTimeoutSeconds));
+}
+
 }  // namespace backends
 }  // namespace lemon
 
@@ -281,8 +275,9 @@ std::unique_ptr<WrappedServer> create(const BackendContext& ctx) {
 }
 
 namespace {
-// Resolve to the one directory holding model.pte + tokenizer.json + config.json,
-// which is what et-server takes as --model-path.
+// Resolve to the one directory holding model.pte and either tokenizer.json +
+// config.json (text) or manifest.json + labels (image), which is what et-server
+// takes as --model-path.
 class ExecutorchOps : public BackendOps {
 public:
     // For a Hugging Face cache, `refs/main` names the active revision — an older
@@ -309,7 +304,7 @@ public:
         if (!hf_cache::exists(dir)) {
             return "";
         }
-        auto candidates = find_complete_model_dirs(dir);
+        auto candidates = classifier::find_model_dirs(dir, kGraphs);
         if (candidates.size() != 1) {
             if (candidates.size() > 1) {
                 LOG(WARNING, "ExecutorchServer")

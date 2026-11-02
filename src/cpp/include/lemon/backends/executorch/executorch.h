@@ -20,8 +20,11 @@ inline const std::set<std::string>& reserved_custom_arg_flags() {
 
 // Serves text classification on /v1/classify through an et-server subprocess,
 // which speaks the same ort-server /classify contract as tflite-server over an
-// exported ExecuTorch program (model.pte). The binary is pre-built and found on
-// PATH; only an x86_64 (musl) ExecuTorch build exists, hence the support list.
+// exported ExecuTorch program (model.pte); image models go to
+// /v1/images/classify with tflite-server's /classify/image contract. The binary
+// is pre-built and found on PATH; only an x86_64 (musl) ExecuTorch build
+// exists, hence the support list. "classification" stays first: it is the
+// default mode the generated docs describe.
 inline const BackendDescriptor descriptor = {
     /*recipe*/          "executorch",
     /*display_name*/    "ExecuTorch",
@@ -39,7 +42,7 @@ inline const BackendDescriptor descriptor = {
     /*support*/ {
         {"system", BackendTier::Experimental, BackendFormat::Native, {"linux"}, {{"cpu", {"x86_64"}}}, "x86_64 CPU"},
     },
-    /*supported_modes*/ {"classification"},
+    /*supported_modes*/ {"classification", "image-classification"},
     /*required_checkpoints*/ {"main"},
     /*default_capabilities*/ {},
     /*web_display_name*/ "",

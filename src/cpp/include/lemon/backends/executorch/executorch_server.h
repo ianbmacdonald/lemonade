@@ -2,6 +2,7 @@
 
 #include "lemon/backends/backend_registry.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/backends/classifier_backend.h"
 #include "lemon/server_capabilities.h"
 #include "lemon/wrapped_server.h"
 #include <string>
@@ -9,7 +10,9 @@
 namespace lemon {
 namespace backends {
 
-class ExecutorchServer : public WrappedServer, public IClassificationServer {
+class ExecutorchServer : public WrappedServer,
+                         public IClassificationServer,
+                         public IImageClassificationServer {
 public:
     static InstallParams get_install_params(const std::string& backend, const std::string& version);
 
@@ -28,7 +31,11 @@ public:
 
     json classify(const json& request) override;
 
+    json classify_image(const json& params, std::string image_bytes) override;
+
 private:
+    classifier::Layout layout_ = classifier::Layout::None;
+
     json forward_classify(const std::string& text, const json& params);
 };
 
