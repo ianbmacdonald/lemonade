@@ -46,6 +46,11 @@ const RouteError kNoSoleImageClassifier{
 const RouteError kCrashedOnInput{
     502, "backend_crashed_on_input",
     "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
+const RouteError kImageRouteUnsupported{
+    502, "image_classification_unsupported",
+    "The engine answered 404 for its image route: it predates image classification "
+    "(tflite-server 0.2.0, et-server 0.2.0 and ort-server 0.2.0-musl are the first releases "
+    "that serve it)"};
 const RouteError kUnresponsiveOnInput{
     504, "backend_unresponsive_on_input",
     "The backend stopped answering its health checks while working on this input and was stopped; the "
@@ -183,7 +188,8 @@ public:
         s.examples = {example};
         s.errors = join_errors({{kBadContentType, kBadImageRequest, kImageTooLarge, kLengthRequired, kContentEncoding,
                                  kServerBusy, kCrashCooldown,
-                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput, kUnresponsiveOnInput,
+                                 kNotImageClassifier, kNoSoleImageClassifier, kCrashedOnInput, kImageRouteUnsupported,
+                                 kUnresponsiveOnInput,
                                  kModelUnloaded, kBackendError, kMalformedBackendResponse,
                                  kUnexpectedException},
                                 ModelLoader::errors()});

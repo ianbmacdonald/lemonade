@@ -7,6 +7,7 @@
 #include "lemon/backends/backend_ops.h"
 #include "lemon/backends/executorch/executorch_server.h"
 #include "lemon/backends/onnxruntime/onnxruntime_server.h"
+#include "lemon/backends/tflite/tflite_server.h"
 #include "lemon/error_types.h"
 
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -78,6 +80,134 @@ bool layout_refused(const std::string& model, lemon::ModelType type, const fs::p
         return true;
     }
     return false;
+}
+
+std::string load_error(const std::string& model, lemon::ModelType type, const fs::path& dir,
+                       const std::vector<std::string>& graphs) {
+    try {
+        classifier::require_layout(model, type, dir, graphs);
+    } catch (const lemon::NonRetryableLoadException& e) {
+        return e.what();
+    }
+    return "";
+}
+
+void make_text_with_manifest(const fs::path& dir, const std::string& graph,
+                             const std::string& manifest) {
+    make_text_with(dir, graph);
+    write(dir / "manifest.json", manifest);
+}
+
+// Not a layout: the dir must be None, resolve to nothing, and load under
+// neither label, so an explicit image declaration never becomes a text model.
+void check_unservable(const std::string& what, const fs::path& dir,
+                      const std::vector<std::string>& graphs,
+                      const lemon::backends::BackendOps* ops) {
+    using lemon::ModelType;
+    check(what + " is None", classifier::detect_layout(dir, graphs) == Layout::None);
+    check(what + " does not resolve", resolved(ops, dir).empty());
+    check(what + " loads under neither label",
+          layout_refused("m", ModelType::CLASSIFICATION, dir, graphs) &&
+              layout_refused("m", ModelType::IMAGE_CLASSIFICATION, dir, graphs));
+}
+
+// Manifest and labels confinement, and image declarations that fail a check
+// with tokenizer.json and config.json present, for one engine's graph names.
+void check_declarations(const fs::path& root, const std::string& recipe, const std::string& graph,
+                        const std::vector<std::string>& graphs,
+                        const lemon::backends::BackendOps* ops) {
+    const fs::path base = root / ("decl-" + recipe);
+    write(base / "outside.txt", "background\ncat\n");
+
+    const std::pair<const char*, std::string> bad_labels[] = {
+        {"a parent-traversing labels_file", R"({"task":"image-classification","labels_file":"../outside.txt"})"},
+        {"an absolute labels_file",
+         R"({"task":"image-classification","labels_file":")" + (base / "outside.txt").generic_string() + R"("})"},
+        {"an empty labels_file", R"({"task":"image-classification","labels_file":""})"},
+        {"a non-string labels_file", R"({"task":"image-classification","labels_file":5})"},
+        {"a missing labels file", R"({"task":"image-classification","labels_file":"absent.txt"})"},
+    };
+    int n = 0;
+    for (const auto& [name, manifest] : bad_labels) {
+        const fs::path dir = base / ("bad_labels_" + std::to_string(n++));
+        make_text_with_manifest(dir, graph, manifest);
+        check_unservable(recipe + ": image manifest with " + name + " and text files", dir,
+                         graphs, ops);
+    }
+
+    make_text_with_manifest(base / "huge_text", graph,
+                            std::string(R"({"task":"image-classification","pad":")") +
+                                std::string(2 * 1024 * 1024, 'a') + "\"}");
+    check_unservable(recipe + ": 2 MiB image manifest with text files", base / "huge_text",
+                     graphs, ops);
+
+    make_text_with_manifest(base / "text_manifest", graph, R"({"task":"text-classification"})");
+    check(recipe + ": a text manifest with text files is still Text",
+          classifier::detect_layout(base / "text_manifest", graphs) == Layout::Text);
+
+#ifndef _WIN32
+    write(base / "elsewhere" / "manifest.json", kImageManifest);
+    const fs::path linked = base / "manifest_link_escape";
+    write(linked / graph, "x");
+    write(linked / "labels.txt", "background\ncat\n");
+    fs::create_symlink(base / "elsewhere" / "manifest.json", linked / "manifest.json");
+    check_unservable(recipe + ": manifest linked outside a plain model dir", linked, graphs, ops);
+
+    const fs::path linked_text = base / "manifest_link_escape_text";
+    make_text_with(linked_text, graph);
+    fs::create_symlink(base / "elsewhere" / "manifest.json", linked_text / "manifest.json");
+    check_unservable(recipe + ": manifest linked outside a text model dir", linked_text, graphs,
+                     ops);
+
+    const fs::path repo = base / "hub" / "models--org--img";
+    write(repo / "blobs" / "m1", kImageManifest);
+    write(repo / "blobs" / "l1", "background\ncat\n");
+    const fs::path snap = repo / "snapshots" / "6e091d820cbe8f22eeb604d136403eca290b8c1e";
+    write(snap / graph, "x");
+    fs::create_symlink("../../blobs/m1", snap / "manifest.json");
+    fs::create_symlink("../../blobs/l1", snap / "labels.txt");
+    check(recipe + ": manifest and labels linked to their repository's blobs is Image",
+          classifier::detect_layout(snap, graphs) == Layout::Image);
+    check(recipe + ": a snapshot with blob links resolves", resolved(ops, snap) == snap);
+
+    const fs::path snap_out = repo / "snapshots" / "aaaa";
+    write(snap_out / graph, "x");
+    fs::create_symlink("../../blobs/l1", snap_out / "labels.txt");
+    fs::create_symlink(base / "elsewhere" / "manifest.json", snap_out / "manifest.json");
+    check_unservable(recipe + ": manifest linked outside its repository", snap_out, graphs, ops);
+
+    const fs::path ms = base / "hub" / "modelscope--models--org--img" / "snapshots" / "bbbb";
+    write(ms.parent_path().parent_path() / "blobs" / "l1", "a\n");
+    make_image(ms, graph);
+    fs::remove(ms / "labels.txt");
+    fs::create_symlink("../../blobs/l1", ms / "labels.txt");
+    check(recipe + ": a ModelScope snapshot linking its labels to a blob is Image",
+          classifier::detect_layout(ms, graphs) == Layout::Image);
+
+    const fs::path fake_snap = base / "plain" / "snapshots" / "m";
+    write(base / "plain" / "other.txt", "a\n");
+    make_image(fake_snap, graph);
+    fs::remove(fake_snap / "labels.txt");
+    fs::create_symlink(base / "plain" / "other.txt", fake_snap / "labels.txt");
+    check_unservable(recipe + ": labels linked beside a dir that is only named snapshots",
+                     fake_snap, graphs, ops);
+#endif
+
+    using lemon::ModelType;
+    make_text_with(base / "text", graph);
+    make_image(base / "image", graph);
+    const std::string to_image = load_error("m", ModelType::IMAGE_CLASSIFICATION, base / "text", graphs);
+    check(recipe + ": the mismatch error reads 'needs the image-classifier layout'",
+          to_image.find("needs the image-classifier layout") != std::string::npos &&
+              to_image.find("has the text-classifier layout") != std::string::npos);
+    const std::string to_text = load_error("m", ModelType::CLASSIFICATION, base / "image", graphs);
+    check(recipe + ": the mismatch error reads 'needs the text-classifier layout'",
+          to_text.find("needs the text-classifier layout") != std::string::npos &&
+              to_text.find("has the image-classifier layout") != std::string::npos);
+    const std::string to_none =
+        load_error("m", ModelType::CLASSIFICATION, base / "bad_labels_0", graphs);
+    check(recipe + ": a dir with no layout is named as such",
+          to_none.find("has no servable classifier layout") != std::string::npos);
 }
 
 void check_engine(const fs::path& root, const std::string& recipe, const std::string& graph,
@@ -245,6 +375,18 @@ int main() {
     make_image(two / "b");
     check("two complete dirs are both found", classifier::find_model_dirs(two, kTflite).size() == 2);
     check("one complete dir is found", classifier::find_model_dirs(root / "image", kTflite).size() == 1);
+
+    check_declarations(root, "tflite", "model.tflite", kTflite, lemon::backends::tflite::ops());
+    check_declarations(root, "executorch", "model.pte", kExecutorch,
+                       lemon::backends::executorch::ops());
+    check_declarations(root, "onnxruntime", "model.ort", kOnnxRuntime,
+                       lemon::backends::onnxruntime::ops());
+
+    {
+        const std::string none = classifier::wrong_route_error(Layout::None)["error"]["message"];
+        check("a backend with nothing loaded says so on either route",
+              none.find("No classification model is loaded") != std::string::npos);
+    }
 
     check_engine(root, "executorch", "model.pte", kExecutorch, lemon::backends::executorch::ops());
     check_engine(root, "onnxruntime", "model.ort", kOnnxRuntime, lemon::backends::onnxruntime::ops());

@@ -280,9 +280,11 @@ json OnnxRuntimeServer::classify_image(const json& params, std::string image_byt
     if (layout_ != classifier::Layout::Image) {
         return classifier::wrong_route_error(layout_);
     }
-    return classifier::normalize_backend_error(forward_multipart_request(
-        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
-        classifier::kImageForwardTimeoutSeconds));
+    return classifier::require_image_route(
+        classifier::normalize_backend_error(forward_multipart_request(
+            "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
+            classifier::kImageForwardTimeoutSeconds)),
+        "ort-server 0.2.0-musl");
 }
 
 }  // namespace backends

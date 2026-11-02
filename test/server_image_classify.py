@@ -71,6 +71,7 @@ ENGINES = {
         "graph": "model.tflite",
         "binary": "tflite-server",
         "args": "tflite_args",
+        "image_release": "tflite-server 0.2.0",
         "model": "user.MobileNetV2-1.0-224-TFLite",
         "text_model": "user.B194-Text-TFLite",
     },
@@ -78,6 +79,7 @@ ENGINES = {
         "graph": "model.pte",
         "binary": "et-server",
         "args": "executorch_args",
+        "image_release": "et-server 0.2.0",
         "model": "user.MobileNetV2-1.0-224-ExecuTorch",
         "text_model": "user.B204-Text-ExecuTorch",
     },
@@ -85,6 +87,7 @@ ENGINES = {
         "graph": "model.onnx",
         "binary": None,
         "args": "onnxruntime_args",
+        "image_release": "ort-server 0.2.0-musl",
         "model": "user.MobileNetV2-1.0-224-ONNX",
         "text_model": "user.B204-Text-ONNX",
     },
@@ -988,9 +991,96 @@ class ImageClassifyTests(ServerTestBase):
             self.assertGreaterEqual(response.status_code, 400, response.text[:500])
             wanted = "image-classifier" if text_dir else "text-classifier"
             found = "text-classifier" if text_dir else "image-classifier"
-            self.assertIn(f"needs a {wanted} layout", response.text)
-            self.assertIn(f"is a {found} layout", response.text)
+            self.assertIn(f"needs the {wanted} layout", response.text)
+            self.assertIn(f"has the {found} layout", response.text)
             print(f"[OK] {label} on a {found} dir refused: {response.status_code}")
+
+    def _register_stub(self, name, label, writer):
+        dest = os.path.join(_opts.hf_cache, "models--" + name[len("user.") :])
+        if os.path.lexists(dest):
+            shutil.rmtree(dest)
+        writer(dest)
+        return requests.post(
+            f"{self.base_url}/pull",
+            json={
+                "model_name": name,
+                "recipe": RECIPE,
+                "labels": [label],
+                "local_import": True,
+            },
+            timeout=TIMEOUT_DEFAULT,
+        )
+
+    def test_517_engine_without_image_route_is_a_502(self):
+        # An engine release older than its first image release answers 404 on
+        # /classify/image; the client must learn which release it needs.
+        if not _opts.fake_backend or not _opts.hf_cache:
+            self.skipTest("needs --fake-backend and --hf-cache")
+        name = "user.B204-Old-Engine-Image"
+
+        def writer(dest):
+            _write_stub_model_dir(dest)
+            with open(os.path.join(dest, "FAKE_NO_IMAGE_ROUTE"), "w", encoding="utf-8"):
+                pass
+
+        response = self._register_stub(name, "image-classification", writer)
+        self.assertEqual(response.status_code, 200, response.text[:500])
+        response = self._post_form(
+            {"image": ("g.jpg", self._fixture(), "image/jpeg")},
+            data={"model": name},
+        )
+        self._assert_status(response, 502, "engine without /classify/image")
+        error = response.json()["error"]
+        self.assertEqual(error["code"], "image_classification_unsupported")
+        self.assertIn(ENGINE["image_release"], error["message"])
+
+    def test_518_invalid_image_declarations_never_load(self):
+        if not _opts.hf_cache:
+            self.skipTest("no --hf-cache (or LEMONADE_TEST_HF_CACHE)")
+        if os.name == "nt":
+            self.skipTest("needs symlinks")
+        outside = os.path.abspath(
+            os.path.join(_opts.hf_cache, "..", f"b204-outside-{RECIPE}")
+        )
+        os.makedirs(outside, exist_ok=True)
+        with open(os.path.join(outside, "labels.txt"), "w", encoding="utf-8") as f:
+            f.write("background\nmilitary uniform\n")
+        with open(os.path.join(outside, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"task": "image-classification", "labels_file": "labels.txt"}, f)
+
+        def bad_labels(dest):
+            _write_stub_text_model_dir(dest)
+            with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {"task": "image-classification", "labels_file": "../outside.txt"},
+                    f,
+                )
+
+        def linked_manifest(dest):
+            _write_stub_model_dir(dest)
+            os.remove(os.path.join(dest, "manifest.json"))
+            os.symlink(
+                os.path.join(outside, "manifest.json"),
+                os.path.join(dest, "manifest.json"),
+            )
+
+        cases = (
+            ("user.B204-Bad-Labels-Text-Files", "classification", bad_labels),
+            ("user.B204-Bad-Labels-Text-Files-Img", "image-classification", bad_labels),
+            ("user.B204-Linked-Manifest", "image-classification", linked_manifest),
+        )
+        for name, label, writer in cases:
+            response = self._register_stub(name, label, writer)
+            if response.status_code == 200:
+                response = requests.post(
+                    f"{self.base_url}/load",
+                    json={"model_name": name},
+                    timeout=TIMEOUT_DEFAULT,
+                )
+            self.assertGreaterEqual(
+                response.status_code, 400, f"{name}: {response.text[:500]}"
+            )
+            print(f"[OK] {name} ({label}) refused: {response.status_code}")
 
     def test_513_repeated_text_crashes_pause_the_model(self):
         self._require_model()

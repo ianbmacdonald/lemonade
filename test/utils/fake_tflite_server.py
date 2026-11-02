@@ -26,7 +26,9 @@ answering GET /health meanwhile, as a single-threaded engine would, and
 otherwise returns fixed label scores.
 
 A model dir containing FAKE_FAIL_START makes the server exit 3 at startup,
-as an engine that refuses its model does.
+as an engine that refuses its model does. One containing FAKE_NO_IMAGE_ROUTE
+answers 404 on POST /classify/image, as a release older than its image
+support does.
 
 When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
 starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
@@ -159,7 +161,7 @@ def make_handler(args, task):
                     },
                 )
                 return
-            if self.path != "/classify/image":
+            if self.path != "/classify/image" or args.no_image_route:
                 self._send(404, {"error": "not found"})
                 return
             image, top_k = _image_part(self, body)
@@ -224,6 +226,7 @@ def main():
     else:
         print(f"{args.engine}: fake found no image or text model", file=sys.stderr)
         sys.exit(1)
+    args.no_image_route = has("FAKE_NO_IMAGE_ROUTE")
     _log("starts.log", str(os.getpid()))
     _log("args.log", json.dumps(sys.argv[1:]))
     ThreadingHTTPServer(
