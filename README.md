@@ -384,7 +384,7 @@ Lemonade supports multiple inference engines for LLM, speech, TTS, and image gen
     <tr>
       <td rowspan="1"><code>executorch</code></td>
       <td><code>system</code>†</td>
-      <td><code>x86_64</code> CPU</td>
+      <td><code>x86_64</code>/ARM64 CPU</td>
       <td>Linux</td>
     </tr>
   </tbody>

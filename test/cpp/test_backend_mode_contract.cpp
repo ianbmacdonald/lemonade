@@ -314,6 +314,25 @@ int main() {
               restamped == labels);
     }
 
+    // The classifier engines all ship x86_64 and arm64 Linux builds. A recipe
+    // whose support rows miss the host's CPU family is filtered out of the model
+    // list there, so a missing arm64 hides its models on an arm64 gateway.
+    for (const std::string recipe : {"executorch", "onnxruntime", "tflite"}) {
+        const lemon::BackendDescriptor* desc = lemon::backends::descriptor_for(recipe);
+        bool x86_64 = false;
+        bool arm64 = false;
+        for (const auto& row : desc != nullptr ? desc->support
+                                               : std::vector<lemon::BackendSupport>{}) {
+            if (row.supported_os.count("linux") == 0) continue;
+            const auto cpu = row.devices.find("cpu");
+            if (cpu == row.devices.end()) continue;
+            x86_64 = x86_64 || cpu->second.empty() || cpu->second.count("x86_64") != 0;
+            arm64 = arm64 || cpu->second.empty() || cpu->second.count("arm64") != 0;
+        }
+        check(recipe + ": supported on linux x86_64 CPUs", x86_64);
+        check(recipe + ": supported on linux arm64 CPUs", arm64);
+    }
+
     // Every backend that serves the Realtime API declares it, so the desktop and
     // web apps can offer the microphone without probing the backend.
     for (const auto& entry : entries) {
