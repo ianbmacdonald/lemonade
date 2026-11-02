@@ -3,6 +3,12 @@
 
 #include "lemon/backends/classifier_backend.h"
 
+#include "lemon/backends/backend_descriptor_registry.h"
+#include "lemon/backends/backend_ops.h"
+#include "lemon/backends/executorch/executorch_server.h"
+#include "lemon/backends/onnxruntime/onnxruntime_server.h"
+#include "lemon/error_types.h"
+
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -17,6 +23,8 @@ using classifier::Layout;
 namespace {
 
 const std::vector<std::string> kTflite = {"model.tflite"};
+const std::vector<std::string> kExecutorch = {"model.pte"};
+const std::vector<std::string> kOnnxRuntime = {"model.onnx", "model.ort"};
 
 int failures = 0;
 
@@ -44,10 +52,106 @@ void make_text(const fs::path& dir) {
     write(dir / "config.json", "{}");
 }
 
-void make_image(const fs::path& dir) {
-    write(dir / "model.tflite", "x");
+void make_image(const fs::path& dir, const std::string& graph = "model.tflite") {
+    write(dir / graph, "x");
     write(dir / "manifest.json", kImageManifest);
     write(dir / "labels.txt", "background\ncat\n");
+}
+
+void make_text_with(const fs::path& dir, const std::string& graph) {
+    write(dir / graph, "x");
+    write(dir / "tokenizer.json", "{}");
+    write(dir / "config.json", "{}");
+}
+
+// What the recipe's resolver picks for a local import, "" when nothing or
+// several models are found: the same search load() runs.
+fs::path resolved(const lemon::backends::BackendOps* ops, const fs::path& dir) {
+    return fs::path(ops->find_imported_checkpoint(dir.string()));
+}
+
+bool layout_refused(const std::string& model, lemon::ModelType type, const fs::path& dir,
+                    const std::vector<std::string>& graphs) {
+    try {
+        classifier::require_layout(model, type, dir, graphs);
+    } catch (const lemon::NonRetryableLoadException&) {
+        return true;
+    }
+    return false;
+}
+
+void check_engine(const fs::path& root, const std::string& recipe, const std::string& graph,
+                  const std::vector<std::string>& graphs, const lemon::backends::BackendOps* ops) {
+    const fs::path base = root / recipe;
+    using lemon::ModelType;
+
+    make_text_with(base / "text", graph);
+    check(recipe + ": text layout is Text",
+          classifier::detect_layout(base / "text", graphs) == Layout::Text);
+    check(recipe + ": a text model resolves", resolved(ops, base / "text") == base / "text");
+
+    make_image(base / "image", graph);
+    check(recipe + ": image manifest + labels is Image",
+          classifier::detect_layout(base / "image", graphs) == Layout::Image);
+    check(recipe + ": an image model resolves", resolved(ops, base / "image") == base / "image");
+
+    write(base / "image_no_labels" / graph, "x");
+    write(base / "image_no_labels" / "manifest.json", kImageManifest);
+    check(recipe + ": image manifest with its labels file missing is None",
+          classifier::detect_layout(base / "image_no_labels", graphs) == Layout::None);
+    check(recipe + ": an image model without labels does not resolve",
+          resolved(ops, base / "image_no_labels").empty());
+
+    write(base / "image_escape" / graph, "x");
+    write(base / "image_escape" / "manifest.json",
+          R"({"task":"image-classification","labels_file":"../text/config.json"})");
+    check(recipe + ": labels_file outside the model dir is None",
+          classifier::detect_layout(base / "image_escape", graphs) == Layout::None);
+    check(recipe + ": an escaping labels file does not resolve",
+          resolved(ops, base / "image_escape").empty());
+
+#ifndef _WIN32
+    const fs::path linked = base / "image_link_escape";
+    make_image(linked, graph);
+    fs::remove(linked / "labels.txt");
+    fs::create_symlink(root / "text" / "config.json", linked / "labels.txt");
+    check(recipe + ": labels file linked outside a plain model dir is None",
+          classifier::detect_layout(linked, graphs) == Layout::None);
+#endif
+
+    make_text_with(base / "text_image_manifest", graph);
+    write(base / "text_image_manifest" / "manifest.json", kImageManifest);
+    write(base / "text_image_manifest" / "labels.txt", "a\n");
+    check(recipe + ": an image manifest makes a dir with a tokenizer Image",
+          classifier::detect_layout(base / "text_image_manifest", graphs) == Layout::Image);
+
+    make_image(base / "other_engine", "model.tflite");
+    check(recipe + ": another engine's graph is None",
+          classifier::detect_layout(base / "other_engine", graphs) == Layout::None);
+    write(base / "none" / "labels.txt", "a\n");
+    check(recipe + ": a dir without a graph is None",
+          classifier::detect_layout(base / "none", graphs) == Layout::None);
+
+    check(recipe + ": an image label on a text dir is refused",
+          layout_refused("m", ModelType::IMAGE_CLASSIFICATION, base / "text", graphs));
+    check(recipe + ": a text label on an image dir is refused",
+          layout_refused("m", ModelType::CLASSIFICATION, base / "image", graphs));
+    check(recipe + ": a matching label is accepted",
+          !layout_refused("m", ModelType::IMAGE_CLASSIFICATION, base / "image", graphs) &&
+              !layout_refused("m", ModelType::CLASSIFICATION, base / "text", graphs));
+
+    const fs::path two = base / "two";
+    make_text_with(two / "a", graph);
+    make_image(two / "b", graph);
+    check(recipe + ": a text and an image model under one root do not resolve",
+          resolved(ops, two).empty());
+
+    check(recipe + " serves image-classification",
+          lemon::backends::backend_serves_mode(recipe, ModelType::IMAGE_CLASSIFICATION));
+    check(recipe + " accepts the image-classification label",
+          lemon::backends::illegal_deployment_labels({"image-classification"}, recipe).empty());
+    check(recipe + " still defaults to classification",
+          lemon::backends::default_mode_for(recipe) == "classification");
 }
 
 }  // namespace
@@ -141,6 +245,16 @@ int main() {
     make_image(two / "b");
     check("two complete dirs are both found", classifier::find_model_dirs(two, kTflite).size() == 2);
     check("one complete dir is found", classifier::find_model_dirs(root / "image", kTflite).size() == 1);
+
+    check_engine(root, "executorch", "model.pte", kExecutorch, lemon::backends::executorch::ops());
+    check_engine(root, "onnxruntime", "model.ort", kOnnxRuntime, lemon::backends::onnxruntime::ops());
+
+    const fs::path both = root / "onnxruntime" / "image_both_graphs";
+    make_image(both, "model.onnx");
+    write(both / "model.ort", "x");
+    check("onnxruntime: an image dir with model.onnx and model.ort is one model",
+          classifier::find_model_dirs(both, kOnnxRuntime).size() == 1 &&
+              resolved(lemon::backends::onnxruntime::ops(), both) == both);
 
     std::error_code ec;
     fs::remove_all(root, ec);

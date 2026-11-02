@@ -273,6 +273,24 @@ CAPABILITIES = {
                 "image_classification": "user.MobileNetV2-1.0-224-TFLite",
             },
         },
+        "executorch": {
+            "backends": ["system"],
+            "supports": {
+                "image_classify": True,
+            },
+            "test_models": {
+                "image_classification": "user.MobileNetV2-1.0-224-ExecuTorch",
+            },
+        },
+        "onnxruntime": {
+            "backends": ["cpu"],
+            "supports": {
+                "image_classify": True,
+            },
+            "test_models": {
+                "image_classification": "user.MobileNetV2-1.0-224-ONNX",
+            },
+        },
     },
     "tts": {
         "openmoss": {

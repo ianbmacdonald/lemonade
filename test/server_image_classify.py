@@ -1,23 +1,30 @@
 """
 Image-classification tests for Lemonade Server: POST /v1/images/classify with
-the tflite recipe (tflite-server >= 0.2.0 subprocess).
+the tflite (tflite-server >= 0.2.0), executorch (et-server) or onnxruntime
+(ort-server) recipe.
 
 Usage:
     python server_image_classify.py --wrapped-server tflite --backend system \\
         --image-model-dir <dir> --hf-cache <lemond's HF cache dir>
 
-    <dir> is a tflite-server image model directory (model.tflite, labels.txt,
+    --wrapped-server picks the recipe: tflite (the default), executorch or
+    onnxruntime. <dir> is an image model directory for that engine (the graph,
+    model.tflite, model.pte, or model.onnx or model.ort, plus labels.txt and
     manifest.json), such as the one tflite-server's tools/make_image_model_dir.py
     writes for TF MobileNetV2 1.0 224. It is copied into the server's HF cache
-    and registered with a local import as user.MobileNetV2-1.0-224-TFLite, so the
-    server must run on this machine. LEMONADE_TEST_IMAGE_MODEL_DIR and
-    LEMONADE_TEST_HF_CACHE work in place of the flags.
+    and registered with a local import as user.MobileNetV2-1.0-224-<engine>, so
+    the server must run on this machine. LEMONADE_TEST_IMAGE_MODEL_DIR and
+    LEMONADE_TEST_HF_CACHE work in place of the flags. tflite-server and
+    et-server are found on PATH; lemond finds ort-server through its install or
+    `onnxruntime.cpu_bin`, so that check is left to the load.
 
     --fake-backend runs the same suite against test/utils/fake_tflite_server.py
-    installed on the server's PATH as `tflite-server`. It skips the accuracy
-    assertions and enables the crash non-replay test, which needs a backend that
-    crashes on demand; pass --fake-state-dir, the FAKE_TFLITE_STATE_DIR the server
-    was started with.
+    installed on the server's PATH as `tflite-server` or `et-server` (for
+    et-server, started with `--engine et-server`), or set as
+    `onnxruntime.cpu_bin` (started with `--engine ort-server`). It skips the
+    accuracy assertions and enables the crash non-replay test, which needs a
+    backend that crashes on demand; pass --fake-state-dir, the
+    FAKE_TFLITE_STATE_DIR the server was started with.
 
     --short-watchdog says the server was started with
     LEMONADE_BACKEND_WATCHDOG_GRACE_SECONDS=10 and
@@ -27,7 +34,7 @@ Usage:
     --lemond-pid enables the resident-memory assertion on the oversized upload.
 
 Negative tests need no model and run first. Positive tests skip, with the
-reason, when no model directory or no tflite-server is available.
+reason, when no model directory or no engine is available.
 
 The fixture test_image_grace_hopper.jpg is the US Navy portrait of Grace Hopper
 (public domain; sha256 a8ca6d73...7130), as used in the TensorFlow Lite
@@ -59,8 +66,33 @@ from utils.test_models import PORT, TIMEOUT_DEFAULT
 
 TIMEOUT_CLASSIFY = 300
 
-MODEL = "user.MobileNetV2-1.0-224-TFLite"
-TEXT_MODEL = "user.B194-Text-TFLite"
+ENGINES = {
+    "tflite": {
+        "graph": "model.tflite",
+        "binary": "tflite-server",
+        "args": "tflite_args",
+        "model": "user.MobileNetV2-1.0-224-TFLite",
+        "text_model": "user.B194-Text-TFLite",
+    },
+    "executorch": {
+        "graph": "model.pte",
+        "binary": "et-server",
+        "args": "executorch_args",
+        "model": "user.MobileNetV2-1.0-224-ExecuTorch",
+        "text_model": "user.B204-Text-ExecuTorch",
+    },
+    "onnxruntime": {
+        "graph": "model.onnx",
+        "binary": None,
+        "args": "onnxruntime_args",
+        "model": "user.MobileNetV2-1.0-224-ONNX",
+        "text_model": "user.B204-Text-ONNX",
+    },
+}
+RECIPE = "tflite"
+ENGINE = ENGINES[RECIPE]
+MODEL = ENGINE["model"]
+TEXT_MODEL = ENGINE["text_model"]
 POISON_TEXT = "B194-POISON-TEXT"
 HANG_TEXT = "B194-HANG-TEXT"
 FIXTURE = os.path.join(
@@ -98,6 +130,7 @@ def _parse_own_args():
     parser.add_argument("--short-watchdog", action="store_true")
     # lemond was started with onnxruntime.cpu_bin pointing at the fake engine.
     parser.add_argument("--fake-ort", action="store_true")
+    parser.add_argument("--wrapped-server", default="tflite", choices=sorted(ENGINES))
     args, _ = parser.parse_known_args()
     return args
 
@@ -154,7 +187,7 @@ def _raw_request(headers, body=b""):
 def _write_stub_model_dir(path):
     """An image model dir for the fake backend, which never reads the model."""
     os.makedirs(path, exist_ok=True)
-    with open(os.path.join(path, "model.tflite"), "wb") as f:
+    with open(os.path.join(path, ENGINE["graph"]), "wb") as f:
         f.write(b"stub")
     with open(os.path.join(path, "labels.txt"), "w", encoding="utf-8") as f:
         f.write("background\nmilitary uniform\n")
@@ -167,13 +200,17 @@ def _write_stub_text_model_dir(path):
     """A text model dir for the fake backend, which never reads the model."""
     os.makedirs(path, exist_ok=True)
     for name, content in (
-        ("model.tflite", "stub"),
+        (ENGINE["graph"], "stub"),
         ("tokenizer.json", "{}"),
         ("config.json", "{}"),
     ):
         with open(os.path.join(path, name), "w", encoding="utf-8") as f:
             f.write(content)
     return os.path.abspath(path)
+
+
+def _engine_args(value):
+    return {ENGINE["args"]: value}
 
 
 def _line_count(path):
@@ -396,14 +433,14 @@ class ImageClassifyTests(ServerTestBase):
     def _require_model(self):
         if _opts.fake_backend and not _opts.image_model_dir and _opts.hf_cache:
             _opts.image_model_dir = _write_stub_model_dir(
-                os.path.join(_opts.hf_cache, "..", "b169-stub-image-model")
+                os.path.join(_opts.hf_cache, "..", f"b169-stub-image-model-{RECIPE}")
             )
         if not _opts.image_model_dir or not os.path.isdir(_opts.image_model_dir):
             self.skipTest("no --image-model-dir (or LEMONADE_TEST_IMAGE_MODEL_DIR)")
         if not _opts.hf_cache:
             self.skipTest("no --hf-cache (or LEMONADE_TEST_HF_CACHE)")
-        if shutil.which("tflite-server") is None:
-            self.skipTest("tflite-server is not on PATH")
+        if ENGINE["binary"] and shutil.which(ENGINE["binary"]) is None:
+            self.skipTest(f"{ENGINE['binary']} is not on PATH")
         if ImageClassifyTests._registered:
             return
         dest = os.path.join(_opts.hf_cache, "models--" + MODEL[len("user.") :])
@@ -414,7 +451,7 @@ class ImageClassifyTests(ServerTestBase):
             f"{self.base_url}/pull",
             json={
                 "model_name": MODEL,
-                "recipe": "tflite",
+                "recipe": RECIPE,
                 "labels": ["image-classification"],
                 "local_import": True,
             },
@@ -510,7 +547,7 @@ class ImageClassifyTests(ServerTestBase):
     def test_507_backend_400_preserved_for_pixel_cap(self):
         self._require_model()
         unload_model(MODEL)
-        load_model(MODEL, tflite_args="--max-image-pixels 1000")
+        load_model(MODEL, **_engine_args("--max-image-pixels 1000"))
         try:
             response = self._post_form(
                 {"image": ("p.png", _png(64, 64), "image/png")},
@@ -519,38 +556,43 @@ class ImageClassifyTests(ServerTestBase):
             self._assert_status(response, 400, "64x64 PNG over a 1000-pixel cap")
         finally:
             unload_model(MODEL)
-            load_model(MODEL, tflite_args="")
+            load_model(MODEL, **_engine_args(""))
 
     def test_507b_load_refuses_bind_override(self):
-        # tflite_args comes from the request body; --host would put the engine
-        # on the LAN without lemond's API key.
+        # The *_args option comes from the request body; --host would put the
+        # engine on the LAN without lemond's API key.
         self._require_model()
         unload_model(MODEL)
+        refused = ["--host 0.0.0.0", "--host=0.0.0.0"]
+        if RECIPE != "onnxruntime":
+            refused.append("--weight-cache /tmp/x")
         try:
-            for args in ("--host 0.0.0.0", "--host=0.0.0.0", "--weight-cache /tmp/x"):
-                response = load_model(MODEL, tflite_args=args)
+            for args in refused:
+                response = load_model(MODEL, **_engine_args(args))
                 self.assertEqual(response.status_code, 400, args)
                 self.assertEqual(
                     response.json()["error"]["code"], "invalid_backend_args", args
                 )
                 self.assertIn("managed by Lemonade", response.text, args)
         finally:
-            load_model(MODEL, tflite_args="")
+            load_model(MODEL, **_engine_args(""))
 
     def test_507b2_load_refuses_a_nul_spliced_flag(self):
         # The engine's argv ends the first token at the NUL, leaving --host.
         self._require_model()
         unload_model(MODEL)
         try:
-            response = load_model(MODEL, tflite_args="--host\x00x 0.0.0.0")
+            response = load_model(MODEL, **_engine_args("--host\x00x 0.0.0.0"))
             self.assertEqual(response.status_code, 400, response.text[:500])
             self.assertIn("NUL", response.text)
         finally:
-            load_model(MODEL, tflite_args="")
+            load_model(MODEL, **_engine_args(""))
 
     def test_507c_weight_cache_symlink_not_used(self):
         # The engine would write its weight cache through the link, which in an
         # HF snapshot points into the shared blob store.
+        if RECIPE != "tflite":
+            self.skipTest("only tflite-server takes a weight cache from lemond")
         if not _opts.fake_backend or not _opts.fake_state_dir:
             self.skipTest("needs --fake-backend and --fake-state-dir")
         self._require_model()
@@ -725,7 +767,7 @@ class ImageClassifyTests(ServerTestBase):
             f"{self.base_url}/pull",
             json={
                 "model_name": TEXT_MODEL,
-                "recipe": "tflite",
+                "recipe": RECIPE,
                 "labels": ["classification"],
                 "local_import": True,
             },
@@ -744,6 +786,8 @@ class ImageClassifyTests(ServerTestBase):
     def test_511_text_labels_refused_by_fixed_label_model(self):
         self._require_text_model()
         self._assert_status(self._classify_text("hello"), 200, "text classify")
+        if RECIPE == "onnxruntime":
+            self.skipTest("ort-server takes caller labels for zero-shot models")
         response = self._classify_text("hello", labels=["caller-category"])
         self._assert_status(response, 400, "labels sent to a fixed-label model")
 
@@ -909,6 +953,45 @@ class ImageClassifyTests(ServerTestBase):
         self.assertGreaterEqual(response.status_code, 400, response.text[:500])
         self._assert_image_model_resident()
 
+    def test_516_label_and_layout_must_agree(self):
+        # Runs last: loading a third model of a type can evict the first.
+        if not _opts.hf_cache:
+            self.skipTest("no --hf-cache (or LEMONADE_TEST_HF_CACHE)")
+        cases = (
+            ("user.B204-Image-Label-On-Text-Dir", "image-classification", True),
+            ("user.B204-Text-Label-On-Image-Dir", "classification", False),
+        )
+        for name, label, text_dir in cases:
+            dest = os.path.join(_opts.hf_cache, "models--" + name[len("user.") :])
+            if os.path.isdir(dest):
+                shutil.rmtree(dest)
+            if text_dir:
+                _write_stub_text_model_dir(dest)
+            else:
+                _write_stub_model_dir(dest)
+            response = requests.post(
+                f"{self.base_url}/pull",
+                json={
+                    "model_name": name,
+                    "recipe": RECIPE,
+                    "labels": [label],
+                    "local_import": True,
+                },
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(response.status_code, 200, response.text[:500])
+            response = requests.post(
+                f"{self.base_url}/load",
+                json={"model_name": name},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertGreaterEqual(response.status_code, 400, response.text[:500])
+            wanted = "image-classifier" if text_dir else "text-classifier"
+            found = "text-classifier" if text_dir else "image-classifier"
+            self.assertIn(f"needs a {wanted} layout", response.text)
+            self.assertIn(f"is a {found} layout", response.text)
+            print(f"[OK] {label} on a {found} dir refused: {response.status_code}")
+
     def test_513_repeated_text_crashes_pause_the_model(self):
         self._require_model()
         self._require_text_model()
@@ -991,11 +1074,21 @@ class ImageClassifyTests(ServerTestBase):
             {"image": ("big.jpg", image, "image/jpeg")},
             data={"model": MODEL, "top_k": "1"},
         )
-        self._assert_status(response, 200, "12 MiB multipart image")
+        if _opts.fake_backend:
+            self._assert_status(response, 200, "12 MiB multipart image")
+            return
+        # A real decoder refuses the synthetic JPEG; its 400 shows the body
+        # passed lemond's cap and reached the engine.
+        self._assert_status(response, 400, "12 MiB multipart image")
+        self.assertIn("JPEG", response.json()["error"]["message"])
 
 
 if __name__ == "__main__":
     _opts = _parse_own_args()
+    RECIPE = _opts.wrapped_server
+    ENGINE = ENGINES[RECIPE]
+    MODEL = ENGINE["model"]
+    TEXT_MODEL = ENGINE["text_model"]
     run_server_tests(
         ImageClassifyTests,
         "IMAGE CLASSIFICATION TESTS",

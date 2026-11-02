@@ -5,7 +5,9 @@ Stand-in for tflite-server's classification contract, for exercising lemond's
 
 Install it on PATH as `tflite-server` (see server_image_classify.py). It
 accepts the flags lemond passes, answers GET /health with
-task=image-classification, and serves POST /classify/image:
+task=image-classification, and serves POST /classify/image. Started with
+`--engine et-server` or `--engine ort-server` it stands in for those engines
+instead, whose /health reports no task:
 
 - a body containing POISON crashes the process with SIGSEGV, which is how the
   non-replay test proves lemond does not resend a crashing input;
@@ -24,7 +26,7 @@ answering GET /health meanwhile, as a single-threaded engine would, and
 otherwise returns fixed label scores.
 
 A model dir containing FAKE_FAIL_START makes the server exit 3 at startup,
-as an engine that refuses its model does; it also stands in for ort-server.
+as an engine that refuses its model does.
 
 When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
 starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
@@ -93,6 +95,14 @@ def _crash():
     time.sleep(60)
 
 
+def _health(engine, task):
+    if engine == "et-server":
+        return {"status": "ok", "engine": "executorch"}
+    if engine == "ort-server":
+        return {"status": "ok", "version": "0.3.1", "onnxruntime": "fake"}
+    return {"status": "ok", "engine": "fake", "task": task}
+
+
 def make_handler(args, task):
     busy = threading.Lock()
 
@@ -112,16 +122,22 @@ def make_handler(args, task):
             if self.path == "/health":
                 with busy:
                     pass
-                self._send(
-                    200,
-                    {"status": "ok", "engine": "fake", "task": task},
-                )
+                self._send(200, _health(args.engine, task))
             else:
                 self._send(404, {"error": "not found"})
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             if task == "text-classification":
+                if self.path == "/classify/image":
+                    self._send(
+                        400,
+                        {
+                            "error": "this server hosts a text-classification model; "
+                            "POST /classify"
+                        },
+                    )
+                    return
                 if self.path != "/classify":
                     self._send(404, {"error": "not found"})
                     return
@@ -188,6 +204,11 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--weight-cache")
     parser.add_argument("--max-image-pixels", type=int, default=4_000_000)
+    parser.add_argument(
+        "--engine",
+        choices=("tflite-server", "et-server", "ort-server"),
+        default="tflite-server",
+    )
     args, _ = parser.parse_known_args()
 
     def has(name):
@@ -201,7 +222,7 @@ def main():
     elif has("tokenizer.json") and has("config.json"):
         task = "text-classification"
     else:
-        print("tflite-server: fake found no image or text model", file=sys.stderr)
+        print(f"{args.engine}: fake found no image or text model", file=sys.stderr)
         sys.exit(1)
     _log("starts.log", str(os.getpid()))
     _log("args.log", json.dumps(sys.argv[1:]))
