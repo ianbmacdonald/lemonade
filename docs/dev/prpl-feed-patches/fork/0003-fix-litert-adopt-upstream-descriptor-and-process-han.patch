@@ -1,7 +1,7 @@
 From 5a17571cae10e6705f0960c4d17e93fa9e2b514a Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 26 Sep 2026 21:00:03 -0400
-Subject: [PATCH 003/102] fix(litert): adopt upstream descriptor and
+Subject: [PATCH 003/104] fix(litert): adopt upstream descriptor and
  process-handle APIs
 
 supported_modes/default_capabilities replace default_labels/modality,

@@ -1,7 +1,7 @@
 From 3884682508e86a937e8aed914c29a26907fec5f6 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 15:46:28 -0400
-Subject: [PATCH 014/102] fix: harden beacon listener rate limiting and thread
+Subject: [PATCH 014/104] fix: harden beacon listener rate limiting and thread
  start; tighten tests
 
 - Check the per-source bucket before spending a global token, so one noisy

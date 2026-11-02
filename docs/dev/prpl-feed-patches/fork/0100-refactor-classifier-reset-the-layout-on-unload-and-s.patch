@@ -1,7 +1,7 @@
-From 455e92a27e0270fa25981052a0fb87b0abe6d12e Mon Sep 17 00:00:00 2001
+From efb8cea14845aebd06605f63c62137d611fb5bdb Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 16:24:09 -0500
-Subject: [PATCH 100/102] refactor(classifier): reset the layout on unload and
+Subject: [PATCH 100/104] refactor(classifier): reset the layout on unload and
  scope ort's text probe
 
 The three backends now clear the loaded layout in unload(), so the

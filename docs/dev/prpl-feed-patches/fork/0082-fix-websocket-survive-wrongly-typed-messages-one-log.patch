@@ -1,7 +1,7 @@
 From f9d65cee1e5480c63163738db7c7e4b5079e5cb5 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:53:43 -0400
-Subject: [PATCH 082/102] fix(websocket): survive wrongly typed messages, one
+Subject: [PATCH 082/104] fix(websocket): survive wrongly typed messages, one
  log subscription per connection, drop stalled readers
 
 - handle_message caught only json::parse_error. Valid JSON of the wrong shape

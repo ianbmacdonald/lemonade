@@ -1,7 +1,7 @@
 From d03466f802bbcbe3bbba6ad78ad62b9e25d9d67b Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:00:34 -0400
-Subject: [PATCH 067/102] fix(download): treat a 416 resume as complete only on
+Subject: [PATCH 067/104] fix(download): treat a 416 resume as complete only on
  an exact size match
 
 When a resume was answered with 416, a local partial at least as large as

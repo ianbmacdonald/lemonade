@@ -1,7 +1,7 @@
 From 68cc7b81871fc664776c33045a23a23c3d146d0c Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 15:00:34 -0400
-Subject: [PATCH 068/102] fix(pull): pin only a full commit id
+Subject: [PATCH 068/104] fix(pull): pin only a full commit id
 
 A pinned pull accepted any safe snapshot id other than the requested
 name. A mirror that answered a revision with a different ref name would

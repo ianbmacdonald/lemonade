@@ -8,7 +8,7 @@ with `git am --keep-cr` on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 102 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0102). |
+| Series: `fork/` | 104 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0104). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -62,12 +62,33 @@ it reaches the feed through upstream `main` once it merges.
     is not a model. Fix the labels path, or remove the `task` from a text model's
     manifest.
   - `manifest.json` must resolve inside the model directory, or inside its registry
-    repository for a downloaded snapshot. A symlink to a file elsewhere makes the
-    directory not a model, and so does a manifest over 1 MiB or one that is not a JSON
-    object, for text models too.
+    repository for a downloaded snapshot. A symlink to a file elsewhere or one that cannot
+    be resolved makes the directory not a model, and so does a manifest that is not a
+    regular file (a directory, a FIFO), is over 1 MiB or is not a JSON object, for text
+    models too.
+  - lemond logs each such directory once as a WARNING (`Not a model: <dir>: <reason>`),
+    and loading the model fails with the same reason instead of "no servable model
+    directory".
   - A directory below a folder that is only named `snapshots` (not a
     `models--<org>--<name>/snapshots` repository) no longer lets its labels file
     resolve outside the model directory.
+- executorch and onnxruntime image models are probed at load: an engine without
+  `POST /classify/image` is refused with a message naming the release that has the
+  route. et-server needs v0.2.0 or later. lemonade-sdk/ort-server, including the
+  default 0.4.0 download, has no image route, so an onnxruntime image model needs
+  `onnxruntime.cpu_bin` set to an ianbmacdonald/ort-server v0.2.0-musl or later build
+  (the prpl feed's ort-server). tflite keeps its `/health` task check and is not probed.
+
+## Known limitations
+
+- The registry-snapshot exception to manifest and labels confinement is decided from the
+  model directory's path as lemond names it, not its resolved path. A cache root reached
+  through a symlink still works, because the path keeps its `models--<org>--<name>/snapshots`
+  names. A model directory reached through a link that hides those names (say
+  `/models/mine -> <cache>/models--org--name/snapshots/<rev>`) is confined to the
+  directory itself, so its blob-linked manifest and labels are refused and the model is
+  not listed. Resolving the directory first would let any link choose the root, so this
+  stays fail-closed.
 
 ## musl-only patches
 
@@ -109,6 +130,7 @@ generic build fixes that musl just happens to exercise:
 | 0093-0097 | image classification on the executorch (`et-server`) and onnxruntime (`ort-server`) backends: the layout detection and image forward shared with tflite, both descriptors gain `image-classification`, tests and the route spec (B204) |
 | 0098 | executorch lists arm64 Linux CPUs, so its models are not hidden on an arm64 host |
 | 0099-0102 | fixes from the B204 review: `manifest.json` confinement, a failed image declaration is never a text model, the `snapshots` root only for registry repositories, a 502 naming the first image release for an engine without `/classify/image`, wording and test cleanups, and `/v1/classify` naming executorch |
+| 0103-0104 | fixes from the second B204 review round: a reason for every refused model directory (logged once, and in the load error), a non-file `manifest.json` refused, et and ort image loads probed for `/classify/image`, and the manifest rules in the classify route notes |
 
 ## Test values
 

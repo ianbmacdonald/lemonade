@@ -1,7 +1,7 @@
 From 5edd112a48093f3b97b30d92b7cfb6f69543b1a2 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Fri, 9 Oct 2026 03:09:40 -0400
-Subject: [PATCH 050/102] docs: per-client cap needs the receive timeout
+Subject: [PATCH 050/104] docs: per-client cap needs the receive timeout
  alongside it
 
 Assisted-by: claude:opus-5.5
