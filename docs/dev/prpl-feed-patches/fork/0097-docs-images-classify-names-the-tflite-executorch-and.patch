@@ -1,0 +1,146 @@
+From 58be606b283b3071d874022e73f298c6fd77b610 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 08:56:49 -0500
+Subject: [PATCH 97/97] docs: images/classify names the tflite, executorch and
+ onnxruntime recipes
+
+The route spec, and the API reference regenerated from it, said the model
+must use the tflite recipe. It now names all three engines, the graph file
+each one loads, the NCHW layout PyTorch exports declare, and the *_args
+option of each. The label reference and the custom-model guide say the
+same.
+
+Assisted-by: claude:opus-5.5
+---
+ docs/api/lemonade.md                          |  6 ++--
+ docs/api/openai.md                            |  6 ++--
+ docs/guide/configuration/custom-models.md     |  2 +-
+ .../lemonade/inference/images_classify.cpp    | 30 +++++++++++--------
+ 4 files changed, 25 insertions(+), 19 deletions(-)
+
+diff --git a/docs/api/lemonade.md b/docs/api/lemonade.md
+index 42c8bf71f..0257bda62 100644
+--- a/docs/api/lemonade.md
++++ b/docs/api/lemonade.md
+@@ -152,7 +152,7 @@ Some upstream models declare only generic `LABEL_<n>` label names; their model c
+ ## `POST /v1/images/classify`
+ <sub>![Status](https://img.shields.io/badge/status-experimental-orange)</sub>
+ 
+-Classifies one image and returns the top-scoring labels. The model must be labeled `image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` (0.2.0 or newer) subprocess on the CPU. The request is either `multipart/form-data` (the same shape as `/v1/images/edits`) or `application/json`, and only JPEG and PNG are accepted, with EXIF orientation not applied.
++Classifies one image and returns the top-scoring labels. The model must be labeled `image-classification` and use the `tflite`, `executorch` or `onnxruntime` recipe, which runs it on the CPU in a `tflite-server` (0.2.0 or newer), `et-server` or `ort-server` subprocess; all three return the same response. The request is either `multipart/form-data` (the same shape as `/v1/images/edits`) or `application/json`, and only JPEG and PNG are accepted, with EXIF orientation not applied.
+ 
+ Requires `LEMONADE_API_KEY` when it is set.
+ 
+@@ -172,7 +172,7 @@ An image that crashes the backend is never replayed, because replaying it would
+ 
+ ### Model Directory
+ 
+-An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the task and preprocessing:
++An image model directory holds the graph (`model.tflite` for `tflite`, `model.pte` for `executorch`, `model.onnx` or `model.ort` for `onnxruntime`; one float32 image input, one float32 output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the task and preprocessing:
+ 
+ ```json
+ {
+@@ -190,7 +190,7 @@ An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, flo
+ }
+ ```
+ 
+-A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps serving `/v1/classify`. Loading fails with a message naming both layouts when a model's label and its directory disagree, and when the installed `tflite-server` is too old to report the image-classification task. The per-model `tflite_args` option passes flags such as `--max-image-pixels` through to `tflite-server`.
++`"layout": "auto"` (the same as `"NHWC"`) expects an input of `[1, H, W, 3]`; a PyTorch export (`[1, 3, H, W]`), as `et-server` and `ort-server` usually load, sets `"NCHW"`, and an input that does not match the declared layout is refused at load. A text model directory (the graph + `tokenizer.json` + `config.json`) keeps serving `/v1/classify`. Loading fails with a message naming both layouts when a model's label and its directory disagree, and, for `tflite`, when the installed `tflite-server` is too old to report the image-classification task. The per-model `tflite_args`, `executorch_args` or `onnxruntime_args` option passes flags such as `--max-image-pixels` through to the engine.
+ 
+ ### Example
+ 
+diff --git a/docs/api/openai.md b/docs/api/openai.md
+index c2720e68d..564c31775 100644
+--- a/docs/api/openai.md
++++ b/docs/api/openai.md
+@@ -1790,7 +1790,7 @@ labels that name different modes:
+ | `audio-generation` | `/audio/generations` | Text-to-audio generation model (e.g. music, sound effects). |
+ | `classification` | `/classify` | Text classification model. Also accepted as `classifier`. |
+ | `3d` | `/3d/generations` | Text- or image-to-3D mesh generation model. |
+-| `image-classification` | `/images/classify` | Image classification model (image in, ranked labels out), served by the `tflite` recipe. |
++| `image-classification` | `/images/classify` | Image classification model (image in, ranked labels out), served by the `tflite`, `executorch` and `onnxruntime` recipes. |
+ 
+ When a model declares no deployment label at all, it inherits its recipe's
+ default: `chat` for `llamacpp`, `flm`, `ryzenai-llm`, `vllm` and `cloud`,
+@@ -1801,8 +1801,8 @@ Two label sets describe a model that cannot exist, and are refused rather than
+ repaired:
+ 
+ - **A mode the recipe's backend does not serve.** `/classify` is served by
+-  `onnxruntime` and `tflite` (image models use `/images/classify`, served by
+-  `tflite`), so `labels: ["classification"]` on a `llamacpp` model is an
++  `onnxruntime`, `tflite` and `executorch` (image models use `/images/classify`,
++  served by the same three), so `labels: ["classification"]` on a `llamacpp` model is an
+   error; register it as the chat model it is.
+ - **Two different modes.** `labels: ["chat", "embeddings"]` on a `llamacpp` model
+   is an error even though llama.cpp serves both: the subprocess is launched for
+diff --git a/docs/guide/configuration/custom-models.md b/docs/guide/configuration/custom-models.md
+index 279888f5b..e867d105c 100644
+--- a/docs/guide/configuration/custom-models.md
++++ b/docs/guide/configuration/custom-models.md
+@@ -100,7 +100,7 @@ Supported registration flags:
+ | `--source SOURCE` | Remote registry for every checkpoint in this model: <!-- BEGIN GENERATED: remote-registry-tokens -->`huggingface` or `modelscope`<!-- END GENERATED: remote-registry-tokens -->. When omitted, the server's configured `default_model_source` applies. |
+ | `--checkpoint TYPE CHECKPOINT` | Add a checkpoint entry. Repeat for multi-file models such as `main` + `mmproj` or `main` + `vae`. |
+ | `--recipe RECIPE` | Recipe to associate with the new `user.*` model. Common values: <!-- BEGIN GENERATED: recipe-values -->`llamacpp`, `llamacpp-hrx`, `whispercpp`, `moonshine`, `kokoro`, `sd-cpp`, `flm`, `ryzenai-llm`, `vllm`, `thenoise`, `ds4`, `thinksound`, `acestep`, `onnxruntime`, `trellis`, `openmoss`, `litert`, `tflite`, `executorch`, `collection.omni`<!-- END GENERATED: recipe-values -->. |
+-| `--label LABEL` | Add a label to the new model. Repeatable. Valid labels include `audio-generation`, `chat`, `coding`, `dflash`, `embeddings`, `hot`, `image-classification`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `transcription`, `vision`. When no [deployment label](../../api/openai.md#model-labels) is given, the recipe's default is added — `chat` for `llamacpp`, `flm`, `ryzenai-llm` and `vllm`; `transcription` for `whispercpp`; `image` for `sd-cpp`; `classification` for `tflite`, so a `tflite` image classifier needs `--label image-classification`; and so on. |
++| `--label LABEL` | Add a label to the new model. Repeatable. Valid labels include `audio-generation`, `chat`, `coding`, `dflash`, `embeddings`, `hot`, `image-classification`, `mtp`, `reasoning`, `reranking`, `tool-calling`, `transcription`, `vision`. When no [deployment label](../../api/openai.md#model-labels) is given, the recipe's default is added — `chat` for `llamacpp`, `flm`, `ryzenai-llm` and `vllm`; `transcription` for `whispercpp`; `image` for `sd-cpp`; `classification` for `tflite`, `executorch` and `onnxruntime`, so an image classifier on those recipes needs `--label image-classification`; and so on. |
+ | `--components MODEL [MODEL ...]` | Components for an omni collection (see below). Use with `--recipe collection.omni`. |
+ 
+ ### Pull an Omni Collection
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index 070898ba4..cfdd845cb 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -99,10 +99,11 @@ public:
+         s.experimental = true;
+         s.description =
+             "Classifies one image and returns the top-scoring labels. The model must be labeled "
+-            "`image-classification` and use the `tflite` recipe, which runs it in a `tflite-server` "
+-            "(0.2.0 or newer) subprocess on the CPU. The request is either `multipart/form-data` "
+-            "(the same shape as `/v1/images/edits`) or `application/json`, and only JPEG and PNG "
+-            "are accepted, with EXIF orientation not applied.";
++            "`image-classification` and use the `tflite`, `executorch` or `onnxruntime` recipe, "
++            "which runs it on the CPU in a `tflite-server` (0.2.0 or newer), `et-server` or "
++            "`ort-server` subprocess; all three return the same response. The request is either "
++            "`multipart/form-data` (the same shape as `/v1/images/edits`) or `application/json`, "
++            "and only JPEG and PNG are accepted, with EXIF orientation not applied.";
+         s.notes = {
+             "`data` is sorted by descending score and is authoritative. `labels` has the same shape "
+             "as `/v1/classify`, but some label sets repeat names (ImageNet has two `crane` "
+@@ -114,9 +115,10 @@ public:
+             "the restarted backend too: this request fails with `backend_crashed_on_input` and the "
+             "next request restarts the backend.",
+             "### Model Directory\n\n"
+-            "An image model directory holds `model.tflite` (float32 input `[1, H, W, 3]`, float32 "
+-            "output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that declares the "
+-            "task and preprocessing:\n\n"
++            "An image model directory holds the graph (`model.tflite` for `tflite`, `model.pte` for "
++            "`executorch`, `model.onnx` or `model.ort` for `onnxruntime`; one float32 image input, "
++            "one float32 output `[1, N]`), a labels file with `N` lines, and a `manifest.json` that "
++            "declares the task and preprocessing:\n\n"
+             "```json\n"
+             "{\n"
+             "  \"task\": \"image-classification\",\n"
+@@ -132,11 +134,15 @@ public:
+             "  \"top_k_default\": 5\n"
+             "}\n"
+             "```\n\n"
+-            "A text model directory (`model.tflite` + `tokenizer.json` + `config.json`) keeps "
+-            "serving `/v1/classify`. Loading fails with a message naming both layouts when a "
+-            "model's label and its directory disagree, and when the installed `tflite-server` is "
+-            "too old to report the image-classification task. The per-model `tflite_args` option "
+-            "passes flags such as `--max-image-pixels` through to `tflite-server`.",
++            "`\"layout\": \"auto\"` (the same as `\"NHWC\"`) expects an input of `[1, H, W, 3]`; a "
++            "PyTorch export (`[1, 3, H, W]`), as `et-server` and `ort-server` usually load, sets "
++            "`\"NCHW\"`, and an input that does not match the declared layout is refused at load. A text "
++            "model directory (the graph + `tokenizer.json` + `config.json`) keeps serving "
++            "`/v1/classify`. Loading fails with a message naming both layouts when a model's label "
++            "and its directory disagree, and, for `tflite`, when the installed `tflite-server` is "
++            "too old to report the image-classification task. The per-model `tflite_args`, "
++            "`executorch_args` or `onnxruntime_args` option passes flags such as "
++            "`--max-image-pixels` through to the engine.",
+         };
+         s.args = {kModel, kImage, kTopK};
+ 
+-- 
+2.53.0
+

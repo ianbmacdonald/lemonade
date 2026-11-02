@@ -1,13 +1,14 @@
 # lemond prplOS feed patches
 
 `git format-patch` series that turn upstream lemonade into the
-`feed/prpl-lemond-no3956` tree the prplOS feed builds. Apply it with `git am --keep-cr`
-on top of the pinned upstream commit:
+`feed/prpl-lemond-no3956` tree the prplOS feed builds, plus image classification on
+the executorch and onnxruntime backends (`feat/prpl-images-classify-et-ort`). Apply it
+with `git am --keep-cr` on top of the pinned upstream commit:
 
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 92 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), then the fixes from the branch's review (0059-0092). |
+| Series: `fork/` | 97 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0097). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -18,9 +19,9 @@ git am --keep-cr docs/dev/prpl-feed-patches/fork/*.patch
 which has CRLF line endings upstream. `patch -p1` cannot apply the series: 0016 adds a
 binary test image (`test/test_image_grace_hopper.jpg`) as a git binary diff.
 
-The result is byte-identical to `feed/prpl-lemond-no3956` minus this directory and
-`docs/dev/prpl-feed-dependencies.md` (checked by applying the series to a clean
-checkout of the base and diffing). The series builds as a whole; intermediate
+The result is byte-identical to the branch this series is committed on minus this
+directory and `docs/dev/prpl-feed-dependencies.md` (checked by applying the series to a
+clean checkout of the base and diffing). The series builds as a whole; intermediate
 patches between 0001 and 0052 do not all compile on their own, because the fork
 work was written against the pre-refactor server and is ported to the route-class
 server and refactored model manager by later patches (0011-0051 port each feature
@@ -45,12 +46,19 @@ it reaches the feed through upstream `main` once it merges.
   and litert's `--cache-dir`. A model whose saved options in `recipe_options.json` carry
   one of them fails to load with a 400 `invalid_backend_args` naming the flag; remove
   the flag from the saved options.
+- executorch and onnxruntime model directories are now read the way tflite's are: a
+  `manifest.json` that declares `"task": "image-classification"` makes the directory an
+  image model, served on `/v1/images/classify` when the model is labeled
+  `image-classification`. A text model directory (graph + `tokenizer.json` +
+  `config.json`) whose manifest declares that task used to load as a text classifier;
+  it now fails to load with a message naming both layouts (or, without its labels
+  file, is not found as a model). Remove the `task` from a text model's manifest.
 
 ## musl-only patches
 
 None. Nothing in the series exists only for musl or prplOS: lemond builds for
-prplOS 5.1 musl (x86_64 and aarch64) from upstream sources with toolchain and
-sysroot configuration alone (see `../prpl-feed-dependencies.md`). Two patches are
+the prplWare 5.2.0 musl base (x86_64 and aarch64_cortex-a53) from upstream sources with
+toolchain and sysroot configuration alone (see `../prpl-feed-dependencies.md`). Two patches are
 generic build fixes that musl just happens to exercise:
 
 - `0053` — `upgradable_http_server.h` called `httplib::detail::shutdown_socket`,
@@ -83,6 +91,7 @@ generic build fixes that musl just happens to exercise:
 | 0088 | the config.json path and the JSON type in the refusal of a mistyped gateway limit |
 | 0089-0091 | the image forward outlasts the watchdog kill, the watchdog reset kind is published in one step, and a failed ort-server start no longer evicts other models |
 | 0092 | a missing ort-server engine no longer evicts other models either |
+| 0093-0097 | image classification on the executorch (`et-server`) and onnxruntime (`ort-server`) backends: the layout detection and image forward shared with tflite, both descriptors gain `image-classification`, tests and the route spec (B204) |
 
 ## Test values
 

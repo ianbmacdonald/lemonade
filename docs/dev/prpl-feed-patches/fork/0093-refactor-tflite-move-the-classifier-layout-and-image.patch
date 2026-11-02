@@ -1,0 +1,888 @@
+From 58a6946b49bce4ac2117877cef9b24d9189de29f Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 08:40:52 -0500
+Subject: [PATCH 93/97] refactor(tflite): move the classifier layout and image
+ forward into a shared helper
+
+The model-directory layout detection (text vs image, manifest and labels
+checks, labels confinement), the label-vs-layout check at load, the
+wrong-route 400s, and the /classify/image multipart forward with its error
+normalization move from the tflite backend into backends/classifier_backend,
+parameterized by the graph file names. tflite's behaviour and messages are
+unchanged; test_tflite_layout becomes test_classifier_layout with the same
+cases.
+
+Assisted-by: claude:opus-5.5
+---
+ CMakeLists.txt                                |  21 +-
+ .../lemon/backends/classifier_backend.h       |  61 +++++
+ .../lemon/backends/tflite/tflite_layout.h     |  25 --
+ .../lemon/backends/tflite/tflite_server.h     |   4 +-
+ .../server/backends/classifier_backend.cpp    | 221 ++++++++++++++++++
+ .../server/backends/tflite/tflite_layout.cpp  | 131 -----------
+ .../server/backends/tflite/tflite_server.cpp  |  91 ++------
+ ..._layout.cpp => test_classifier_layout.cpp} |  54 +++--
+ 8 files changed, 340 insertions(+), 268 deletions(-)
+ create mode 100644 src/cpp/include/lemon/backends/classifier_backend.h
+ delete mode 100644 src/cpp/include/lemon/backends/tflite/tflite_layout.h
+ create mode 100644 src/cpp/server/backends/classifier_backend.cpp
+ delete mode 100644 src/cpp/server/backends/tflite/tflite_layout.cpp
+ rename test/cpp/{test_tflite_layout.cpp => test_classifier_layout.cpp} (70%)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cadbbcbe5..4b3204b57 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1197,6 +1197,7 @@ set(LEMON_BACKEND_DESCRIPTOR_SOURCES
+ set(LEMON_BACKEND_FACTORY_SOURCES
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/backends/backend_registry.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/backends/backend_ops.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/backends/classifier_backend.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/backends/hf_cache_util.cpp)
+ foreach(_backend_entry ${LEMON_BACKENDS})
+     string(REPLACE "|" ";" _backend_parts "${_backend_entry}")
+@@ -2724,23 +2725,23 @@ if(BUILD_TESTING AND EXISTS "${_IMAGE_CLASSIFY_REQUEST_TEST_SRC}")
+     add_cpp_ci_test(ImageClassifyRequestTest CI ON COMMAND test_image_classify_request)
+ endif()
+ 
+-# tflite model-directory layout detection (text vs image classifier).
+-set(_TFLITE_LAYOUT_TEST_SRC
+-    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_tflite_layout.cpp"
++# Classifier model-directory layout detection (text vs image classifier).
++set(_CLASSIFIER_LAYOUT_TEST_SRC
++    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_classifier_layout.cpp"
+ )
+-if(BUILD_TESTING AND EXISTS "${_TFLITE_LAYOUT_TEST_SRC}")
+-    add_executable(test_tflite_layout
+-        test/cpp/test_tflite_layout.cpp
++if(BUILD_TESTING AND EXISTS "${_CLASSIFIER_LAYOUT_TEST_SRC}")
++    add_executable(test_classifier_layout
++        test/cpp/test_classifier_layout.cpp
+     )
+-    target_include_directories(test_tflite_layout PRIVATE
++    target_include_directories(test_classifier_layout PRIVATE
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
+         ${CMAKE_CURRENT_BINARY_DIR}/include
+     )
+-    target_link_libraries(test_tflite_layout PRIVATE lemonade-server-core)
+-    add_dependencies(test_tflite_layout copy_resources)
++    target_link_libraries(test_classifier_layout PRIVATE lemonade-server-core)
++    add_dependencies(test_classifier_layout copy_resources)
+ 
+     include(CTest)
+-    add_cpp_ci_test(TfliteLayoutTest CI ON COMMAND test_tflite_layout)
++    add_cpp_ci_test(ClassifierLayoutTest CI ON COMMAND test_classifier_layout)
+ endif()
+ 
+ set(_DOCS_ENDPOINT_TEST_SRC
+diff --git a/src/cpp/include/lemon/backends/classifier_backend.h b/src/cpp/include/lemon/backends/classifier_backend.h
+new file mode 100644
+index 000000000..8b55d7e87
+--- /dev/null
++++ b/src/cpp/include/lemon/backends/classifier_backend.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include "lemon/model_types.h"
++#include "lemon/utils/http_client.h"
++
++#include <filesystem>
++#include <nlohmann/json.hpp>
++#include <string>
++#include <vector>
++
++namespace lemon {
++namespace backends {
++namespace classifier {
++
++// The model directory layouts shared by the classification engines
++// (tflite-server, et-server, ort-server). `graphs` names the graph files an
++// engine loads (model.tflite; model.pte; model.onnx or model.ort); any one of
++// them counts.
++//
++// Text:  a graph + tokenizer.json + config.json (manifest.json optional).
++// Image: a graph + manifest.json {"task": "image-classification"} + the
++//        labels file the manifest names.
++enum class Layout { None, Text, Image };
++
++// Runs during bulk model listing, so it never throws.
++Layout detect_layout(const std::filesystem::path& dir,
++                     const std::vector<std::string>& graphs) noexcept;
++
++const char* layout_name(Layout layout) noexcept;
++
++// Every directory under root that holds a servable model, sorted; a directory
++// holding several of `graphs` is listed once.
++std::vector<std::filesystem::path> find_model_dirs(const std::filesystem::path& root,
++                                                   const std::vector<std::string>& graphs);
++
++// The layout `type` needs. Throws NonRetryableLoadException naming both
++// layouts when dir holds the other one.
++Layout require_layout(const std::string& model_name, ModelType type,
++                      const std::filesystem::path& dir,
++                      const std::vector<std::string>& graphs);
++
++// The 400 for a request on the route that the loaded layout does not serve.
++nlohmann::json wrong_route_error(Layout loaded);
++
++// The multipart body of the engines' POST /classify/image: the image and top_k
++// (lemond's default 5 when params carry none).
++std::vector<utils::MultipartField> image_classify_fields(const nlohmann::json& params,
++                                                         std::string image_bytes);
++
++// forward_multipart_request nests the engine's status and body under
++// error.details. Lifts the engine's own message, code and status to the top so
++// the client sees "image too large" with its 4xx, not a generic 500.
++nlohmann::json normalize_backend_error(nlohmann::json response);
++
++// Longer than the backend watchdog takes to kill a hung engine (about 105 s
++// with the defaults), so a hang ends in a reset rather than a network error.
++constexpr long kImageForwardTimeoutSeconds = 120;
++
++}  // namespace classifier
++}  // namespace backends
++}  // namespace lemon
+diff --git a/src/cpp/include/lemon/backends/tflite/tflite_layout.h b/src/cpp/include/lemon/backends/tflite/tflite_layout.h
+deleted file mode 100644
+index 83714043b..000000000
+--- a/src/cpp/include/lemon/backends/tflite/tflite_layout.h
++++ /dev/null
+@@ -1,25 +0,0 @@
+-#pragma once
+-
+-#include <filesystem>
+-#include <vector>
+-
+-namespace lemon {
+-namespace backends {
+-namespace tflite {
+-
+-enum class TfliteLayout { None, Text, Image };
+-
+-// Text:  model.tflite + tokenizer.json + config.json (manifest.json optional).
+-// Image: model.tflite + manifest.json {"task": "image-classification"} + the
+-//        labels file the manifest names.
+-// Runs during bulk model listing, so it never throws.
+-TfliteLayout detect_tflite_layout(const std::filesystem::path& dir) noexcept;
+-
+-const char* tflite_layout_name(TfliteLayout layout) noexcept;
+-
+-// Every directory under root that holds a servable model, sorted.
+-std::vector<std::filesystem::path> find_complete_model_dirs(const std::filesystem::path& root);
+-
+-}  // namespace tflite
+-}  // namespace backends
+-}  // namespace lemon
+diff --git a/src/cpp/include/lemon/backends/tflite/tflite_server.h b/src/cpp/include/lemon/backends/tflite/tflite_server.h
+index 1e7cc1a6f..2dadf2379 100644
+--- a/src/cpp/include/lemon/backends/tflite/tflite_server.h
++++ b/src/cpp/include/lemon/backends/tflite/tflite_server.h
+@@ -5,6 +5,7 @@
+ #include "lemon/wrapped_server.h"
+ #include "lemon/server_capabilities.h"
+ #include "lemon/backends/backend_utils.h"
++#include "lemon/backends/classifier_backend.h"
+ #include <string>
+ 
+ namespace lemon {
+@@ -39,8 +40,7 @@ public:
+     json classify_image(const json& params, std::string image_bytes) override;
+ 
+ private:
+-    // The /health "task" the loaded subprocess must report.
+-    std::string expected_task_;
++    classifier::Layout layout_ = classifier::Layout::None;
+ 
+     // Forward a classify request to the subprocess and normalize its response.
+     json forward_classify(const std::string& text, const json& params);
+diff --git a/src/cpp/server/backends/classifier_backend.cpp b/src/cpp/server/backends/classifier_backend.cpp
+new file mode 100644
+index 000000000..687194fe7
+--- /dev/null
++++ b/src/cpp/server/backends/classifier_backend.cpp
+@@ -0,0 +1,221 @@
++#include "lemon/backends/classifier_backend.h"
++
++#include "lemon/backends/hf_cache_util.h"
++#include "lemon/error_types.h"
++#include "lemon/image_classify_request.h"
++#include "lemon/utils/path_utils.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <fstream>
++#include <iterator>
++#include <system_error>
++#include <utility>
++
++namespace fs = std::filesystem;
++using json = nlohmann::json;
++
++namespace lemon {
++namespace backends {
++namespace classifier {
++
++namespace {
++
++constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
++
++// True only for a readable manifest declaring the image-classification task. A
++// text model's optional manifest carries no task, so it falls through to Text.
++bool read_image_manifest(const fs::path& dir, std::string& labels_file) {
++    std::error_code ec;
++    const fs::path manifest = dir / "manifest.json";
++    if (!fs::is_regular_file(manifest, ec) || ec) return false;
++    const auto size = fs::file_size(manifest, ec);
++    if (ec || size > kMaxManifestBytes) return false;
++
++    std::ifstream in(manifest, std::ios::binary);
++    if (!in) return false;
++    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    const json doc = json::parse(text, nullptr, false);
++    if (!doc.is_object()) return false;
++    const auto task = doc.find("task");
++    if (task == doc.end() || !task->is_string() ||
++        task->get<std::string>() != "image-classification") {
++        return false;
++    }
++    labels_file = "labels.txt";
++    const auto labels = doc.find("labels_file");
++    if (labels != doc.end()) {
++        if (!labels->is_string()) return false;
++        labels_file = labels->get<std::string>();
++    }
++    // The labels file must sit in the model dir; a path that climbs out of it
++    // would let a manifest point the backend anywhere on disk.
++    const fs::path rel(labels_file);
++    if (labels_file.empty() || rel.is_absolute() || rel.has_root_path()) return false;
++    for (const auto& part : rel) {
++        if (part == "..") return false;
++    }
++    return true;
++}
++
++// A Hugging Face snapshot links each file into its repository's blobs/, so a
++// labels file may resolve anywhere in that repository; outside a snapshot it
++// must resolve inside the model dir. Checked on the resolved target, since the
++// lexical check in read_image_manifest does not see through symlinks.
++bool labels_file_confined(const fs::path& dir, const std::string& labels_file) {
++    std::error_code ec;
++    const fs::path abs_dir = fs::absolute(dir, ec);
++    if (ec) return false;
++    fs::path root = abs_dir;
++    for (fs::path p = abs_dir; p.has_relative_path(); p = p.parent_path()) {
++        if (p.filename() == "snapshots") {
++            root = p.parent_path();
++            break;
++        }
++    }
++    const fs::path base = fs::canonical(root, ec);
++    if (ec) return false;
++    const fs::path target = fs::canonical(abs_dir / fs::path(labels_file), ec);
++    if (ec) return false;
++    return std::mismatch(base.begin(), base.end(), target.begin(), target.end()).first == base.end();
++}
++
++bool has_graph(const fs::path& dir, const std::vector<std::string>& graphs) {
++    for (const auto& graph : graphs) {
++        std::error_code ec;
++        if (fs::exists(dir / graph, ec) && !ec) return true;
++    }
++    return false;
++}
++
++json invalid_request(const std::string& message) {
++    return json{
++        {"error", {
++            {"message", message},
++            {"type", "invalid_request_error"},
++            {"status_code", 400},
++        }}
++    };
++}
++
++}  // namespace
++
++Layout detect_layout(const fs::path& dir, const std::vector<std::string>& graphs) noexcept {
++    try {
++        std::error_code ec;
++        if (!has_graph(dir, graphs)) return Layout::None;
++
++        std::string labels_file;
++        if (read_image_manifest(dir, labels_file)) {
++            return fs::is_regular_file(dir / fs::path(labels_file), ec) && !ec &&
++                           labels_file_confined(dir, labels_file)
++                       ? Layout::Image
++                       : Layout::None;
++        }
++        // The config is mandatory even when a manifest is present: the manifest
++        // describes the output contract only, and the engine checks the
++        // architecture in config.json against its supported input convention.
++        if (fs::exists(dir / "tokenizer.json", ec) && fs::exists(dir / "config.json", ec)) {
++            return Layout::Text;
++        }
++    } catch (...) {
++    }
++    return Layout::None;
++}
++
++const char* layout_name(Layout layout) noexcept {
++    switch (layout) {
++        case Layout::Text: return "text-classifier";
++        case Layout::Image: return "image-classifier";
++        default: return "unrecognized";
++    }
++}
++
++std::vector<fs::path> find_model_dirs(const fs::path& root, const std::vector<std::string>& graphs) {
++    std::vector<fs::path> dirs;
++    std::error_code ec;
++    fs::recursive_directory_iterator it(root, hf_cache::dir_options(), ec);
++    if (ec) return dirs;
++    for (auto end = fs::recursive_directory_iterator(); it != end; it.increment(ec)) {
++        if (ec) break;
++        if (!it->is_regular_file(ec) || ec) continue;
++        const fs::path name = it->path().filename();
++        const bool is_graph = std::any_of(graphs.begin(), graphs.end(),
++                                          [&name](const std::string& g) { return name == g; });
++        if (is_graph && detect_layout(it->path().parent_path(), graphs) != Layout::None) {
++            dirs.push_back(it->path().parent_path());
++        }
++    }
++    std::sort(dirs.begin(), dirs.end());
++    dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
++    return dirs;
++}
++
++Layout require_layout(const std::string& model_name, ModelType type, const fs::path& dir,
++                      const std::vector<std::string>& graphs) {
++    const Layout wanted = type == ModelType::IMAGE_CLASSIFICATION ? Layout::Image : Layout::Text;
++    const Layout layout = detect_layout(dir, graphs);
++    if (layout != wanted) {
++        throw NonRetryableLoadException(
++            "Model '" + model_name + "' is labeled " + model_type_to_string(type) +
++            " and needs a " + layout_name(wanted) + " layout, but '" +
++            utils::path_to_utf8(dir) + "' is a " + layout_name(layout) + " layout");
++    }
++    return layout;
++}
++
++json wrong_route_error(Layout loaded) {
++    return loaded == Layout::Image
++               ? invalid_request("This is an image-classification model; POST /v1/images/classify")
++               : invalid_request("This is a text-classification model; POST /v1/classify");
++}
++
++std::vector<utils::MultipartField> image_classify_fields(const json& params,
++                                                         std::string image_bytes) {
++    int top_k = 5;
++    if (params.contains("top_k") && params["top_k"].is_number_integer()) {
++        top_k = params["top_k"].get<int>();
++    }
++    std::vector<utils::MultipartField> fields;
++    std::string mime = image_classify::sniff_image_mime(image_bytes);
++    if (mime.empty()) mime = "application/octet-stream";
++    fields.push_back({"image", std::move(image_bytes), "image", std::move(mime)});
++    fields.push_back({"top_k", std::to_string(top_k), "", ""});
++    return fields;
++}
++
++json normalize_backend_error(json response) {
++    if (!response.contains("error") || !response["error"].is_object()) return response;
++    json& err = response["error"];
++    if (!err.contains("details") || !err["details"].is_object()) return response;
++    const json& details = err["details"];
++    if (!details.contains("status_code") || !details["status_code"].is_number_integer()) {
++        return response;
++    }
++    const int status = details["status_code"].get<int>();
++    err["status_code"] = status;
++    if (status >= 400 && status < 500) err["type"] = "invalid_request_error";
++    if (details.contains("response")) {
++        const json& body = details["response"];
++        if (body.is_object() && body.contains("error")) {
++            const json& backend_error = body["error"];
++            if (backend_error.is_string()) {
++                err["message"] = backend_error;
++            } else if (backend_error.is_object()) {
++                if (backend_error.contains("message") && backend_error["message"].is_string()) {
++                    err["message"] = backend_error["message"];
++                }
++                if (backend_error.contains("code") && backend_error["code"].is_string()) {
++                    err["code"] = backend_error["code"];
++                }
++            }
++        } else if (body.is_string() && !body.get<std::string>().empty()) {
++            err["message"] = body;
++        }
++    }
++    return response;
++}
++
++}  // namespace classifier
++}  // namespace backends
++}  // namespace lemon
+diff --git a/src/cpp/server/backends/tflite/tflite_layout.cpp b/src/cpp/server/backends/tflite/tflite_layout.cpp
+deleted file mode 100644
+index c02767c84..000000000
+--- a/src/cpp/server/backends/tflite/tflite_layout.cpp
++++ /dev/null
+@@ -1,131 +0,0 @@
+-#include "lemon/backends/tflite/tflite_layout.h"
+-
+-#include "lemon/backends/hf_cache_util.h"
+-
+-#include <algorithm>
+-#include <cstdint>
+-#include <fstream>
+-#include <iterator>
+-#include <nlohmann/json.hpp>
+-#include <string>
+-#include <system_error>
+-
+-namespace fs = std::filesystem;
+-
+-namespace lemon {
+-namespace backends {
+-namespace tflite {
+-
+-namespace {
+-
+-constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
+-
+-// True only for a readable manifest declaring the image-classification task. A
+-// text model's optional manifest carries no task, so it falls through to Text.
+-bool read_image_manifest(const fs::path& dir, std::string& labels_file) {
+-    std::error_code ec;
+-    const fs::path manifest = dir / "manifest.json";
+-    if (!fs::is_regular_file(manifest, ec) || ec) return false;
+-    const auto size = fs::file_size(manifest, ec);
+-    if (ec || size > kMaxManifestBytes) return false;
+-
+-    std::ifstream in(manifest, std::ios::binary);
+-    if (!in) return false;
+-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+-    const nlohmann::json doc = nlohmann::json::parse(text, nullptr, false);
+-    if (!doc.is_object()) return false;
+-    const auto task = doc.find("task");
+-    if (task == doc.end() || !task->is_string() ||
+-        task->get<std::string>() != "image-classification") {
+-        return false;
+-    }
+-    labels_file = "labels.txt";
+-    const auto labels = doc.find("labels_file");
+-    if (labels != doc.end()) {
+-        if (!labels->is_string()) return false;
+-        labels_file = labels->get<std::string>();
+-    }
+-    // The labels file must sit in the model dir; a path that climbs out of it
+-    // would let a manifest point the backend anywhere on disk.
+-    const fs::path rel(labels_file);
+-    if (labels_file.empty() || rel.is_absolute() || rel.has_root_path()) return false;
+-    for (const auto& part : rel) {
+-        if (part == "..") return false;
+-    }
+-    return true;
+-}
+-
+-// A Hugging Face snapshot links each file into its repository's blobs/, so a
+-// labels file may resolve anywhere in that repository; outside a snapshot it
+-// must resolve inside the model dir. Checked on the resolved target, since the
+-// lexical check in read_image_manifest does not see through symlinks.
+-bool labels_file_confined(const fs::path& dir, const std::string& labels_file) {
+-    std::error_code ec;
+-    const fs::path abs_dir = fs::absolute(dir, ec);
+-    if (ec) return false;
+-    fs::path root = abs_dir;
+-    for (fs::path p = abs_dir; p.has_relative_path(); p = p.parent_path()) {
+-        if (p.filename() == "snapshots") {
+-            root = p.parent_path();
+-            break;
+-        }
+-    }
+-    const fs::path base = fs::canonical(root, ec);
+-    if (ec) return false;
+-    const fs::path target = fs::canonical(abs_dir / fs::path(labels_file), ec);
+-    if (ec) return false;
+-    return std::mismatch(base.begin(), base.end(), target.begin(), target.end()).first == base.end();
+-}
+-
+-}  // namespace
+-
+-TfliteLayout detect_tflite_layout(const fs::path& dir) noexcept {
+-    try {
+-        std::error_code ec;
+-        if (!fs::exists(dir / "model.tflite", ec) || ec) return TfliteLayout::None;
+-
+-        std::string labels_file;
+-        if (read_image_manifest(dir, labels_file)) {
+-            return fs::is_regular_file(dir / fs::path(labels_file), ec) && !ec &&
+-                           labels_file_confined(dir, labels_file)
+-                       ? TfliteLayout::Image
+-                       : TfliteLayout::None;
+-        }
+-        // The config is mandatory even when a manifest is present: the manifest
+-        // describes the output contract only, and the backend checks the
+-        // architecture in config.json against its supported input convention.
+-        if (fs::exists(dir / "tokenizer.json", ec) && fs::exists(dir / "config.json", ec)) {
+-            return TfliteLayout::Text;
+-        }
+-    } catch (...) {
+-    }
+-    return TfliteLayout::None;
+-}
+-
+-const char* tflite_layout_name(TfliteLayout layout) noexcept {
+-    switch (layout) {
+-        case TfliteLayout::Text: return "text-classifier";
+-        case TfliteLayout::Image: return "image-classifier";
+-        default: return "unrecognized";
+-    }
+-}
+-
+-std::vector<fs::path> find_complete_model_dirs(const fs::path& root) {
+-    std::vector<fs::path> dirs;
+-    std::error_code ec;
+-    fs::recursive_directory_iterator it(root, hf_cache::dir_options(), ec);
+-    if (ec) return dirs;
+-    for (auto end = fs::recursive_directory_iterator(); it != end; it.increment(ec)) {
+-        if (ec) break;
+-        if (it->is_regular_file(ec) && !ec && it->path().filename() == "model.tflite" &&
+-            detect_tflite_layout(it->path().parent_path()) != TfliteLayout::None) {
+-            dirs.push_back(it->path().parent_path());
+-        }
+-    }
+-    std::sort(dirs.begin(), dirs.end());
+-    return dirs;
+-}
+-
+-}  // namespace tflite
+-}  // namespace backends
+-}  // namespace lemon
+diff --git a/src/cpp/server/backends/tflite/tflite_server.cpp b/src/cpp/server/backends/tflite/tflite_server.cpp
+index 623f37102..40108cdea 100644
+--- a/src/cpp/server/backends/tflite/tflite_server.cpp
++++ b/src/cpp/server/backends/tflite/tflite_server.cpp
+@@ -1,14 +1,13 @@
+ #include "lemon/backends/tflite/tflite_server.h"
+ #include "lemon/backends/tflite/tflite.h"
+-#include "lemon/backends/tflite/tflite_layout.h"
+ #include "lemon/backends/backend_registry.h"
+ #include "lemon/backends/backend_ops.h"
+ #include "lemon/backends/backend_utils.h"
++#include "lemon/backends/classifier_backend.h"
+ #include "lemon/backends/hf_cache_util.h"
+ #include "lemon/backend_manager.h"
+ #include "lemon/classify_text_limit.h"
+ #include "lemon/error_types.h"
+-#include "lemon/image_classify_request.h"
+ #include "lemon/utils/path_utils.h"
+ #include "lemon/utils/custom_args.h"
+ #include "lemon/utils/http_client.h"
+@@ -27,6 +26,8 @@ namespace lemon {
+ namespace backends {
+ 
+ namespace {
++const std::vector<std::string> kGraphs = {"model.tflite"};
++
+ // Relaunch tflite-server just long enough to read the error it prints before
+ // exiting. It refuses a model (unsupported architecture, bad manifest, corrupt
+ // tokenizer) by writing one "tflite-server: ..." line to stderr and exiting.
+@@ -86,41 +87,6 @@ const char* task_for_type(ModelType type) {
+     return type == ModelType::IMAGE_CLASSIFICATION ? "image-classification"
+                                                    : "text-classification";
+ }
+-
+-// forward_multipart_request nests the backend's status and body under
+-// error.details. Lift the backend's own message, code and status to the top so
+-// the client sees "image too large" with its 4xx, not a generic 500.
+-json normalize_backend_error(json response) {
+-    if (!response.contains("error") || !response["error"].is_object()) return response;
+-    json& err = response["error"];
+-    if (!err.contains("details") || !err["details"].is_object()) return response;
+-    const json& details = err["details"];
+-    if (!details.contains("status_code") || !details["status_code"].is_number_integer()) {
+-        return response;
+-    }
+-    const int status = details["status_code"].get<int>();
+-    err["status_code"] = status;
+-    if (status >= 400 && status < 500) err["type"] = "invalid_request_error";
+-    if (details.contains("response")) {
+-        const json& body = details["response"];
+-        if (body.is_object() && body.contains("error")) {
+-            const json& backend_error = body["error"];
+-            if (backend_error.is_string()) {
+-                err["message"] = backend_error;
+-            } else if (backend_error.is_object()) {
+-                if (backend_error.contains("message") && backend_error["message"].is_string()) {
+-                    err["message"] = backend_error["message"];
+-                }
+-                if (backend_error.contains("code") && backend_error["code"].is_string()) {
+-                    err["code"] = backend_error["code"];
+-                }
+-            }
+-        } else if (body.is_string() && !body.get<std::string>().empty()) {
+-            err["message"] = body;
+-        }
+-    }
+-    return response;
+-}
+ }  // namespace
+ 
+ // The tflite-server subprocess speaks ort-server's HTTP contract:
+@@ -171,7 +137,7 @@ void TfliteServer::load(const std::string& model_name,
+     // to the cache root when resolution is ambiguous, so a complete root that also
+     // contains a nested complete model must still be rejected here — never assume
+     // the resolved path is the only candidate.
+-    auto candidates = tflite::find_complete_model_dirs(path_from_utf8(model_path));
++    auto candidates = classifier::find_model_dirs(path_from_utf8(model_path), kGraphs);
+     if (candidates.empty()) {
+         throw NonRetryableLoadException(
+             "No servable model directory under '" + model_path +
+@@ -192,16 +158,8 @@ void TfliteServer::load(const std::string& model_name,
+     LOG(INFO, "TfliteServer") << "Using model: " << model_path << std::endl;
+ 
+     const bool wants_image = model_info.type == ModelType::IMAGE_CLASSIFICATION;
+-    const tflite::TfliteLayout layout = tflite::detect_tflite_layout(candidates.front());
+-    const tflite::TfliteLayout wanted =
+-        wants_image ? tflite::TfliteLayout::Image : tflite::TfliteLayout::Text;
+-    if (layout != wanted) {
+-        throw NonRetryableLoadException(
+-            "Model '" + model_name + "' is labeled " + model_type_to_string(model_info.type) +
+-            " and needs a " + tflite::tflite_layout_name(wanted) + " layout, but '" +
+-            model_path + "' is a " + tflite::tflite_layout_name(layout) + " layout");
+-    }
+-    expected_task_ = task_for_type(model_info.type);
++    layout_ = classifier::require_layout(model_name, model_info.type, candidates.front(), kGraphs);
++    const std::string expected_task = task_for_type(model_info.type);
+ 
+     std::string executable = BackendUtils::get_backend_binary_path(*tflite::spec(), "system");
+     LOG(INFO, "TfliteServer") << "Using executable: " << executable << std::endl;
+@@ -278,7 +236,7 @@ void TfliteServer::load(const std::string& model_name,
+     if (health.is_object() && health.contains("task") && health["task"].is_string()) {
+         reported_task = health["task"].get<std::string>();
+     }
+-    const bool task_ok = reported_task == expected_task_ ||
++    const bool task_ok = reported_task == expected_task ||
+                          (!wants_image && reported_task == "token-classification");
+     if (!task_ok) {
+         unload();
+@@ -303,14 +261,8 @@ json TfliteServer::forward_classify(const std::string& text, const json& params)
+ }
+ 
+ json TfliteServer::classify(const json& request) {
+-    if (expected_task_ == "image-classification") {
+-        return json{
+-            {"error", {
+-                {"message", "This is an image-classification model; POST /v1/images/classify"},
+-                {"type", "invalid_request_error"},
+-                {"status_code", 400},
+-            }}
+-        };
++    if (layout_ == classifier::Layout::Image) {
++        return classifier::wrong_route_error(layout_);
+     }
+     if (request.contains("labels")) {
+         return json{
+@@ -343,25 +295,12 @@ json TfliteServer::classify(const json& request) {
+ }
+ 
+ json TfliteServer::classify_image(const json& params, std::string image_bytes) {
+-    if (expected_task_ != "image-classification") {
+-        return json{
+-            {"error", {
+-                {"message", "This is a text-classification model; POST /v1/classify"},
+-                {"type", "invalid_request_error"},
+-                {"status_code", 400},
+-            }}
+-        };
+-    }
+-    int top_k = 5;
+-    if (params.contains("top_k") && params["top_k"].is_number_integer()) {
+-        top_k = params["top_k"].get<int>();
++    if (layout_ != classifier::Layout::Image) {
++        return classifier::wrong_route_error(layout_);
+     }
+-    std::vector<utils::MultipartField> fields;
+-    std::string mime = image_classify::sniff_image_mime(image_bytes);
+-    if (mime.empty()) mime = "application/octet-stream";
+-    fields.push_back({"image", std::move(image_bytes), "image", std::move(mime)});
+-    fields.push_back({"top_k", std::to_string(top_k), "", ""});
+-    return normalize_backend_error(forward_multipart_request("/classify/image", fields, 120));
++    return classifier::normalize_backend_error(forward_multipart_request(
++        "/classify/image", classifier::image_classify_fields(params, std::move(image_bytes)),
++        classifier::kImageForwardTimeoutSeconds));
+ }
+ 
+ }  // namespace backends
+@@ -406,7 +345,7 @@ public:
+         if (!hf_cache::exists(dir)) {
+             return "";
+         }
+-        auto candidates = tflite::find_complete_model_dirs(dir);
++        auto candidates = classifier::find_model_dirs(dir, kGraphs);
+         if (candidates.size() != 1) {
+             if (candidates.size() > 1) {
+                 LOG(WARNING, "TfliteServer")
+diff --git a/test/cpp/test_tflite_layout.cpp b/test/cpp/test_classifier_layout.cpp
+similarity index 70%
+rename from test/cpp/test_tflite_layout.cpp
+rename to test/cpp/test_classifier_layout.cpp
+index 9dfd68916..bff84aec9 100644
+--- a/test/cpp/test_tflite_layout.cpp
++++ b/test/cpp/test_classifier_layout.cpp
+@@ -1,23 +1,29 @@
+-// Model-directory layout detection for the tflite backend: which directories
+-// are a text classifier, an image classifier, or neither.
++// Model-directory layout detection for the classification backends: which
++// directories are a text classifier, an image classifier, or neither.
+ 
+-#include "lemon/backends/tflite/tflite_layout.h"
++#include "lemon/backends/classifier_backend.h"
+ 
+ #include <chrono>
+ #include <cstdio>
+ #include <filesystem>
+ #include <fstream>
+ #include <string>
++#include <vector>
+ 
+ namespace fs = std::filesystem;
+-using lemon::backends::tflite::TfliteLayout;
+-using lemon::backends::tflite::detect_tflite_layout;
+-using lemon::backends::tflite::find_complete_model_dirs;
++namespace classifier = lemon::backends::classifier;
++using classifier::Layout;
+ 
+ namespace {
+ 
++const std::vector<std::string> kTflite = {"model.tflite"};
++
+ int failures = 0;
+ 
++Layout tflite_layout(const fs::path& dir) {
++    return classifier::detect_layout(dir, kTflite);
++}
++
+ void check(const std::string& what, bool ok) {
+     std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
+     if (!ok) ++failures;
+@@ -49,48 +55,48 @@ void make_image(const fs::path& dir) {
+ int main() {
+     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+     const fs::path root =
+-        fs::temp_directory_path() / ("lemon_tflite_layout_" + std::to_string(stamp));
++        fs::temp_directory_path() / ("lemon_classifier_layout_" + std::to_string(stamp));
+     fs::create_directories(root);
+ 
+     make_text(root / "text");
+-    check("text layout is Text", detect_tflite_layout(root / "text") == TfliteLayout::Text);
++    check("text layout is Text", tflite_layout(root / "text") == Layout::Text);
+ 
+     make_text(root / "text_manifest");
+     write(root / "text_manifest" / "manifest.json", R"({"task":"text-classification"})");
+     check("text layout with a text manifest is Text",
+-          detect_tflite_layout(root / "text_manifest") == TfliteLayout::Text);
++          tflite_layout(root / "text_manifest") == Layout::Text);
+ 
+     make_image(root / "image");
+     check("image manifest + labels is Image",
+-          detect_tflite_layout(root / "image") == TfliteLayout::Image);
++          tflite_layout(root / "image") == Layout::Image);
+ 
+     write(root / "image_default_labels" / "model.tflite", "x");
+     write(root / "image_default_labels" / "manifest.json", R"({"task":"image-classification"})");
+     write(root / "image_default_labels" / "labels.txt", "a\n");
+     check("labels_file defaults to labels.txt",
+-          detect_tflite_layout(root / "image_default_labels") == TfliteLayout::Image);
++          tflite_layout(root / "image_default_labels") == Layout::Image);
+ 
+     write(root / "image_no_labels" / "model.tflite", "x");
+     write(root / "image_no_labels" / "manifest.json", kImageManifest);
+     check("image manifest with its labels file missing is None",
+-          detect_tflite_layout(root / "image_no_labels") == TfliteLayout::None);
++          tflite_layout(root / "image_no_labels") == Layout::None);
+ 
+     write(root / "image_escape" / "model.tflite", "x");
+     write(root / "image_escape" / "manifest.json",
+           R"({"task":"image-classification","labels_file":"../text/config.json"})");
+     check("labels_file outside the model dir is None",
+-          detect_tflite_layout(root / "image_escape") == TfliteLayout::None);
++          tflite_layout(root / "image_escape") == Layout::None);
+ 
+     write(root / "text_no_tokenizer" / "model.tflite", "x");
+     write(root / "text_no_tokenizer" / "config.json", "{}");
+     check("text layout without a tokenizer is None",
+-          detect_tflite_layout(root / "text_no_tokenizer") == TfliteLayout::None);
++          tflite_layout(root / "text_no_tokenizer") == Layout::None);
+ 
+     write(root / "corrupt" / "model.tflite", "x");
+     write(root / "corrupt" / "manifest.json", "{not json");
+     write(root / "corrupt" / "labels.txt", "a\n");
+     check("corrupt manifest is None without throwing",
+-          detect_tflite_layout(root / "corrupt") == TfliteLayout::None);
++          tflite_layout(root / "corrupt") == Layout::None);
+ 
+     write(root / "huge" / "model.tflite", "x");
+     write(root / "huge" / "labels.txt", "a\n");
+@@ -98,10 +104,10 @@ int main() {
+           std::string(R"({"task":"image-classification","pad":")") +
+               std::string(2 * 1024 * 1024, 'a') + "\"}");
+     check("2 MiB manifest is None without throwing",
+-          detect_tflite_layout(root / "huge") == TfliteLayout::None);
++          tflite_layout(root / "huge") == Layout::None);
+ 
+     check("missing directory is None",
+-          detect_tflite_layout(root / "does_not_exist") == TfliteLayout::None);
++          tflite_layout(root / "does_not_exist") == Layout::None);
+ 
+ #ifndef _WIN32
+     {
+@@ -112,37 +118,37 @@ int main() {
+         write(snap / "manifest.json", kImageManifest);
+         fs::create_symlink("../../blobs/4f1a", snap / "labels.txt");
+         check("labels file linked to its repository's blob is Image",
+-              detect_tflite_layout(snap) == TfliteLayout::Image);
++              tflite_layout(snap) == Layout::Image);
+ 
+         const fs::path escape = repo / "snapshots" / "aaaa";
+         write(escape / "model.tflite", "x");
+         write(escape / "manifest.json", kImageManifest);
+         fs::create_symlink(root / "text" / "config.json", escape / "labels.txt");
+         check("labels file linked outside its repository is None",
+-              detect_tflite_layout(escape) == TfliteLayout::None);
++              tflite_layout(escape) == Layout::None);
+ 
+         const fs::path plain = root / "image_link_escape";
+         write(plain / "model.tflite", "x");
+         write(plain / "manifest.json", kImageManifest);
+         fs::create_symlink(root / "text" / "config.json", plain / "labels.txt");
+         check("labels file linked outside a plain model dir is None",
+-              detect_tflite_layout(plain) == TfliteLayout::None);
++              tflite_layout(plain) == Layout::None);
+     }
+ #endif
+ 
+     const fs::path two = root / "two";
+     make_text(two / "a");
+     make_image(two / "b");
+-    check("two complete dirs are both found", find_complete_model_dirs(two).size() == 2);
+-    check("one complete dir is found", find_complete_model_dirs(root / "image").size() == 1);
++    check("two complete dirs are both found", classifier::find_model_dirs(two, kTflite).size() == 2);
++    check("one complete dir is found", classifier::find_model_dirs(root / "image", kTflite).size() == 1);
+ 
+     std::error_code ec;
+     fs::remove_all(root, ec);
+ 
+     if (failures == 0) {
+-        std::printf("\nAll tflite layout checks passed.\n");
++        std::printf("\nAll classifier layout checks passed.\n");
+         return 0;
+     }
+-    std::printf("\n%d tflite layout check(s) failed.\n", failures);
++    std::printf("\n%d classifier layout check(s) failed.\n", failures);
+     return 1;
+ }
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From 857d86ad78d50667887554436564a03a0fc152f8 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 21:24:00 -0400
-Subject: [PATCH 45/92] feat(beacon): beacon_trusted_relays lets a named relay
+Subject: [PATCH 45/97] feat(beacon): beacon_trusted_relays lets a named relay
  vouch for hosts
 
 A relay that re-sends another host's beacon from its own address was

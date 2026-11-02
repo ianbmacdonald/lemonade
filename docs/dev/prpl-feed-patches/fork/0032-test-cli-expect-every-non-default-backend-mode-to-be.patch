@@ -1,7 +1,7 @@
 From 5b1a22af8acd929b91a1575cc77bd7b4061b3bb8 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 17:46:40 -0400
-Subject: [PATCH 32/92] test(cli): expect every non-default backend mode to be
+Subject: [PATCH 32/97] test(cli): expect every non-default backend mode to be
  a valid pull label (RED)
 
 Assisted-by: claude:opus-5.5

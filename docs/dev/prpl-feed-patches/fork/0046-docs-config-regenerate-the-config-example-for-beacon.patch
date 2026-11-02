@@ -1,7 +1,7 @@
 From dd929433dc7d47786c6d9f465e89bd0f7b45d753 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 21:29:23 -0400
-Subject: [PATCH 46/92] docs(config): regenerate the config example for
+Subject: [PATCH 46/97] docs(config): regenerate the config example for
  beacon_trusted_relays
 
 Assisted-by: claude:opus-5.5
