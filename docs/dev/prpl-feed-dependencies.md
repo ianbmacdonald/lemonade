@@ -1,9 +1,10 @@
 # lemond prplOS feed: build dependencies
 
 This lists every external source the `lemond` and `lemonade` build pulls in when it
-is cross-compiled for prplOS 5.x (musl, x86_64 and aarch64), as the build resolved
-them on branch `feed/prpl-lemond-no3956`, and how to supply each one for an offline
-build (the OpenWrt download step fetches, then the build runs with no network).
+is cross-compiled for the prplWare 5.2.0 base (musl, x86_64 and aarch64_cortex-a53),
+as the build resolved them on branch `feed/prpl-lemond-no3956`, and how to supply each
+one for an offline build (the OpenWrt download step fetches, then the build runs with
+no network).
 
 The build was checked offline: both architectures were configured and built
 inside `unshare -rn` (no network namespace) with the sources below supplied through
@@ -56,7 +57,7 @@ cmake --build build --target lemond lemonade
 
 | Library | Found by | prplOS package | Runtime `NEEDED` | Licence |
 |---|---|---|---|---|
-| libcurl >= 8.5.0 (8.12.1 in prplOS 5.1) | pkg-config `libcurl` | `libcurl` | `libcurl.so.4` | curl |
+| libcurl >= 8.5.0 (8.19.0 in the prplWare 5.2.0 sysroots) | pkg-config `libcurl` | `libcurl` | `libcurl.so.4` | curl |
 | libwebsockets >= 4.3.3 | pkg-config `libwebsockets` | `libwebsockets-openssl` | `libwebsockets.so.19` | MIT |
 | zlib | via libcurl | `zlib` | `libz.so.1` | Zlib |
 | libcap | pkg-config `libcap` | `libcap` | `libcap.so.2` | BSD-3-Clause / GPL-2.0 |
