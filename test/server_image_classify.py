@@ -90,7 +90,7 @@ ENGINES = {
         "binary": None,
         "args": "onnxruntime_args",
         "server": "ort-server",
-        "route_requirement": "lemonade-sdk/ort-server, including the default 0.4.0",
+        "route_requirement": "set onnxruntime.cpu_bin to the absolute path of an ort-server",
         "model": "user.MobileNetV2-1.0-224-ONNX",
         "text_model": "user.B204-Text-ONNX",
     },
@@ -1045,16 +1045,56 @@ class ImageClassifyTests(ServerTestBase):
                 data={"model": name},
             )
             self._assert_status(response, 404, "tflite engine 404 passes through")
+            error = response.json()["error"]
+            self.assertEqual(error["status_code"], 404)
+            self.assertEqual(error["type"], "invalid_request_error")
             return
+        message = self._load_refusal(name)
+        self.assertIn(f"{ENGINE['server']} has no POST /classify/image route", message)
+        self.assertIn(ENGINE["route_requirement"], message)
+
+    def _load_refusal(self, name):
         response = requests.post(
-            f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_DEFAULT
+            f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_CLASSIFY
         )
-        self.assertGreaterEqual(response.status_code, 400, response.text[:500])
+        self.assertEqual(response.status_code, 500, response.text[:500])
+        error = response.json()["error"]
+        self.assertEqual(error["code"], "model_load_error", error)
+        print(f"[OK] {name} load refused: {error['message'][:200]}")
+        return error["message"]
+
+    def _assert_probe_refuses(self, marker, expected):
+        # Only the engine's 4xx refusal of an image request without an image
+        # shows the route exists; anything else must refuse the load.
+        if ENGINE["route_requirement"] is None:
+            self.skipTest("tflite-server is not probed")
+        if not _opts.fake_backend or not _opts.hf_cache:
+            self.skipTest("needs --fake-backend and --hf-cache")
+        name = "user.B204-Probe-" + marker[len("FAKE_PROBE_") :].replace("_", "-")
+        self._stub_image_with_marker(name, marker)
         self.assertIn(
-            f"{ENGINE['server']} has no POST /classify/image route", response.text
+            expected.format(server=ENGINE["server"]), self._load_refusal(name)
         )
-        self.assertIn(ENGINE["route_requirement"], response.text)
-        print(f"[OK] load refused: {response.status_code}")
+
+    _UNCONFIRMED = "{server} did not confirm its POST /classify/image route at load"
+
+    def test_519a_probe_timeout_refuses_the_load(self):
+        self._assert_probe_refuses(
+            "FAKE_PROBE_HANG", self._UNCONFIRMED + ": it did not answer"
+        )
+
+    def test_519b_probe_500_refuses_the_load(self):
+        self._assert_probe_refuses(
+            "FAKE_PROBE_500", self._UNCONFIRMED + ": it answered HTTP 500"
+        )
+
+    def test_519c_probe_crash_refuses_the_load(self):
+        self._assert_probe_refuses("FAKE_PROBE_CRASH", self._UNCONFIRMED)
+
+    def test_519d_probe_404_with_a_body_refuses_the_load(self):
+        self._assert_probe_refuses(
+            "FAKE_PROBE_404_BODY", "{server} has no POST /classify/image route"
+        )
 
     def test_517b_image_route_lost_after_load_is_a_502(self):
         if ENGINE["route_requirement"] is None:

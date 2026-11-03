@@ -226,12 +226,26 @@ void ExecutorchServer::unload() {
 
 // /health carries no task, so an engine without the image route would load and
 // then fail every request. An image request without an image is refused with a
-// 400 by an engine that has the route and with an empty 404 by one that does not.
+// 4xx by an engine that has the route and a 404 by one that does not. Anything
+// else (a 5xx, a timeout, a crash) proves nothing, so the load fails closed.
 void ExecutorchServer::require_image_route_at_load() {
-    if (classifier::is_missing_image_route(forward_request("/classify/image", json::object(), 10))) {
+    const json probe = forward_request("/classify/image", json::object(), 10);
+    if (load_cancelled()) {
         stop_server();
-        throw NonRetryableLoadException(classifier::missing_image_route_message(
-            "et-server", executorch::kImageRouteRequirement));
+        throw NonRetryableLoadException("et-server load cancelled");
+    }
+    std::string outcome;
+    switch (classifier::classify_route_probe(probe, outcome)) {
+        case classifier::RouteProbe::Present:
+            return;
+        case classifier::RouteProbe::Missing:
+            stop_server();
+            throw NonRetryableLoadException(classifier::missing_image_route_message(
+                "et-server", executorch::kImageRouteRequirement));
+        case classifier::RouteProbe::Failed:
+            stop_server();
+            throw NonRetryableLoadException(
+                "et-server did not confirm its POST /classify/image route at load: " + outcome);
     }
 }
 

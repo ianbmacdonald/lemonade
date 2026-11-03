@@ -32,6 +32,11 @@ a release without the image route does. FAKE_IMAGE_ROUTE_GONE does that only
 after its first /classify/image request, which it answers like an engine that
 has the route: a load probe passes and later requests do not.
 
+An image request that carries no image (lemond's load probe) can be made to
+misbehave: FAKE_PROBE_HANG never answers it, FAKE_PROBE_500 answers 500,
+FAKE_PROBE_404_BODY answers a 404 with a JSON body, and FAKE_PROBE_CRASH
+crashes the engine.
+
 When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
 starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
 list to args.log.
@@ -177,6 +182,16 @@ def make_handler(args, task):
                 return
             image_calls.append(self.path)
             image, top_k = _image_part(self, body)
+            if image is None and args.probe_fault:
+                if args.probe_fault == "FAKE_PROBE_HANG":
+                    time.sleep(600)
+                elif args.probe_fault == "FAKE_PROBE_500":
+                    self._send(500, {"error": "probe fault"})
+                elif args.probe_fault == "FAKE_PROBE_404_BODY":
+                    self._send(404, {"error": "no such thing"})
+                else:
+                    _crash()
+                return
             if image is None:
                 self._send(400, {"error": "exactly one image part required"})
                 return
@@ -240,6 +255,19 @@ def main():
         sys.exit(1)
     args.no_image_route = has("FAKE_NO_IMAGE_ROUTE")
     args.image_route_gone = has("FAKE_IMAGE_ROUTE_GONE")
+    args.probe_fault = next(
+        (
+            m
+            for m in (
+                "FAKE_PROBE_HANG",
+                "FAKE_PROBE_500",
+                "FAKE_PROBE_404_BODY",
+                "FAKE_PROBE_CRASH",
+            )
+            if has(m)
+        ),
+        None,
+    )
     _log("starts.log", str(os.getpid()))
     _log("args.log", json.dumps(sys.argv[1:]))
     ThreadingHTTPServer(

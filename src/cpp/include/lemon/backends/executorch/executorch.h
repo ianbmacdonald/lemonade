@@ -21,7 +21,8 @@ inline const std::set<std::string>& reserved_custom_arg_flags() {
 // What an image model needs from et-server: v0.2.0 is the first release with
 // POST /classify/image (src/main.cpp at v0.1.0 has no such route).
 inline constexpr const char* kImageRouteRequirement =
-    "image models need et-server v0.2.0 or later (ianbmacdonald/et-server)";
+    "put an et-server v0.2.0 or later (ianbmacdonald/et-server) on PATH; lemonade does not "
+    "download et-server";
 
 // Serves text classification on /v1/classify through an et-server subprocess,
 // which speaks the same ort-server /classify contract as tflite-server over an

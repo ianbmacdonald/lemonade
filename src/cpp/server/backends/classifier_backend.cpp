@@ -365,23 +365,49 @@ json wrong_route_error(Layout loaded) {
     }
 }
 
+namespace {
+
+int error_status(const json& err) {
+    if (err.contains("status_code") && err["status_code"].is_number_integer()) {
+        return err["status_code"].get<int>();
+    }
+    if (err.contains("details") && err["details"].is_object() &&
+        err["details"].contains("status_code") &&
+        err["details"]["status_code"].is_number_integer()) {
+        return err["details"]["status_code"].get<int>();
+    }
+    return 0;
+}
+
+}  // namespace
+
 bool is_missing_image_route(const json& response) {
     if (!response.contains("error") || !response["error"].is_object()) return false;
     const json& err = response["error"];
-    const json* details = err.contains("details") && err["details"].is_object()
-                              ? &err["details"]
-                              : nullptr;
-    int status = 0;
-    if (err.contains("status_code") && err["status_code"].is_number_integer()) {
-        status = err["status_code"].get<int>();
-    } else if (details && details->contains("status_code") &&
-               (*details)["status_code"].is_number_integer()) {
-        status = (*details)["status_code"].get<int>();
+    if (error_status(err) != 404) return false;
+    if (!err.contains("details") || !err["details"].is_object() ||
+        !err["details"].contains("response")) {
+        return true;
     }
-    if (status != 404) return false;
-    if (!details || !details->contains("response")) return true;
-    const json& body = (*details)["response"];
+    const json& body = err["details"]["response"];
     return body.is_null() || (body.is_string() && body.get<std::string>().empty());
+}
+
+RouteProbe classify_route_probe(const json& response, std::string& outcome) {
+    if (!response.contains("error") || !response["error"].is_object()) {
+        outcome = "it accepted an image request that carried no image";
+        return RouteProbe::Failed;
+    }
+    const json& err = response["error"];
+    const int status = error_status(err);
+    if (status == 404) return RouteProbe::Missing;
+    if (status >= 400 && status < 500) return RouteProbe::Present;
+    const std::string message =
+        err.contains("message") && err["message"].is_string() ? err["message"].get<std::string>()
+                                                               : std::string("no message");
+    outcome = (status > 0 ? "it answered HTTP " + std::to_string(status) : "it did not answer") +
+              " (" + printable(message, kMaxEchoedValueBytes) + ")";
+    return RouteProbe::Failed;
 }
 
 std::string missing_image_route_message(const std::string& binary,

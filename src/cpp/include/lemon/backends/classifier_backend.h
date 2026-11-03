@@ -75,8 +75,15 @@ nlohmann::json normalize_backend_error(nlohmann::json response);
 
 // An engine without a POST /classify/image route answers it with cpp-httplib's
 // default 404, whose body is empty; an engine's own 404 carries one. True for
-// that response, as forward_request or forward_multipart_request return it.
+// that response, as forward_multipart_request returns it. For requests after
+// the load only; the load probe uses classify_route_probe.
 bool is_missing_image_route(const nlohmann::json& response);
+
+// What the load probe (an image request without an image) found. Only a 4xx
+// other than 404 shows the route exists; any 404 means it does not; everything
+// else (2xx, 5xx, a timeout, a crash) is Failed and `outcome` says what happened.
+enum class RouteProbe { Present, Missing, Failed };
+RouteProbe classify_route_probe(const nlohmann::json& response, std::string& outcome);
 
 // The one wording for an engine without the image route, used both when a load
 // probe finds it and when a request does. `requirement` says which engine
