@@ -50,9 +50,9 @@ const RouteError kCrashedOnInput{
     "The backend crashed on this input; the request is not retried, and the next request restarts the backend"};
 const RouteError kImageRouteUnsupported{
     502, "image_classification_unsupported",
-    std::string("The `executorch` or `onnxruntime` engine has no `POST /classify/image` route "
-                "(loading refuses such an engine, so this is the fallback for one replaced "
-                "after the load). For `et-server`: ") +
+    std::string("`et-server` (executorch) or `ort-server` (onnxruntime) has no "
+                "`POST /classify/image` route; loading refuses such an engine, so this is the "
+                "fallback for one replaced after the load. For `et-server`: ") +
         backends::executorch::kImageRouteRequirement + ". For `ort-server`: " +
         backends::onnxruntime::kImageRouteRequirement};
 const RouteError kUnresponsiveOnInput{
@@ -151,8 +151,9 @@ public:
             "`manifest.json` must resolve inside the model directory (or inside its repository for "
             "a downloaded snapshot), be a regular file of at most 1 MiB and hold a JSON object; the "
             "labels file must resolve the same way. A directory whose manifest or labels file "
-            "fails a check is not a model, for text models too: it is left out of the model list "
-            "with a warning in the server log, and loading it fails with the reason. Loading also "
+            "fails a check is not served, for text models too: the model stays registered, loading "
+            "it fails with the reason, and the server log names the directory once in a warning. "
+            "Loading also "
             "fails with a message naming both layouts when a model's label and its directory "
             "disagree; for `tflite`, when the installed `tflite-server` is too old to report the "
             "image-classification task; and for `executorch` and `onnxruntime`, when the engine has "
