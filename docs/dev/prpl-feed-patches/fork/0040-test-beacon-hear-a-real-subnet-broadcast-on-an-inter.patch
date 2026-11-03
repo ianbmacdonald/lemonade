@@ -1,7 +1,7 @@
 From e648824be17287b4d1784f6486c474786ab6e036 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 18:34:00 -0400
-Subject: [PATCH 040/107] test(beacon): hear a real subnet broadcast on an
+Subject: [PATCH 040/109] test(beacon): hear a real subnet broadcast on an
  interface without a configured brd
 
 Adds BeaconListenerNetnsTest (CI OFF, Linux): the socket test re-runs in a

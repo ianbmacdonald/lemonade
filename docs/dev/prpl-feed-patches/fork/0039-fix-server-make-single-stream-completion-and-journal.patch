@@ -1,7 +1,7 @@
 From aca4699f1eac7b9fe2508a3d2dac563cd0978cf4 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Tue, 29 Sep 2026 18:51:03 -0400
-Subject: [PATCH 039/107] fix(server): make single-stream completion and
+Subject: [PATCH 039/109] fix(server): make single-stream completion and
  journal removal durable
 
 Confirmation-round follow-ups on the download path.

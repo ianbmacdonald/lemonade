@@ -1,7 +1,7 @@
-From d2d65ff49b30b68d84f327da734fa7128c86933e Mon Sep 17 00:00:00 2001
+From ed845e54ea589bc07e54f69fc298dc2bb3937a8e Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 08:45:22 -0500
-Subject: [PATCH 094/107] feat(executorch): serve image-classification models
+Subject: [PATCH 094/109] feat(executorch): serve image-classification models
  on /v1/images/classify
 
 et-server serves POST /classify/image with tflite-server's contract for a

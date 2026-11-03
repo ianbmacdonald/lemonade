@@ -1,7 +1,7 @@
 From 4f1edf406ae476feccab77179ff24ae45c765a38 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 18:11:29 -0400
-Subject: [PATCH 075/107] fix(server): bound the upgrade peek and keep client
+Subject: [PATCH 075/109] fix(server): bound the upgrade peek and keep client
  sockets out of children
 
 The front server peeks every accepted connection for a WebSocket upgrade

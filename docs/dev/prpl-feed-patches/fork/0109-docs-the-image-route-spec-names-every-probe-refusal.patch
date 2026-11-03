@@ -1,0 +1,69 @@
+From 7cb807ac55f58bfb6110bf064013bd9723b0dbe4 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 23:44:41 -0500
+Subject: [PATCH 109/109] docs: the image route spec names every probe refusal
+
+The /v1/images/classify note said an executorch or onnxruntime load fails
+only when the engine has no POST /classify/image route; it also fails when
+the probe gets a 2xx, a 5xx, a timeout or a crash. The Inspection comment
+now says what from_files skips: only a dir with no manifest declaring the
+image task and not both tokenizer.json and config.json. The API reference
+is regenerated.
+
+Assisted-by: claude:opus-5.5
+---
+ docs/api/lemonade.md                                        | 2 +-
+ src/cpp/include/lemon/backends/classifier_backend.h         | 6 ++++--
+ .../server/routes/lemonade/inference/images_classify.cpp    | 6 ++++--
+ 3 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/docs/api/lemonade.md b/docs/api/lemonade.md
+index 0c3f7e362..46a2bf4a4 100644
+--- a/docs/api/lemonade.md
++++ b/docs/api/lemonade.md
+@@ -192,7 +192,7 @@ An image model directory holds the graph (`model.tflite` for `tflite`, `model.pt
+ 
+ `"layout": "auto"` (the same as `"NHWC"`) expects an input of `[1, H, W, 3]`; a PyTorch export (`[1, 3, H, W]`), as `et-server` and `ort-server` usually load, sets `"NCHW"`, and an input that does not match the declared layout is refused at load. A text model directory (the graph + `tokenizer.json` + `config.json`, with no `manifest.json` declaring the image-classification task) is served by `/v1/classify`.
+ 
+-`manifest.json` must resolve inside the model directory (or inside its repository for a downloaded snapshot), be a regular file of at most 1 MiB and hold a JSON object; the labels file must resolve the same way. A directory whose manifest or labels file fails a check is not served, for text models too: the model stays registered, loading it fails with the reason, and the server log names the directory once in a warning. Loading also fails with a message naming both layouts when a model's label and its directory disagree; for `tflite`, when the installed `tflite-server` is too old to report the image-classification task; and for `executorch` and `onnxruntime`, when the engine has no `POST /classify/image` route. The per-model `tflite_args`, `executorch_args` or `onnxruntime_args` option passes flags such as `--max-image-pixels` through to the engine.
++`manifest.json` must resolve inside the model directory (or inside its repository for a downloaded snapshot), be a regular file of at most 1 MiB and hold a JSON object; the labels file must resolve the same way. A directory whose manifest or labels file fails a check is not served, for text models too: the model stays registered, loading it fails with the reason, and the server log names the directory once in a warning. Loading also fails with a message naming both layouts when a model's label and its directory disagree; for `tflite`, when the installed `tflite-server` is too old to report the image-classification task; and for `executorch` and `onnxruntime`, when the load probe (an image request without an image) does not confirm the engine's `POST /classify/image` route: the engine has none, or the probe gets a 2xx, a 5xx, a timeout or a crash. The per-model `tflite_args`, `executorch_args` or `onnxruntime_args` option passes flags such as `--max-image-pixels` through to the engine.
+ 
+ ### Example
+ 
+diff --git a/src/cpp/include/lemon/backends/classifier_backend.h b/src/cpp/include/lemon/backends/classifier_backend.h
+index 7e01b7edc..4b3991895 100644
+--- a/src/cpp/include/lemon/backends/classifier_backend.h
++++ b/src/cpp/include/lemon/backends/classifier_backend.h
+@@ -30,8 +30,10 @@ enum class Layout { None, Text, Image };
+ struct Inspection {
+     Layout layout;
+     std::string problem;
+-    // False when the dir merely lacks layout files (a stray or partly downloaded
+-    // graph): that is not logged or listed as a refusal.
++    // False when the only problem is missing layout files: no manifest.json
++    // declaring the image task, and not both tokenizer.json and config.json (a
++    // stray graph, or a text model still downloading). That is not logged or
++    // listed as a refusal; manifest and labels failures are.
+     bool from_files = true;
+ };
+ 
+diff --git a/src/cpp/server/routes/lemonade/inference/images_classify.cpp b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+index ac3487644..ab89393f0 100644
+--- a/src/cpp/server/routes/lemonade/inference/images_classify.cpp
++++ b/src/cpp/server/routes/lemonade/inference/images_classify.cpp
+@@ -156,8 +156,10 @@ public:
+             "Loading also "
+             "fails with a message naming both layouts when a model's label and its directory "
+             "disagree; for `tflite`, when the installed `tflite-server` is too old to report the "
+-            "image-classification task; and for `executorch` and `onnxruntime`, when the engine has "
+-            "no `POST /classify/image` route. The per-model `tflite_args`, "
++            "image-classification task; and for `executorch` and `onnxruntime`, when the load "
++            "probe (an image request without an image) does not confirm the engine's "
++            "`POST /classify/image` route: the engine has none, or the probe gets a 2xx, a 5xx, a "
++            "timeout or a crash. The per-model `tflite_args`, "
+             "`executorch_args` or `onnxruntime_args` option passes flags such as "
+             "`--max-image-pixels` through to the engine.",
+         };
+-- 
+2.53.0
+

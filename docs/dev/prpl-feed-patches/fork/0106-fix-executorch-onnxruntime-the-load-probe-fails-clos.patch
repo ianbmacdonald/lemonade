@@ -1,7 +1,7 @@
-From 420efb9ecebbb6a1c86f79fad41054fdc3218001 Mon Sep 17 00:00:00 2001
+From 904f330e4411dd9feb77b2cd4d622f0f5db1b458 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 22:12:12 -0500
-Subject: [PATCH 106/107] fix(executorch, onnxruntime): the load probe fails
+Subject: [PATCH 106/109] fix(executorch, onnxruntime): the load probe fails
  closed, and say exactly what to install
 
 Review round 3 of B204.

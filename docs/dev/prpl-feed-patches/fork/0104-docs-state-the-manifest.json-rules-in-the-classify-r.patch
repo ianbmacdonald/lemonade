@@ -1,7 +1,7 @@
-From cd78f7c5ac9642b8ba3e2d50835354417c9d38f9 Mon Sep 17 00:00:00 2001
+From 535caa977bb435a0b59099cbb8f2e1ff7f672d0a Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 18:57:26 -0500
-Subject: [PATCH 104/107] docs: state the manifest.json rules in the classify
+Subject: [PATCH 104/109] docs: state the manifest.json rules in the classify
  route notes
 
 The /v1/images/classify and /v1/classify model-directory notes now say

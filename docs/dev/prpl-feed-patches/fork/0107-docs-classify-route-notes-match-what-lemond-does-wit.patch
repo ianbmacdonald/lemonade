@@ -1,7 +1,7 @@
-From 92b52cf9c9eef025aa7ea9570026b186546b3a65 Mon Sep 17 00:00:00 2001
+From 24c8b3d98e6ea9979a10af739e019f3dfaa62c83 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 22:12:12 -0500
-Subject: [PATCH 107/107] docs: classify route notes match what lemond does
+Subject: [PATCH 107/109] docs: classify route notes match what lemond does
  with a refused directory
 
 The notes said a refused model directory is left out of the model list;

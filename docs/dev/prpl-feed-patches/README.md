@@ -8,7 +8,7 @@ with `git am --keep-cr` on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 107 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0107). |
+| Series: `fork/` | 109 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0109). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -83,11 +83,15 @@ it reaches the feed through upstream `main` once it merges.
   v0.2.0-musl or later, the prpl feed's ort-server). A version tag in `cpu_bin` installs
   lemonade-sdk/ort-server and does not work. tflite keeps its `/health` task check and is
   not probed.
-- A refused model's load error lists at most 5 directories (then "and N more") and at
-  most 2 KiB of reasons; echoed manifest values are cut to 120 bytes, and control
-  characters in reasons are escaped, in the error and in the `Not a model:` warning. A
-  graph with no layout files at all (a stray or partly downloaded graph) is not warned
-  about.
+- A refused model's load error always names the first refused directory and its reason,
+  then at most 4 more (then "and N more"), within 2 KiB. Echoed manifest values are cut
+  to 120 bytes on a character boundary, and control characters and bytes that are not
+  valid UTF-8 are escaped as `\xNN`, in the error and in the `Not a model:` warning. A
+  directory whose only problem is missing layout files (no manifest declaring the image
+  task, and not both `tokenizer.json` and `config.json`: a stray graph, or a text model
+  still downloading) is not warned about or listed.
+- The probe also refuses the load when the engine accepts the image-less request (a 2xx),
+  answers 5xx, times out or crashes, with what happened.
 
 ## Known limitations
 
@@ -146,6 +150,7 @@ generic build fixes that musl just happens to exercise:
 | 0099-0102 | fixes from the B204 review: `manifest.json` confinement, a failed image declaration is never a text model, the `snapshots` root only for registry repositories, a 502 naming the first image release for an engine without `/classify/image`, wording and test cleanups, and `/v1/classify` naming executorch |
 | 0103-0104 | fixes from the second B204 review round: a reason for every refused model directory (logged once, and in the load error), a non-file `manifest.json` refused, et and ort image loads probed for `/classify/image`, and the manifest rules in the classify route notes |
 | 0105-0107 | fixes from the third B204 review round: bounded and escaped refusal reasons and no warning for a stray graph, the image-route probe failing closed with exact install remedies, and the route notes matching the behaviour |
+| 0108-0109 | fixes from the fourth B204 review round: load errors stay valid UTF-8 and always name the first refused directory, the probe's reset outcome, and the route spec naming every probe refusal |
 
 ## Test values
 

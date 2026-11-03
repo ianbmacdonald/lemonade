@@ -1,7 +1,7 @@
 From 400c771111fa4fc376942926d0f6538d018e723d Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 19:55:25 -0500
-Subject: [PATCH 092/107] fix(onnxruntime): a missing ort-server engine does
+Subject: [PATCH 092/109] fix(onnxruntime): a missing ort-server engine does
  not evict other models
 
 The install step ran before the start-failure handling, so an engine that

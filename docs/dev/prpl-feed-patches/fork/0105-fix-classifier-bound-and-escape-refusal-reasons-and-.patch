@@ -1,7 +1,7 @@
-From c3c48b2449a0183d723e7bcff3a57a2011222284 Mon Sep 17 00:00:00 2001
+From 63433016c1b487c9832da5f5fd8c76f1d06be07f Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 22:12:12 -0500
-Subject: [PATCH 105/107] fix(classifier): bound and escape refusal reasons,
+Subject: [PATCH 105/109] fix(classifier): bound and escape refusal reasons,
  and skip stray graphs
 
 Review round 3 of B204.

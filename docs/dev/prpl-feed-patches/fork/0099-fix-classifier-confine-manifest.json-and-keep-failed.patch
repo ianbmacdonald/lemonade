@@ -1,7 +1,7 @@
-From 6cfbddde98dc28b628b770c9bdcb0d09679c260f Mon Sep 17 00:00:00 2001
+From 9881f51d70626978659a43a052e29afd35a9ebbf Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 16:23:58 -0500
-Subject: [PATCH 099/107] fix(classifier): confine manifest.json and keep
+Subject: [PATCH 099/109] fix(classifier): confine manifest.json and keep
  failed image declarations out of the text layout
 
 Review round 1 of B204 found three ways the shared layout detector could
