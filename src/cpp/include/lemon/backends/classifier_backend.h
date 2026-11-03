@@ -30,6 +30,9 @@ enum class Layout { None, Text, Image };
 struct Inspection {
     Layout layout;
     std::string problem;
+    // False when the dir merely lacks layout files (a stray or partly downloaded
+    // graph): that is not logged or listed as a refusal.
+    bool from_files = true;
 };
 
 // Runs during bulk model listing, so neither throws.

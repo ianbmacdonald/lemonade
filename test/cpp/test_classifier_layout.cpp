@@ -148,6 +148,8 @@ void check_reasons(const fs::path& base, const std::string& recipe, const std::s
     fs::create_symlink("sub", base / "manifest_link_dir" / "manifest.json");
     check_unservable(recipe + ": a manifest.json linked to a directory, with text files",
                      base / "manifest_link_dir", graphs, ops);
+    reason("a manifest.json linked to a directory", base / "manifest_link_dir",
+           "manifest.json is not a regular file");
 
     make_text_with(base / "manifest_dangling", graph);
     fs::create_symlink("gone.json", base / "manifest_dangling" / "manifest.json");
@@ -156,6 +158,36 @@ void check_reasons(const fs::path& base, const std::string& recipe, const std::s
     reason("a dangling manifest link", base / "manifest_dangling",
            "manifest.json cannot be resolved");
 #endif
+}
+
+// A refusal reaches the log and the client's error body, so it is bounded and
+// carries no raw control characters; a graph with no layout files is not one.
+void check_refusal_bounds(const fs::path& root, const std::string& recipe,
+                          const std::string& graph, const std::vector<std::string>& graphs) {
+    const fs::path base = root / ("bounds-" + recipe);
+
+    const std::string forged = "../\n[Warn] forged " + std::string(500, 'a');
+    make_text_with_manifest(base / "one" / "forged", graph,
+                            nlohmann::json{{"task", "image-classification"},
+                                           {"labels_file", forged}}
+                                .dump());
+    const std::string one = classifier::refused_model_dirs(base / "one", graphs);
+    check(recipe + ": a refusal escapes control characters",
+          one.find('\n', 1) == std::string::npos && one.find("\\x0a") != std::string::npos);
+    check(recipe + ": a refusal cuts an echoed labels_file", one.size() < 400);
+
+    for (int i = 0; i < 7; ++i) {
+        make_text_with_manifest(base / "many" / ("m" + std::to_string(i)), graph, "[]");
+    }
+    const std::string many = classifier::refused_model_dirs(base / "many", graphs);
+    size_t lines = 0;
+    for (const char c : many) lines += c == '\n';
+    check(recipe + ": a refusal lists at most 5 dirs and says how many more",
+          lines == 6 && many.find("and 2 more") != std::string::npos);
+
+    write(base / "stray" / "partial" / graph, "x");
+    check(recipe + ": a graph with no layout files is not listed as a refusal",
+          classifier::refused_model_dirs(base / "stray", graphs).empty());
 }
 
 // Manifest and labels confinement, and image declarations that fail a check
@@ -257,6 +289,7 @@ void check_declarations(const fs::path& root, const std::string& recipe, const s
           to_none.find("has no servable classifier layout") != std::string::npos);
 
     check_reasons(base, recipe, graph, graphs, ops);
+    check_refusal_bounds(root, recipe, graph, graphs);
 }
 
 void check_engine(const fs::path& root, const std::string& recipe, const std::string& graph,

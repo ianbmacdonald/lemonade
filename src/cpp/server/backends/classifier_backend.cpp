@@ -25,6 +25,32 @@ namespace classifier {
 namespace {
 
 constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
+constexpr size_t kMaxEchoedValueBytes = 120;
+constexpr size_t kMaxListedDirs = 5;
+constexpr size_t kMaxRefusalBytes = 2048;
+
+// Manifest values and paths reach the log and the client's error body, so
+// control characters are escaped (no forged log lines) and a value is cut to
+// `max` bytes.
+std::string printable(const std::string& value, size_t max = std::string::npos) {
+    std::string out;
+    for (const char c : value) {
+        if (out.size() >= max) {
+            out += "...";
+            break;
+        }
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7f) {
+            static const char kHex[] = "0123456789abcdef";
+            out += "\\x";
+            out += kHex[u >> 4];
+            out += kHex[u & 0xf];
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
 
 // The registry cache names a repository <prefix><org>--<name>, the prefix being
 // "models--" (Hugging Face) or "modelscope--models--" (ModelScope).
@@ -151,7 +177,8 @@ ImageDeclaration read_image_manifest(const fs::path& dir, std::string& labels_fi
     }
     if (!lexical_ok) {
         problem = "manifest.json declares image-classification, but its labels_file '" +
-                  labels_file + "' is empty, absolute or climbs out of the model directory";
+                  printable(labels_file, kMaxEchoedValueBytes) +
+                  "' is empty, absolute or climbs out of the model directory";
         return ImageDeclaration::Invalid;
     }
     return ImageDeclaration::Valid;
@@ -190,17 +217,17 @@ Inspection inspect_layout(const fs::path& dir, const std::vector<std::string>& g
                 std::string error;
                 switch (resolve_confined(dir, fs::path(labels_file), labels, error)) {
                     case Resolution::Outside:
-                        return {Layout::None, "the labels file '" + labels_file +
+                        return {Layout::None, "the labels file '" + printable(labels_file, kMaxEchoedValueBytes) +
                                                   "' resolves outside the model directory"};
                     case Resolution::Unresolvable:
-                        return {Layout::None, "the labels file '" + labels_file +
+                        return {Layout::None, "the labels file '" + printable(labels_file, kMaxEchoedValueBytes) +
                                                   "' cannot be resolved (" + error + ")"};
                     case Resolution::Inside:
                         break;
                 }
                 if (!fs::is_regular_file(labels, ec) || ec) {
                     return {Layout::None,
-                            "the labels file '" + labels_file + "' is not a regular file"};
+                            "the labels file '" + printable(labels_file, kMaxEchoedValueBytes) + "' is not a regular file"};
                 }
                 return {Layout::Image, ""};
             }
@@ -217,7 +244,8 @@ Inspection inspect_layout(const fs::path& dir, const std::vector<std::string>& g
         }
         return {Layout::None,
                 "it has neither an image-classification manifest.json nor tokenizer.json + "
-                "config.json"};
+                "config.json",
+                /*from_files=*/false};
     } catch (const std::exception& e) {
         return {Layout::None, std::string("it cannot be inspected (") + e.what() + ")"};
     } catch (...) {
@@ -249,8 +277,8 @@ void warn_once(const fs::path& dir, const std::string& problem) {
         std::lock_guard<std::mutex> lock(mutex);
         if (!logged.insert(key).second) return;
     }
-    LOG(WARNING, "Classifier") << "Not a model: " << utils::path_to_utf8(dir) << ": " << problem
-                               << std::endl;
+    LOG(WARNING, "Classifier") << "Not a model: " << printable(utils::path_to_utf8(dir)) << ": "
+                               << printable(problem) << std::endl;
 }
 
 void scan_model_dirs(const fs::path& root, const std::vector<std::string>& graphs,
@@ -270,7 +298,7 @@ void scan_model_dirs(const fs::path& root, const std::vector<std::string>& graph
         const Inspection found = inspect_layout(dir, graphs);
         if (found.layout != Layout::None) {
             if (servable) servable->push_back(dir);
-        } else if (!found.problem.empty()) {
+        } else if (found.from_files && !found.problem.empty()) {
             warn_once(dir, found.problem);
             if (refused) refused->emplace_back(dir, found.problem);
         }
@@ -293,8 +321,16 @@ std::string refused_model_dirs(const fs::path& root, const std::vector<std::stri
     std::sort(refused.begin(), refused.end());
     refused.erase(std::unique(refused.begin(), refused.end()), refused.end());
     std::string out;
+    size_t listed = 0;
     for (const auto& [dir, problem] : refused) {
-        out += "\n  " + utils::path_to_utf8(dir) + ": " + problem;
+        const std::string line =
+            "\n  " + printable(utils::path_to_utf8(dir)) + ": " + printable(problem);
+        if (listed == kMaxListedDirs || out.size() + line.size() > kMaxRefusalBytes) break;
+        out += line;
+        ++listed;
+    }
+    if (listed < refused.size()) {
+        out += "\n  and " + std::to_string(refused.size() - listed) + " more";
     }
     return out;
 }
@@ -308,7 +344,7 @@ Layout require_layout(const std::string& model_name, ModelType type, const fs::p
         const std::string found =
             layout == Layout::None
                 ? "has no servable classifier layout" +
-                      (inspected.problem.empty() ? std::string() : ": " + inspected.problem)
+                      (inspected.problem.empty() ? std::string() : ": " + printable(inspected.problem))
                 : std::string("has the ") + layout_name(layout) + " layout";
         throw NonRetryableLoadException(
             "Model '" + model_name + "' is labeled " + model_type_to_string(type) +
