@@ -264,7 +264,10 @@ void ModelLoader::write_load_error(httplib::Response& res, const std::string& mo
                                    const std::string& message) const {
     json error_response = model_error(model, message);
     res.status = load_error(error_response["error"]["code"].get<std::string>()).status;
-    res.set_content(error_response.dump(), "application/json");
+    // A load error can quote file names; a byte that is not UTF-8 must not
+    // cost the client the whole error body.
+    res.set_content(error_response.dump(-1, ' ', false, json::error_handler_t::replace),
+                    "application/json");
 }
 
 } // namespace lemon

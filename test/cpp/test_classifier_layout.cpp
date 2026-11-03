@@ -185,6 +185,51 @@ void check_refusal_bounds(const fs::path& root, const std::string& recipe,
     check(recipe + ": a refusal lists at most 5 dirs and says how many more",
           lines == 6 && many.find("and 2 more") != std::string::npos);
 
+    // A cut must not split a character, and bytes that are not UTF-8 are
+    // escaped: the reason goes into a JSON error body, whose dump() throws on
+    // invalid UTF-8.
+    auto dumps = [](const std::string& text) {
+        try {
+            (void)nlohmann::json(text).dump();
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    std::string accented = "../";
+    for (int i = 0; i < 100; ++i) accented += "\xc3\xa9";
+    make_text_with_manifest(base / "utf8" / "cut", graph,
+                            nlohmann::json{{"task", "image-classification"},
+                                           {"labels_file", accented}}
+                                .dump());
+    const std::string cut = classifier::refused_model_dirs(base / "utf8", graphs);
+    check(recipe + ": a cut labels_file stays valid UTF-8",
+          dumps(cut) && cut.find("climbs out") != std::string::npos);
+    check(recipe + ": a load error with a cut labels_file stays valid UTF-8",
+          dumps(load_error("m", lemon::ModelType::CLASSIFICATION, base / "utf8" / "cut", graphs)));
+
+#ifndef _WIN32
+    const fs::path raw = base / "raw" / std::string("bad\xff\xfe");
+    make_text_with_manifest(raw, graph, "[]");
+    const std::string escaped = classifier::refused_model_dirs(base / "raw", graphs);
+    check(recipe + ": a directory name that is not UTF-8 is escaped",
+          dumps(escaped) && escaped.find("bad\\xff\\xfe") != std::string::npos);
+#endif
+
+    fs::path deep = base / "deep";
+    for (int i = 0; i < 12; ++i) deep /= std::string(200, static_cast<char>('a' + i));
+    make_text_with_manifest(deep, graph, "[]");
+    const std::string long_one = classifier::refused_model_dirs(base / "deep", graphs);
+    check(recipe + ": a refusal over 2 KiB still names the dir and its reason",
+          long_one.find("not a JSON object") != std::string::npos &&
+              long_one.find("more") == std::string::npos && long_one.size() <= 2048);
+
+    const std::string named =
+        load_error("m\n[Warn] forged", lemon::ModelType::IMAGE_CLASSIFICATION, base / "one" / "forged",
+                   graphs);
+    check(recipe + ": the load error escapes the model name",
+          named.find('\n') == std::string::npos && named.find("m\\x0a") != std::string::npos);
+
     write(base / "stray" / "partial" / graph, "x");
     check(recipe + ": a graph with no layout files is not listed as a refusal",
           classifier::refused_model_dirs(base / "stray", graphs).empty());

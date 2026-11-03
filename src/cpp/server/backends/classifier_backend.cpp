@@ -28,26 +28,65 @@ constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
 constexpr size_t kMaxEchoedValueBytes = 120;
 constexpr size_t kMaxListedDirs = 5;
 constexpr size_t kMaxRefusalBytes = 2048;
+constexpr size_t kMaxListedPathBytes = 512;
+constexpr size_t kMaxListedReasonBytes = 1024;
+// Room kept for the "and N more" line, so the whole list stays within the cap.
+constexpr size_t kMoreSuffixBytes = 32;
 
-// Manifest values and paths reach the log and the client's error body, so
-// control characters are escaped (no forged log lines) and a value is cut to
-// `max` bytes.
+// The length of the well-formed UTF-8 sequence at s[i] (the ranges JSON
+// serialization accepts: no overlongs, surrogates or code points past
+// U+10FFFF), or 0 when the byte there does not start one.
+size_t utf8_sequence_length(const std::string& s, size_t i) {
+    const auto byte = [&s](size_t k) { return static_cast<unsigned char>(s[k]); };
+    const unsigned char lead = byte(i);
+    size_t n = 0;
+    unsigned char lo = 0x80;
+    unsigned char hi = 0xBF;
+    if (lead < 0x80) return 1;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        n = 2;
+    } else if (lead >= 0xE0 && lead <= 0xEF) {
+        n = 3;
+        if (lead == 0xE0) lo = 0xA0;
+        if (lead == 0xED) hi = 0x9F;
+    } else if (lead >= 0xF0 && lead <= 0xF4) {
+        n = 4;
+        if (lead == 0xF0) lo = 0x90;
+        if (lead == 0xF4) hi = 0x8F;
+    } else {
+        return 0;
+    }
+    if (i + n > s.size()) return 0;
+    if (byte(i + 1) < lo || byte(i + 1) > hi) return 0;
+    for (size_t k = 2; k < n; ++k) {
+        if (byte(i + k) < 0x80 || byte(i + k) > 0xBF) return 0;
+    }
+    return n;
+}
+
+// Manifest values and paths reach the log and the client's JSON error body, so
+// control characters and bytes that are not valid UTF-8 are escaped as \xNN
+// (no forged log lines, nothing JSON cannot carry), and a value is cut to at
+// most `max` bytes on a character boundary.
 std::string printable(const std::string& value, size_t max = std::string::npos) {
+    static const char kHex[] = "0123456789abcdef";
     std::string out;
-    for (const char c : value) {
-        if (out.size() >= max) {
+    for (size_t i = 0; i < value.size();) {
+        const size_t n = utf8_sequence_length(value, i);
+        const auto u = static_cast<unsigned char>(value[i]);
+        std::string unit;
+        if (n == 0 || u < 0x20 || u == 0x7f) {
+            unit = {'\\', 'x', kHex[u >> 4], kHex[u & 0xf]};
+            i += 1;
+        } else {
+            unit = value.substr(i, n);
+            i += n;
+        }
+        if (out.size() + unit.size() > max) {
             out += "...";
             break;
         }
-        const auto u = static_cast<unsigned char>(c);
-        if (u < 0x20 || u == 0x7f) {
-            static const char kHex[] = "0123456789abcdef";
-            out += "\\x";
-            out += kHex[u >> 4];
-            out += kHex[u & 0xf];
-        } else {
-            out += c;
-        }
+        out += unit;
     }
     return out;
 }
@@ -323,9 +362,15 @@ std::string refused_model_dirs(const fs::path& root, const std::vector<std::stri
     std::string out;
     size_t listed = 0;
     for (const auto& [dir, problem] : refused) {
-        const std::string line =
-            "\n  " + printable(utils::path_to_utf8(dir)) + ": " + printable(problem);
-        if (listed == kMaxListedDirs || out.size() + line.size() > kMaxRefusalBytes) break;
+        const std::string line = "\n  " +
+                                 printable(utils::path_to_utf8(dir), kMaxListedPathBytes) +
+                                 ": " + printable(problem, kMaxListedReasonBytes);
+        // The first line always fits (its parts are capped), so the error names
+        // at least one directory and its reason.
+        if (listed > 0 && (listed == kMaxListedDirs ||
+                           out.size() + line.size() + kMoreSuffixBytes > kMaxRefusalBytes)) {
+            break;
+        }
         out += line;
         ++listed;
     }
@@ -347,9 +392,10 @@ Layout require_layout(const std::string& model_name, ModelType type, const fs::p
                       (inspected.problem.empty() ? std::string() : ": " + printable(inspected.problem))
                 : std::string("has the ") + layout_name(layout) + " layout";
         throw NonRetryableLoadException(
-            "Model '" + model_name + "' is labeled " + model_type_to_string(type) +
+            "Model '" + printable(model_name, kMaxEchoedValueBytes) + "' is labeled " +
+            model_type_to_string(type) +
             " and needs the " + layout_name(wanted) + " layout, but '" +
-            utils::path_to_utf8(dir) + "' " + found);
+            printable(utils::path_to_utf8(dir), kMaxListedPathBytes) + "' " + found);
     }
     return layout;
 }
@@ -402,6 +448,13 @@ RouteProbe classify_route_probe(const json& response, std::string& outcome) {
     const int status = error_status(err);
     if (status == 404) return RouteProbe::Missing;
     if (status >= 400 && status < 500) return RouteProbe::Present;
+    // The watchdog's own message promises an automatic reload, which a refused
+    // (non-retryable) load does not do.
+    if (err.contains("details") && err["details"].is_object() &&
+        err["details"].value("code", "") == "backend_watchdog_reset") {
+        outcome = "the engine was reset during the probe";
+        return RouteProbe::Failed;
+    }
     const std::string message =
         err.contains("message") && err["message"].is_string() ? err["message"].get<std::string>()
                                                                : std::string("no message");

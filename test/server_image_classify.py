@@ -1091,6 +1091,20 @@ class ImageClassifyTests(ServerTestBase):
     def test_519c_probe_crash_refuses_the_load(self):
         self._assert_probe_refuses("FAKE_PROBE_CRASH", self._UNCONFIRMED)
 
+    def test_519e_probe_2xx_refuses_the_load(self):
+        self._assert_probe_refuses(
+            "FAKE_PROBE_OK",
+            self._UNCONFIRMED + ": it accepted an image request that carried no image",
+        )
+
+    def test_519f_probe_crash_names_no_reload(self):
+        # The watchdog's message promises an automatic reload, which a refused
+        # load does not do; the outcome says the engine was reset instead.
+        self._assert_probe_refuses(
+            "FAKE_PROBE_CRASH",
+            self._UNCONFIRMED + ": the engine was reset during the probe",
+        )
+
     def test_519d_probe_404_with_a_body_refuses_the_load(self):
         self._assert_probe_refuses(
             "FAKE_PROBE_404_BODY", "{server} has no POST /classify/image route"
@@ -1179,6 +1193,48 @@ class ImageClassifyTests(ServerTestBase):
             )
             self.assertIn(reason, response.text, name)
             print(f"[OK] {name} ({label}) refused: {response.status_code}: {reason}")
+
+    def _assert_load_error_body(self, name, writer, expected):
+        # A refusal quotes manifest values and directory names; a character cut
+        # in half or a name that is not UTF-8 must not cost the client the JSON
+        # error body.
+        if not _opts.hf_cache:
+            self.skipTest("no --hf-cache (or LEMONADE_TEST_HF_CACHE)")
+        if os.name == "nt":
+            self.skipTest("needs byte-string file names")
+        response = self._register_stub(name, "classification", writer)
+        self.addCleanup(self._remove_stub, name)
+        self.assertEqual(response.status_code, 200, f"{name}: {response.text[:300]}")
+        self.assertIn(expected, self._load_refusal(name))
+
+    def test_520a_load_error_survives_a_cut_character(self):
+        def writer(dest):
+            _write_stub_text_model_dir(dest)
+            with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {"task": "image-classification", "labels_file": "../" + "é" * 100},
+                    f,
+                    ensure_ascii=False,
+                )
+
+        self._assert_load_error_body(
+            "user.B204-Cut-Labels", writer, "climbs out of the model directory"
+        )
+
+    def test_520b_load_error_survives_a_non_utf8_dir_name(self):
+        def writer(dest):
+            raw = os.path.join(os.fsencode(dest), b"bad\xff\xfe")
+            os.makedirs(raw)
+            for name, content in (
+                (ENGINE["graph"], b"stub"),
+                ("tokenizer.json", b"{}"),
+                ("config.json", b"{}"),
+                ("manifest.json", b"[]"),
+            ):
+                with open(os.path.join(raw, os.fsencode(name)), "wb") as f:
+                    f.write(content)
+
+        self._assert_load_error_body("user.B204-Raw-Dir-Name", writer, "bad\\xff\\xfe")
 
     def test_513_repeated_text_crashes_pause_the_model(self):
         self._require_model()

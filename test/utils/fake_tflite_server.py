@@ -33,7 +33,8 @@ after its first /classify/image request, which it answers like an engine that
 has the route: a load probe passes and later requests do not.
 
 An image request that carries no image (lemond's load probe) can be made to
-misbehave: FAKE_PROBE_HANG never answers it, FAKE_PROBE_500 answers 500,
+misbehave: FAKE_PROBE_OK answers it with 200, FAKE_PROBE_HANG never answers
+it, FAKE_PROBE_500 answers 500,
 FAKE_PROBE_404_BODY answers a 404 with a JSON body, and FAKE_PROBE_CRASH
 crashes the engine.
 
@@ -185,6 +186,8 @@ def make_handler(args, task):
             if image is None and args.probe_fault:
                 if args.probe_fault == "FAKE_PROBE_HANG":
                     time.sleep(600)
+                elif args.probe_fault == "FAKE_PROBE_OK":
+                    self._send(200, {"predictions": [], "labels": {}})
                 elif args.probe_fault == "FAKE_PROBE_500":
                     self._send(500, {"error": "probe fault"})
                 elif args.probe_fault == "FAKE_PROBE_404_BODY":
@@ -259,6 +262,7 @@ def main():
         (
             m
             for m in (
+                "FAKE_PROBE_OK",
                 "FAKE_PROBE_HANG",
                 "FAKE_PROBE_500",
                 "FAKE_PROBE_404_BODY",
