@@ -30,8 +30,10 @@ enum class Layout { None, Text, Image };
 struct Inspection {
     Layout layout;
     std::string problem;
-    // False when the dir merely lacks layout files (a stray or partly downloaded
-    // graph): that is not logged or listed as a refusal.
+    // False when the only problem is missing layout files: no manifest.json
+    // declaring the image task, and not both tokenizer.json and config.json (a
+    // stray graph, or a text model still downloading). That is not logged or
+    // listed as a refusal; manifest and labels failures are.
     bool from_files = true;
 };
 

@@ -156,8 +156,10 @@ public:
             "Loading also "
             "fails with a message naming both layouts when a model's label and its directory "
             "disagree; for `tflite`, when the installed `tflite-server` is too old to report the "
-            "image-classification task; and for `executorch` and `onnxruntime`, when the engine has "
-            "no `POST /classify/image` route. The per-model `tflite_args`, "
+            "image-classification task; and for `executorch` and `onnxruntime`, when the load "
+            "probe (an image request without an image) does not confirm the engine's "
+            "`POST /classify/image` route: the engine has none, or the probe gets a 2xx, a 5xx, a "
+            "timeout or a crash. The per-model `tflite_args`, "
             "`executorch_args` or `onnxruntime_args` option passes flags such as "
             "`--max-image-pixels` through to the engine.",
         };
