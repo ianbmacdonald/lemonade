@@ -1,7 +1,7 @@
 From 291afa9f28a7ab9af2d659b7048074c7c1932fe7 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sat, 31 Oct 2026 01:12:46 -0400
-Subject: [PATCH 052/104] fix: run the litert, tflite and executorch backends
+Subject: [PATCH 052/107] fix: run the litert, tflite and executorch backends
  through start_server
 
 Upstream replaced the raw process-handle API (start_process,

@@ -1,7 +1,7 @@
 From 25067e213daabcffedf6767e96efc51723b60207 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 15:14:04 -0500
-Subject: [PATCH 090/104] fix(watchdog): publish the reset kind before the
+Subject: [PATCH 090/107] fix(watchdog): publish the reset kind before the
  trigger, in one step
 
 The reset kind was stored after watchdog_triggered_, so a concurrent

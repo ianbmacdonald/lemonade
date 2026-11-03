@@ -1,7 +1,7 @@
 From dea7814237542b1683e04653bd323e3bb52accd0 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 01:53:44 -0400
-Subject: [PATCH 084/104] fix(process): Linux backends inherit only stdin,
+Subject: [PATCH 084/107] fix(process): Linux backends inherit only stdin,
  stdout and stderr
 
 httplib accepts without SOCK_CLOEXEC, so a client socket waiting in the worker

@@ -8,7 +8,7 @@ with `git am --keep-cr` on top of the pinned upstream commit:
 | | |
 |---|---|
 | Base | `lemonade-sdk/lemonade` `main` at `b9a4bc2cd`, "fix(gui3): honor saved ctx_size when loading custom models (#4019) (#4020)" (`b9a4bc2cd210a58fd8b0373476148c95ff088ed2`) |
-| Series: `fork/` | 104 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0104). |
+| Series: `fork/` | 107 patches: the ianbmacdonald fork's prpl-demo features, rebased (linearly, merge commits dropped) onto the base (0001-0058), the fixes from the branch's review (0059-0092), then image classification on executorch and onnxruntime (0093-0107). |
 
 ```sh
 git checkout b9a4bc2cd
@@ -72,12 +72,22 @@ it reaches the feed through upstream `main` once it merges.
   - A directory below a folder that is only named `snapshots` (not a
     `models--<org>--<name>/snapshots` repository) no longer lets its labels file
     resolve outside the model directory.
-- executorch and onnxruntime image models are probed at load: an engine without
-  `POST /classify/image` is refused with a message naming the release that has the
-  route. et-server needs v0.2.0 or later. lemonade-sdk/ort-server, including the
-  default 0.4.0 download, has no image route, so an onnxruntime image model needs
-  `onnxruntime.cpu_bin` set to an ianbmacdonald/ort-server v0.2.0-musl or later build
-  (the prpl feed's ort-server). tflite keeps its `/health` task check and is not probed.
+- executorch and onnxruntime image models are probed at load with an image request that
+  carries no image. Only the engine's 4xx refusal (other than 404) lets the load go on: a
+  404 means the engine has no `POST /classify/image` route, and a 5xx, a timeout or a
+  crash during the probe also fails the load, with what happened. For executorch, put an
+  et-server v0.2.0 or later (ianbmacdonald/et-server) on PATH; lemonade does not
+  download et-server. For onnxruntime, lemonade-sdk/ort-server, which lemonade
+  downloads, has no image route: set `onnxruntime.cpu_bin` to the absolute path of an
+  ort-server that serves `/classify/image` (for example ianbmacdonald/ort-server
+  v0.2.0-musl or later, the prpl feed's ort-server). A version tag in `cpu_bin` installs
+  lemonade-sdk/ort-server and does not work. tflite keeps its `/health` task check and is
+  not probed.
+- A refused model's load error lists at most 5 directories (then "and N more") and at
+  most 2 KiB of reasons; echoed manifest values are cut to 120 bytes, and control
+  characters in reasons are escaped, in the error and in the `Not a model:` warning. A
+  graph with no layout files at all (a stray or partly downloaded graph) is not warned
+  about.
 
 ## Known limitations
 
@@ -86,9 +96,13 @@ it reaches the feed through upstream `main` once it merges.
   through a symlink still works, because the path keeps its `models--<org>--<name>/snapshots`
   names. A model directory reached through a link that hides those names (say
   `/models/mine -> <cache>/models--org--name/snapshots/<rev>`) is confined to the
-  directory itself, so its blob-linked manifest and labels are refused and the model is
-  not listed. Resolving the directory first would let any link choose the root, so this
+  directory itself, so its blob-linked manifest and labels are refused and the model fails
+  to load. Resolving the directory first would let any link choose the root, so this
   stays fail-closed.
+- Manifest and labels links are resolved with `std::filesystem::canonical`. onnxruntime
+  also has a Windows row, and on Windows MSVC can refuse a symlink the process has no
+  privilege to follow; such a model directory is refused with "cannot be resolved". It
+  is untested there: nothing in the prpl feed runs on Windows.
 
 ## musl-only patches
 
@@ -131,6 +145,7 @@ generic build fixes that musl just happens to exercise:
 | 0098 | executorch lists arm64 Linux CPUs, so its models are not hidden on an arm64 host |
 | 0099-0102 | fixes from the B204 review: `manifest.json` confinement, a failed image declaration is never a text model, the `snapshots` root only for registry repositories, a 502 naming the first image release for an engine without `/classify/image`, wording and test cleanups, and `/v1/classify` naming executorch |
 | 0103-0104 | fixes from the second B204 review round: a reason for every refused model directory (logged once, and in the load error), a non-file `manifest.json` refused, et and ort image loads probed for `/classify/image`, and the manifest rules in the classify route notes |
+| 0105-0107 | fixes from the third B204 review round: bounded and escaped refusal reasons and no warning for a stray graph, the image-route probe failing closed with exact install remedies, and the route notes matching the behaviour |
 
 ## Test values
 

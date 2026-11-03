@@ -1,7 +1,7 @@
-From 6c695033bea7a509760e36dedde9546ddf6418a0 Mon Sep 17 00:00:00 2001
+From c54a22388197f8f50a9bc08258bf8f632710ef0d Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 08:56:49 -0500
-Subject: [PATCH 097/104] docs: images/classify names the tflite, executorch
+Subject: [PATCH 097/107] docs: images/classify names the tflite, executorch
  and onnxruntime recipes
 
 The route spec, and the API reference regenerated from it, said the model

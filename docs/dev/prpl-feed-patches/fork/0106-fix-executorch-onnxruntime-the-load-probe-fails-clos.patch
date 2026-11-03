@@ -1,0 +1,375 @@
+From 420efb9ecebbb6a1c86f79fad41054fdc3218001 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 22:12:12 -0500
+Subject: [PATCH 106/107] fix(executorch, onnxruntime): the load probe fails
+ closed, and say exactly what to install
+
+Review round 3 of B204.
+
+The image-route probe let the load go ahead on anything but an empty 404:
+a timeout, a transport error, a 5xx, a crash or a watchdog reset during
+the probe all counted as "route present". Now only the engine's 4xx
+refusal of an image request without an image (other than 404) lets the
+load continue. Any 404, whatever its body, means no route. Anything else
+refuses the load (NonRetryable) with what happened, for example "it did
+not answer (Network error: CURL error: Timeout was reached)" or "it
+answered HTTP 500 (...)", and a cancelled load is reported as cancelled.
+The empty-body rule now applies only to the request-time 502 fallback,
+where a bodied 404 passes through.
+
+The remedies now say what works. backend_utils.cpp
+find_external_backend_binary sends a *_bin value that does not look like
+a path to the install flow, and the onnxruntime install repository is
+lemonade-sdk/ort-server, which has no image route. So for ort the text is
+"set onnxruntime.cpu_bin to the absolute path of an ort-server that serves
+/classify/image (for example ianbmacdonald/ort-server v0.2.0-musl or
+later), since a version tag there installs lemonade-sdk/ort-server". For
+et it is "put an et-server v0.2.0 or later on PATH; lemonade does not
+download et-server". The text no longer names the 0.4.0 default.
+
+The fake engine gains FAKE_PROBE_HANG, FAKE_PROBE_500, FAKE_PROBE_404_BODY
+and FAKE_PROBE_CRASH, which misbehave only on an image request without an
+image. test_519a-d check that each one refuses the et and ort load with
+its outcome, and test_517 now pins the exact status and envelope: tflite's
+engine 404 passes through as a 404 invalid_request_error, and et/ort loads
+are refused with 500 model_load_error.
+
+Assisted-by: claude:opus-5.5
+---
+ .../lemon/backends/classifier_backend.h       |  9 +++-
+ .../lemon/backends/executorch/executorch.h    |  3 +-
+ .../lemon/backends/onnxruntime/onnxruntime.h  | 10 ++--
+ .../server/backends/classifier_backend.cpp    | 50 +++++++++++++-----
+ .../backends/executorch/executorch_server.cpp | 22 ++++++--
+ .../onnxruntime/onnxruntime_server.cpp        | 22 ++++++--
+ test/server_image_classify.py                 | 52 ++++++++++++++++---
+ test/utils/fake_tflite_server.py              | 28 ++++++++++
+ 8 files changed, 164 insertions(+), 32 deletions(-)
+
+diff --git a/src/cpp/include/lemon/backends/classifier_backend.h b/src/cpp/include/lemon/backends/classifier_backend.h
+index 777caa985..7e01b7edc 100644
+--- a/src/cpp/include/lemon/backends/classifier_backend.h
++++ b/src/cpp/include/lemon/backends/classifier_backend.h
+@@ -75,9 +75,16 @@ nlohmann::json normalize_backend_error(nlohmann::json response);
+ 
+ // An engine without a POST /classify/image route answers it with cpp-httplib's
+ // default 404, whose body is empty; an engine's own 404 carries one. True for
+-// that response, as forward_request or forward_multipart_request return it.
++// that response, as forward_multipart_request returns it. For requests after
++// the load only; the load probe uses classify_route_probe.
+ bool is_missing_image_route(const nlohmann::json& response);
+ 
++// What the load probe (an image request without an image) found. Only a 4xx
++// other than 404 shows the route exists; any 404 means it does not; everything
++// else (2xx, 5xx, a timeout, a crash) is Failed and `outcome` says what happened.
++enum class RouteProbe { Present, Missing, Failed };
++RouteProbe classify_route_probe(const nlohmann::json& response, std::string& outcome);
++
+ // The one wording for an engine without the image route, used both when a load
+ // probe finds it and when a request does. `requirement` says which engine
+ // release has the route (the descriptor's kImageRouteRequirement).
+diff --git a/src/cpp/include/lemon/backends/executorch/executorch.h b/src/cpp/include/lemon/backends/executorch/executorch.h
+index 93bdd4dd3..d098b529a 100644
+--- a/src/cpp/include/lemon/backends/executorch/executorch.h
++++ b/src/cpp/include/lemon/backends/executorch/executorch.h
+@@ -21,7 +21,8 @@ inline const std::set<std::string>& reserved_custom_arg_flags() {
+ // What an image model needs from et-server: v0.2.0 is the first release with
+ // POST /classify/image (src/main.cpp at v0.1.0 has no such route).
+ inline constexpr const char* kImageRouteRequirement =
+-    "image models need et-server v0.2.0 or later (ianbmacdonald/et-server)";
++    "put an et-server v0.2.0 or later (ianbmacdonald/et-server) on PATH; lemonade does not "
++    "download et-server";
+ 
+ // Serves text classification on /v1/classify through an et-server subprocess,
+ // which speaks the same ort-server /classify contract as tflite-server over an
+diff --git a/src/cpp/include/lemon/backends/onnxruntime/onnxruntime.h b/src/cpp/include/lemon/backends/onnxruntime/onnxruntime.h
+index 54a066561..2ee9da1b4 100644
+--- a/src/cpp/include/lemon/backends/onnxruntime/onnxruntime.h
++++ b/src/cpp/include/lemon/backends/onnxruntime/onnxruntime.h
+@@ -19,11 +19,13 @@ inline const std::set<std::string>& reserved_custom_arg_flags() {
+ 
+ // What an image model needs from ort-server. POST /classify/image exists only in
+ // the ianbmacdonald/ort-server line, from v0.2.0-musl; lemonade-sdk/ort-server,
+-// whose 0.4.0 is the default download, has no such route.
++// which is what lemonade downloads, has no such route. A version tag in cpu_bin
++// installs from lemonade-sdk/ort-server, so only a path works.
+ inline constexpr const char* kImageRouteRequirement =
+-    "lemonade-sdk/ort-server, including the default 0.4.0 download, has no image route; set "
+-    "onnxruntime.cpu_bin to an ort-server that has one (ianbmacdonald/ort-server v0.2.0-musl or "
+-    "later)";
++    "lemonade-sdk/ort-server, which lemonade downloads, has no image route; set "
++    "onnxruntime.cpu_bin to the absolute path of an ort-server that serves /classify/image (for "
++    "example ianbmacdonald/ort-server v0.2.0-musl or later), since a version tag there installs "
++    "lemonade-sdk/ort-server";
+ 
+ // The ONNX Runtime backend descriptor (plain data). A generic ORT model server
+ // (see lemonade-sdk/ort-server); v1 serves text classification for the router's
+diff --git a/src/cpp/server/backends/classifier_backend.cpp b/src/cpp/server/backends/classifier_backend.cpp
+index 096b09203..ff043edf5 100644
+--- a/src/cpp/server/backends/classifier_backend.cpp
++++ b/src/cpp/server/backends/classifier_backend.cpp
+@@ -365,25 +365,51 @@ json wrong_route_error(Layout loaded) {
+     }
+ }
+ 
++namespace {
++
++int error_status(const json& err) {
++    if (err.contains("status_code") && err["status_code"].is_number_integer()) {
++        return err["status_code"].get<int>();
++    }
++    if (err.contains("details") && err["details"].is_object() &&
++        err["details"].contains("status_code") &&
++        err["details"]["status_code"].is_number_integer()) {
++        return err["details"]["status_code"].get<int>();
++    }
++    return 0;
++}
++
++}  // namespace
++
+ bool is_missing_image_route(const json& response) {
+     if (!response.contains("error") || !response["error"].is_object()) return false;
+     const json& err = response["error"];
+-    const json* details = err.contains("details") && err["details"].is_object()
+-                              ? &err["details"]
+-                              : nullptr;
+-    int status = 0;
+-    if (err.contains("status_code") && err["status_code"].is_number_integer()) {
+-        status = err["status_code"].get<int>();
+-    } else if (details && details->contains("status_code") &&
+-               (*details)["status_code"].is_number_integer()) {
+-        status = (*details)["status_code"].get<int>();
++    if (error_status(err) != 404) return false;
++    if (!err.contains("details") || !err["details"].is_object() ||
++        !err["details"].contains("response")) {
++        return true;
+     }
+-    if (status != 404) return false;
+-    if (!details || !details->contains("response")) return true;
+-    const json& body = (*details)["response"];
++    const json& body = err["details"]["response"];
+     return body.is_null() || (body.is_string() && body.get<std::string>().empty());
+ }
+ 
++RouteProbe classify_route_probe(const json& response, std::string& outcome) {
++    if (!response.contains("error") || !response["error"].is_object()) {
++        outcome = "it accepted an image request that carried no image";
++        return RouteProbe::Failed;
++    }
++    const json& err = response["error"];
++    const int status = error_status(err);
++    if (status == 404) return RouteProbe::Missing;
++    if (status >= 400 && status < 500) return RouteProbe::Present;
++    const std::string message =
++        err.contains("message") && err["message"].is_string() ? err["message"].get<std::string>()
++                                                               : std::string("no message");
++    outcome = (status > 0 ? "it answered HTTP " + std::to_string(status) : "it did not answer") +
++              " (" + printable(message, kMaxEchoedValueBytes) + ")";
++    return RouteProbe::Failed;
++}
++
+ std::string missing_image_route_message(const std::string& binary,
+                                         const std::string& requirement) {
+     return binary + " has no POST /classify/image route, so it cannot serve "
+diff --git a/src/cpp/server/backends/executorch/executorch_server.cpp b/src/cpp/server/backends/executorch/executorch_server.cpp
+index df056be50..b8e9e1754 100644
+--- a/src/cpp/server/backends/executorch/executorch_server.cpp
++++ b/src/cpp/server/backends/executorch/executorch_server.cpp
+@@ -226,12 +226,26 @@ void ExecutorchServer::unload() {
+ 
+ // /health carries no task, so an engine without the image route would load and
+ // then fail every request. An image request without an image is refused with a
+-// 400 by an engine that has the route and with an empty 404 by one that does not.
++// 4xx by an engine that has the route and a 404 by one that does not. Anything
++// else (a 5xx, a timeout, a crash) proves nothing, so the load fails closed.
+ void ExecutorchServer::require_image_route_at_load() {
+-    if (classifier::is_missing_image_route(forward_request("/classify/image", json::object(), 10))) {
++    const json probe = forward_request("/classify/image", json::object(), 10);
++    if (load_cancelled()) {
+         stop_server();
+-        throw NonRetryableLoadException(classifier::missing_image_route_message(
+-            "et-server", executorch::kImageRouteRequirement));
++        throw NonRetryableLoadException("et-server load cancelled");
++    }
++    std::string outcome;
++    switch (classifier::classify_route_probe(probe, outcome)) {
++        case classifier::RouteProbe::Present:
++            return;
++        case classifier::RouteProbe::Missing:
++            stop_server();
++            throw NonRetryableLoadException(classifier::missing_image_route_message(
++                "et-server", executorch::kImageRouteRequirement));
++        case classifier::RouteProbe::Failed:
++            stop_server();
++            throw NonRetryableLoadException(
++                "et-server did not confirm its POST /classify/image route at load: " + outcome);
+     }
+ }
+ 
+diff --git a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+index cb96637ee..27843bd12 100644
+--- a/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
++++ b/src/cpp/server/backends/onnxruntime/onnxruntime_server.cpp
+@@ -256,12 +256,26 @@ void OnnxRuntimeServer::load(const std::string& model_name,
+ 
+ // /health carries no task, so an engine without the image route would load and
+ // then fail every request. An image request without an image is refused with a
+-// 400 by an engine that has the route and with an empty 404 by one that does not.
++// 4xx by an engine that has the route and a 404 by one that does not. Anything
++// else (a 5xx, a timeout, a crash) proves nothing, so the load fails closed.
+ void OnnxRuntimeServer::require_image_route_at_load() {
+-    if (classifier::is_missing_image_route(forward_request("/classify/image", json::object(), 10))) {
++    const json probe = forward_request("/classify/image", json::object(), 10);
++    if (load_cancelled()) {
+         stop_server();
+-        throw NonRetryableLoadException(classifier::missing_image_route_message(
+-            "ort-server", onnxruntime::kImageRouteRequirement));
++        throw NonRetryableLoadException("ort-server load cancelled");
++    }
++    std::string outcome;
++    switch (classifier::classify_route_probe(probe, outcome)) {
++        case classifier::RouteProbe::Present:
++            return;
++        case classifier::RouteProbe::Missing:
++            stop_server();
++            throw NonRetryableLoadException(classifier::missing_image_route_message(
++                "ort-server", onnxruntime::kImageRouteRequirement));
++        case classifier::RouteProbe::Failed:
++            stop_server();
++            throw NonRetryableLoadException(
++                "ort-server did not confirm its POST /classify/image route at load: " + outcome);
+     }
+ }
+ 
+diff --git a/test/server_image_classify.py b/test/server_image_classify.py
+index 819a89dff..5743f765d 100644
+--- a/test/server_image_classify.py
++++ b/test/server_image_classify.py
+@@ -90,7 +90,7 @@ ENGINES = {
+         "binary": None,
+         "args": "onnxruntime_args",
+         "server": "ort-server",
+-        "route_requirement": "lemonade-sdk/ort-server, including the default 0.4.0",
++        "route_requirement": "set onnxruntime.cpu_bin to the absolute path of an ort-server",
+         "model": "user.MobileNetV2-1.0-224-ONNX",
+         "text_model": "user.B204-Text-ONNX",
+     },
+@@ -1045,16 +1045,56 @@ class ImageClassifyTests(ServerTestBase):
+                 data={"model": name},
+             )
+             self._assert_status(response, 404, "tflite engine 404 passes through")
++            error = response.json()["error"]
++            self.assertEqual(error["status_code"], 404)
++            self.assertEqual(error["type"], "invalid_request_error")
+             return
++        message = self._load_refusal(name)
++        self.assertIn(f"{ENGINE['server']} has no POST /classify/image route", message)
++        self.assertIn(ENGINE["route_requirement"], message)
++
++    def _load_refusal(self, name):
+         response = requests.post(
+-            f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_DEFAULT
++            f"{self.base_url}/load", json={"model_name": name}, timeout=TIMEOUT_CLASSIFY
+         )
+-        self.assertGreaterEqual(response.status_code, 400, response.text[:500])
++        self.assertEqual(response.status_code, 500, response.text[:500])
++        error = response.json()["error"]
++        self.assertEqual(error["code"], "model_load_error", error)
++        print(f"[OK] {name} load refused: {error['message'][:200]}")
++        return error["message"]
++
++    def _assert_probe_refuses(self, marker, expected):
++        # Only the engine's 4xx refusal of an image request without an image
++        # shows the route exists; anything else must refuse the load.
++        if ENGINE["route_requirement"] is None:
++            self.skipTest("tflite-server is not probed")
++        if not _opts.fake_backend or not _opts.hf_cache:
++            self.skipTest("needs --fake-backend and --hf-cache")
++        name = "user.B204-Probe-" + marker[len("FAKE_PROBE_") :].replace("_", "-")
++        self._stub_image_with_marker(name, marker)
+         self.assertIn(
+-            f"{ENGINE['server']} has no POST /classify/image route", response.text
++            expected.format(server=ENGINE["server"]), self._load_refusal(name)
++        )
++
++    _UNCONFIRMED = "{server} did not confirm its POST /classify/image route at load"
++
++    def test_519a_probe_timeout_refuses_the_load(self):
++        self._assert_probe_refuses(
++            "FAKE_PROBE_HANG", self._UNCONFIRMED + ": it did not answer"
++        )
++
++    def test_519b_probe_500_refuses_the_load(self):
++        self._assert_probe_refuses(
++            "FAKE_PROBE_500", self._UNCONFIRMED + ": it answered HTTP 500"
++        )
++
++    def test_519c_probe_crash_refuses_the_load(self):
++        self._assert_probe_refuses("FAKE_PROBE_CRASH", self._UNCONFIRMED)
++
++    def test_519d_probe_404_with_a_body_refuses_the_load(self):
++        self._assert_probe_refuses(
++            "FAKE_PROBE_404_BODY", "{server} has no POST /classify/image route"
+         )
+-        self.assertIn(ENGINE["route_requirement"], response.text)
+-        print(f"[OK] load refused: {response.status_code}")
+ 
+     def test_517b_image_route_lost_after_load_is_a_502(self):
+         if ENGINE["route_requirement"] is None:
+diff --git a/test/utils/fake_tflite_server.py b/test/utils/fake_tflite_server.py
+index 349cbc130..67e1ecea7 100644
+--- a/test/utils/fake_tflite_server.py
++++ b/test/utils/fake_tflite_server.py
+@@ -32,6 +32,11 @@ a release without the image route does. FAKE_IMAGE_ROUTE_GONE does that only
+ after its first /classify/image request, which it answers like an engine that
+ has the route: a load probe passes and later requests do not.
+ 
++An image request that carries no image (lemond's load probe) can be made to
++misbehave: FAKE_PROBE_HANG never answers it, FAKE_PROBE_500 answers 500,
++FAKE_PROBE_404_BODY answers a 404 with a JSON body, and FAKE_PROBE_CRASH
++crashes the engine.
++
+ When FAKE_TFLITE_STATE_DIR is set, each start, crash and hang appends a line to
+ starts.log / crashes.log / hangs.log there, and each start writes its arguments as a JSON
+ list to args.log.
+@@ -177,6 +182,16 @@ def make_handler(args, task):
+                 return
+             image_calls.append(self.path)
+             image, top_k = _image_part(self, body)
++            if image is None and args.probe_fault:
++                if args.probe_fault == "FAKE_PROBE_HANG":
++                    time.sleep(600)
++                elif args.probe_fault == "FAKE_PROBE_500":
++                    self._send(500, {"error": "probe fault"})
++                elif args.probe_fault == "FAKE_PROBE_404_BODY":
++                    self._send(404, {"error": "no such thing"})
++                else:
++                    _crash()
++                return
+             if image is None:
+                 self._send(400, {"error": "exactly one image part required"})
+                 return
+@@ -240,6 +255,19 @@ def main():
+         sys.exit(1)
+     args.no_image_route = has("FAKE_NO_IMAGE_ROUTE")
+     args.image_route_gone = has("FAKE_IMAGE_ROUTE_GONE")
++    args.probe_fault = next(
++        (
++            m
++            for m in (
++                "FAKE_PROBE_HANG",
++                "FAKE_PROBE_500",
++                "FAKE_PROBE_404_BODY",
++                "FAKE_PROBE_CRASH",
++            )
++            if has(m)
++        ),
++        None,
++    )
+     _log("starts.log", str(os.getpid()))
+     _log("args.log", json.dumps(sys.argv[1:]))
+     ThreadingHTTPServer(
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
-From 21aa79a7f3d6af5c363bb6300f587dd331536a8d Mon Sep 17 00:00:00 2001
+From 2531cdd56668e33b226bc9a42beab9688b80de48 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 08:40:52 -0500
-Subject: [PATCH 093/104] refactor(tflite): move the classifier layout and
+Subject: [PATCH 093/107] refactor(tflite): move the classifier layout and
  image forward into a shared helper
 
 The model-directory layout detection (text vs image, manifest and labels

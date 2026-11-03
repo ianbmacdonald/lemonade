@@ -1,7 +1,7 @@
-From b0435aaa4570d5736e0c7e29f00e6cd32540924c Mon Sep 17 00:00:00 2001
+From d44233f392666bc844def5de5503ad3f130857fd Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 16:24:09 -0500
-Subject: [PATCH 101/104] test: resolve the image suite's engine at import and
+Subject: [PATCH 101/107] test: resolve the image suite's engine at import and
  split test_514
 
 The recipe, engine and model names were set to tflite at import and rebound

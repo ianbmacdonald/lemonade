@@ -1,7 +1,7 @@
 From ef9704b00e9254a07485b0eaff31288c82db829b Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Sun, 1 Nov 2026 16:42:53 -0500
-Subject: [PATCH 091/104] fix(onnxruntime): a failed ort-server start does not
+Subject: [PATCH 091/107] fix(onnxruntime): a failed ort-server start does not
  evict other models
 
 ort-server load failures threw a plain runtime_error, so the router

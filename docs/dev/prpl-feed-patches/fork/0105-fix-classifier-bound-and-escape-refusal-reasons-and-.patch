@@ -1,0 +1,235 @@
+From c3c48b2449a0183d723e7bcff3a57a2011222284 Mon Sep 17 00:00:00 2001
+From: Ian MacDonald <ian@netstatz.com>
+Date: Mon, 2 Nov 2026 22:12:12 -0500
+Subject: [PATCH 105/107] fix(classifier): bound and escape refusal reasons,
+ and skip stray graphs
+
+Review round 3 of B204.
+
+A refused model's load error listed every refused directory and echoed
+labels_file verbatim (a manifest value up to about 1 MiB) into the
+client's error body, and the "Not a model:" WARNING wrote manifest strings
+unescaped, so a crafted labels_file could forge log lines. Now:
+
+- echoed manifest values are cut to 120 bytes;
+- control characters in paths and reasons are escaped (\xNN) in the load
+  error, the require_layout message and the WARNING;
+- the load error lists at most 5 directories, then "and N more", within
+  2 KiB.
+
+A directory holding a graph but no layout files at all (a stray or
+partly downloaded graph) is not a manifest or labels failure, so it is no
+longer warned about or listed as a refusal. The warning dedupe was
+already keyed on (dir, reason), so a changed reason warns again.
+
+test_classifier_layout checks the escaping, the cut, the 5-dir cap and
+the stray graph on all three engines, and asserts the reason for a
+manifest.json linked to a directory.
+
+Assisted-by: claude:opus-5.5
+---
+ .../lemon/backends/classifier_backend.h       |  3 +
+ .../server/backends/classifier_backend.cpp    | 56 +++++++++++++++----
+ test/cpp/test_classifier_layout.cpp           | 33 +++++++++++
+ 3 files changed, 82 insertions(+), 10 deletions(-)
+
+diff --git a/src/cpp/include/lemon/backends/classifier_backend.h b/src/cpp/include/lemon/backends/classifier_backend.h
+index 257b7b55a..777caa985 100644
+--- a/src/cpp/include/lemon/backends/classifier_backend.h
++++ b/src/cpp/include/lemon/backends/classifier_backend.h
+@@ -30,6 +30,9 @@ enum class Layout { None, Text, Image };
+ struct Inspection {
+     Layout layout;
+     std::string problem;
++    // False when the dir merely lacks layout files (a stray or partly downloaded
++    // graph): that is not logged or listed as a refusal.
++    bool from_files = true;
+ };
+ 
+ // Runs during bulk model listing, so neither throws.
+diff --git a/src/cpp/server/backends/classifier_backend.cpp b/src/cpp/server/backends/classifier_backend.cpp
+index 25de04ce4..096b09203 100644
+--- a/src/cpp/server/backends/classifier_backend.cpp
++++ b/src/cpp/server/backends/classifier_backend.cpp
+@@ -25,6 +25,32 @@ namespace classifier {
+ namespace {
+ 
+ constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
++constexpr size_t kMaxEchoedValueBytes = 120;
++constexpr size_t kMaxListedDirs = 5;
++constexpr size_t kMaxRefusalBytes = 2048;
++
++// Manifest values and paths reach the log and the client's error body, so
++// control characters are escaped (no forged log lines) and a value is cut to
++// `max` bytes.
++std::string printable(const std::string& value, size_t max = std::string::npos) {
++    std::string out;
++    for (const char c : value) {
++        if (out.size() >= max) {
++            out += "...";
++            break;
++        }
++        const auto u = static_cast<unsigned char>(c);
++        if (u < 0x20 || u == 0x7f) {
++            static const char kHex[] = "0123456789abcdef";
++            out += "\\x";
++            out += kHex[u >> 4];
++            out += kHex[u & 0xf];
++        } else {
++            out += c;
++        }
++    }
++    return out;
++}
+ 
+ // The registry cache names a repository <prefix><org>--<name>, the prefix being
+ // "models--" (Hugging Face) or "modelscope--models--" (ModelScope).
+@@ -151,7 +177,8 @@ ImageDeclaration read_image_manifest(const fs::path& dir, std::string& labels_fi
+     }
+     if (!lexical_ok) {
+         problem = "manifest.json declares image-classification, but its labels_file '" +
+-                  labels_file + "' is empty, absolute or climbs out of the model directory";
++                  printable(labels_file, kMaxEchoedValueBytes) +
++                  "' is empty, absolute or climbs out of the model directory";
+         return ImageDeclaration::Invalid;
+     }
+     return ImageDeclaration::Valid;
+@@ -190,17 +217,17 @@ Inspection inspect_layout(const fs::path& dir, const std::vector<std::string>& g
+                 std::string error;
+                 switch (resolve_confined(dir, fs::path(labels_file), labels, error)) {
+                     case Resolution::Outside:
+-                        return {Layout::None, "the labels file '" + labels_file +
++                        return {Layout::None, "the labels file '" + printable(labels_file, kMaxEchoedValueBytes) +
+                                                   "' resolves outside the model directory"};
+                     case Resolution::Unresolvable:
+-                        return {Layout::None, "the labels file '" + labels_file +
++                        return {Layout::None, "the labels file '" + printable(labels_file, kMaxEchoedValueBytes) +
+                                                   "' cannot be resolved (" + error + ")"};
+                     case Resolution::Inside:
+                         break;
+                 }
+                 if (!fs::is_regular_file(labels, ec) || ec) {
+                     return {Layout::None,
+-                            "the labels file '" + labels_file + "' is not a regular file"};
++                            "the labels file '" + printable(labels_file, kMaxEchoedValueBytes) + "' is not a regular file"};
+                 }
+                 return {Layout::Image, ""};
+             }
+@@ -217,7 +244,8 @@ Inspection inspect_layout(const fs::path& dir, const std::vector<std::string>& g
+         }
+         return {Layout::None,
+                 "it has neither an image-classification manifest.json nor tokenizer.json + "
+-                "config.json"};
++                "config.json",
++                /*from_files=*/false};
+     } catch (const std::exception& e) {
+         return {Layout::None, std::string("it cannot be inspected (") + e.what() + ")"};
+     } catch (...) {
+@@ -249,8 +277,8 @@ void warn_once(const fs::path& dir, const std::string& problem) {
+         std::lock_guard<std::mutex> lock(mutex);
+         if (!logged.insert(key).second) return;
+     }
+-    LOG(WARNING, "Classifier") << "Not a model: " << utils::path_to_utf8(dir) << ": " << problem
+-                               << std::endl;
++    LOG(WARNING, "Classifier") << "Not a model: " << printable(utils::path_to_utf8(dir)) << ": "
++                               << printable(problem) << std::endl;
+ }
+ 
+ void scan_model_dirs(const fs::path& root, const std::vector<std::string>& graphs,
+@@ -270,7 +298,7 @@ void scan_model_dirs(const fs::path& root, const std::vector<std::string>& graph
+         const Inspection found = inspect_layout(dir, graphs);
+         if (found.layout != Layout::None) {
+             if (servable) servable->push_back(dir);
+-        } else if (!found.problem.empty()) {
++        } else if (found.from_files && !found.problem.empty()) {
+             warn_once(dir, found.problem);
+             if (refused) refused->emplace_back(dir, found.problem);
+         }
+@@ -293,8 +321,16 @@ std::string refused_model_dirs(const fs::path& root, const std::vector<std::stri
+     std::sort(refused.begin(), refused.end());
+     refused.erase(std::unique(refused.begin(), refused.end()), refused.end());
+     std::string out;
++    size_t listed = 0;
+     for (const auto& [dir, problem] : refused) {
+-        out += "\n  " + utils::path_to_utf8(dir) + ": " + problem;
++        const std::string line =
++            "\n  " + printable(utils::path_to_utf8(dir)) + ": " + printable(problem);
++        if (listed == kMaxListedDirs || out.size() + line.size() > kMaxRefusalBytes) break;
++        out += line;
++        ++listed;
++    }
++    if (listed < refused.size()) {
++        out += "\n  and " + std::to_string(refused.size() - listed) + " more";
+     }
+     return out;
+ }
+@@ -308,7 +344,7 @@ Layout require_layout(const std::string& model_name, ModelType type, const fs::p
+         const std::string found =
+             layout == Layout::None
+                 ? "has no servable classifier layout" +
+-                      (inspected.problem.empty() ? std::string() : ": " + inspected.problem)
++                      (inspected.problem.empty() ? std::string() : ": " + printable(inspected.problem))
+                 : std::string("has the ") + layout_name(layout) + " layout";
+         throw NonRetryableLoadException(
+             "Model '" + model_name + "' is labeled " + model_type_to_string(type) +
+diff --git a/test/cpp/test_classifier_layout.cpp b/test/cpp/test_classifier_layout.cpp
+index 802ad617f..07fdeea08 100644
+--- a/test/cpp/test_classifier_layout.cpp
++++ b/test/cpp/test_classifier_layout.cpp
+@@ -148,6 +148,8 @@ void check_reasons(const fs::path& base, const std::string& recipe, const std::s
+     fs::create_symlink("sub", base / "manifest_link_dir" / "manifest.json");
+     check_unservable(recipe + ": a manifest.json linked to a directory, with text files",
+                      base / "manifest_link_dir", graphs, ops);
++    reason("a manifest.json linked to a directory", base / "manifest_link_dir",
++           "manifest.json is not a regular file");
+ 
+     make_text_with(base / "manifest_dangling", graph);
+     fs::create_symlink("gone.json", base / "manifest_dangling" / "manifest.json");
+@@ -158,6 +160,36 @@ void check_reasons(const fs::path& base, const std::string& recipe, const std::s
+ #endif
+ }
+ 
++// A refusal reaches the log and the client's error body, so it is bounded and
++// carries no raw control characters; a graph with no layout files is not one.
++void check_refusal_bounds(const fs::path& root, const std::string& recipe,
++                          const std::string& graph, const std::vector<std::string>& graphs) {
++    const fs::path base = root / ("bounds-" + recipe);
++
++    const std::string forged = "../\n[Warn] forged " + std::string(500, 'a');
++    make_text_with_manifest(base / "one" / "forged", graph,
++                            nlohmann::json{{"task", "image-classification"},
++                                           {"labels_file", forged}}
++                                .dump());
++    const std::string one = classifier::refused_model_dirs(base / "one", graphs);
++    check(recipe + ": a refusal escapes control characters",
++          one.find('\n', 1) == std::string::npos && one.find("\\x0a") != std::string::npos);
++    check(recipe + ": a refusal cuts an echoed labels_file", one.size() < 400);
++
++    for (int i = 0; i < 7; ++i) {
++        make_text_with_manifest(base / "many" / ("m" + std::to_string(i)), graph, "[]");
++    }
++    const std::string many = classifier::refused_model_dirs(base / "many", graphs);
++    size_t lines = 0;
++    for (const char c : many) lines += c == '\n';
++    check(recipe + ": a refusal lists at most 5 dirs and says how many more",
++          lines == 6 && many.find("and 2 more") != std::string::npos);
++
++    write(base / "stray" / "partial" / graph, "x");
++    check(recipe + ": a graph with no layout files is not listed as a refusal",
++          classifier::refused_model_dirs(base / "stray", graphs).empty());
++}
++
+ // Manifest and labels confinement, and image declarations that fail a check
+ // with tokenizer.json and config.json present, for one engine's graph names.
+ void check_declarations(const fs::path& root, const std::string& recipe, const std::string& graph,
+@@ -257,6 +289,7 @@ void check_declarations(const fs::path& root, const std::string& recipe, const s
+           to_none.find("has no servable classifier layout") != std::string::npos);
+ 
+     check_reasons(base, recipe, graph, graphs, ops);
++    check_refusal_bounds(root, recipe, graph, graphs);
+ }
+ 
+ void check_engine(const fs::path& root, const std::string& recipe, const std::string& graph,
+-- 
+2.53.0
+

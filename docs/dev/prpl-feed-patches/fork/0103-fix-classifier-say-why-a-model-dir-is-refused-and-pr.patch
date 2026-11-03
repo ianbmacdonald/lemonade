@@ -1,7 +1,7 @@
-From fcd2f20bc4fbe5e4b05ea6bc5713cb463994f294 Mon Sep 17 00:00:00 2001
+From b25939844edf676063925f7ce014d63baffdd105 Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 18:57:26 -0500
-Subject: [PATCH 103/104] fix(classifier): say why a model dir is refused, and
+Subject: [PATCH 103/107] fix(classifier): say why a model dir is refused, and
  probe et/ort for the image route
 
 Review round 2 of B204.

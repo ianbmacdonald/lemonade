@@ -1,7 +1,7 @@
-From c4158777ec46f08ffd51c93de31928abcc57c9f6 Mon Sep 17 00:00:00 2001
+From 704ea016fe84d4eeb36fa73d78a06fb7b20121aa Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 09:36:37 -0500
-Subject: [PATCH 098/104] fix(executorch): list arm64 Linux CPUs in the support
+Subject: [PATCH 098/107] fix(executorch): list arm64 Linux CPUs in the support
  row
 
 The executorch support row named x86_64 only, from when et-server had no

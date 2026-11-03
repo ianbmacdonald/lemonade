@@ -1,7 +1,7 @@
-From c8cd2b58d01a4d5e2291167e66cfbc3bedc0822a Mon Sep 17 00:00:00 2001
+From 755326daaa6bdfa3598dac7b138df20cf23fbf5c Mon Sep 17 00:00:00 2001
 From: Ian MacDonald <ian@netstatz.com>
 Date: Mon, 2 Nov 2026 16:24:09 -0500
-Subject: [PATCH 102/104] docs: /v1/classify names executorch, and regenerate
+Subject: [PATCH 102/107] docs: /v1/classify names executorch, and regenerate
  the API reference
 
 The /v1/classify route spec listed onnxruntime and tflite text classifiers
